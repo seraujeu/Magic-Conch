@@ -79,6 +79,12 @@ import {
   PluginNodeDefinition,
   validatePlugin,
 } from "../lib/plugin-system";
+import {
+  expandWorkflowSyntax,
+  expandWorkflowSyntaxInValue,
+  WORKFLOW_SYNTAX,
+  WorkflowSyntaxContext,
+} from "../lib/workflow-syntax";
 
 type BuiltinNodeType = "start" | "input" | "request" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
@@ -94,6 +100,7 @@ type WorkflowContext = {
   lastOutput?: string;
   files: FileAsset[];
   values: Record<string, unknown>;
+  syntax: WorkflowSyntaxContext;
 };
 type FlowNode = {
   id: string;
@@ -182,6 +189,7 @@ type ChatSession = {
   workflowId: string;
   pinned: boolean;
   updatedAt: string;
+  sessionNumber: number;
 };
 type DebugDatum = {
   port: string;
@@ -588,16 +596,17 @@ const initialWorkflow: Workflow = {
 const DEFAULT_AGENT_NAME = "Magic Conch";
 const DEFAULT_START_MESSAGE = "Hello — I’m ready to run your workflow. What would you like to accomplish?";
 
-function getStartSettings(workflow: Workflow) {
+function getStartSettings(workflow: Workflow, syntax?: WorkflowSyntaxContext) {
   const start = workflow.nodes.find((node) => node.type === "start");
+  const expand = (value: string) => syntax ? expandWorkflowSyntax(value, syntax) : value;
   return {
-    agentName: start?.config.agentName?.trim() || workflow.name.trim() || DEFAULT_AGENT_NAME,
-    startMessage: start?.config.startMessage?.trim() || DEFAULT_START_MESSAGE,
+    agentName: expand(start?.config.agentName?.trim() || workflow.name.trim() || DEFAULT_AGENT_NAME),
+    startMessage: expand(start?.config.startMessage?.trim() || DEFAULT_START_MESSAGE),
   };
 }
 
-function createStarterMessages(workflow: Workflow, id = uid("message")): Message[] {
-  const { agentName, startMessage } = getStartSettings(workflow);
+function createStarterMessages(workflow: Workflow, id = uid("message"), syntax?: WorkflowSyntaxContext): Message[] {
+  const { agentName, startMessage } = getStartSettings(workflow, syntax);
   return [{ id, role: "assistant", text: startMessage, time: "Now", meta: agentName }];
 }
 
@@ -609,6 +618,7 @@ const initialChatSession: ChatSession = {
   workflowId: initialWorkflow.id,
   pinned: false,
   updatedAt: new Date(0).toISOString(),
+  sessionNumber: 1,
 };
 
 const modelDefaults: Record<AIProvider, string> = {
@@ -739,6 +749,17 @@ export default function Workbench() {
   );
   const editingChatSessionId = editingChatSession?.id;
 
+  function syntaxContextFor(workflow = activeWorkflow, sessionId = activeSessionId): WorkflowSyntaxContext {
+    const session = chatSessions.find((item) => item.id === sessionId);
+    return {
+      now: new Date(),
+      chatSessionNumber: session?.sessionNumber || 1,
+      chatSessionId: session?.id || sessionId,
+      chatSessionTitle: session?.title || "New conversation",
+      workflowName: workflow.name,
+    };
+  }
+
   useEffect(() => {
     if (!editingChatSessionId) return;
     chatSessionTitleInputRef.current?.focus();
@@ -790,7 +811,13 @@ export default function Workbench() {
         if (savedPlugins) setPlugins(restoredPlugins);
         if (savedUndoLimit) setUndoLimit(Math.max(1, Math.min(500, Number(savedUndoLimit))));
         if (savedSessions) {
-          const sessions = JSON.parse(savedSessions) as ChatSession[];
+          const restored = JSON.parse(savedSessions) as Partial<ChatSession>[];
+          const byAge = [...restored].sort((a, b) => (Date.parse(a.updatedAt || "") || 0) - (Date.parse(b.updatedAt || "") || 0));
+          const assignedNumbers = new Map(byAge.map((session, index) => [session.id, session.sessionNumber || index + 1]));
+          const sessions = restored.map((session, index) => ({
+            ...session,
+            sessionNumber: assignedNumbers.get(session.id) || index + 1,
+          })) as ChatSession[];
           if (sessions.length) {
             const chosen = sessions.find((session) => session.id === savedActiveSession) || sessions[0];
             setChatSessions(sessions);
@@ -908,14 +935,24 @@ export default function Workbench() {
   }
 
   function createChatSession() {
-    const openingMessages = createStarterMessages(activeWorkflow);
+    const sessionNumber = Math.max(0, ...chatSessions.map((session) => session.sessionNumber || 0)) + 1;
+    const sessionId = uid("session");
+    const syntax = {
+      now: new Date(),
+      chatSessionNumber: sessionNumber,
+      chatSessionId: sessionId,
+      chatSessionTitle: "New conversation",
+      workflowName: activeWorkflow.name,
+    };
+    const openingMessages = createStarterMessages(activeWorkflow, uid("message"), syntax);
     const session: ChatSession = {
-      id: uid("session"),
+      id: sessionId,
       title: "New conversation",
       messages: openingMessages,
       workflowId: activeWorkflowId,
       pinned: false,
       updatedAt: new Date().toISOString(),
+      sessionNumber,
     };
     setChatSessions((current) => [session, ...current]);
     setActiveSessionId(session.id);
@@ -967,6 +1004,7 @@ export default function Workbench() {
       title: `${source.title} copy`,
       pinned: false,
       updatedAt: new Date().toISOString(),
+      sessionNumber: Math.max(0, ...chatSessions.map((session) => session.sessionNumber || 0)) + 1,
     };
     setChatSessions((current) => [duplicate, ...current]);
     setActiveSessionId(duplicate.id);
@@ -988,6 +1026,7 @@ export default function Workbench() {
         messages: createStarterMessages(activeWorkflow),
         workflowId: activeWorkflowId,
         updatedAt: new Date().toISOString(),
+        sessionNumber: Math.max(0, ...chatSessions.map((session) => session.sessionNumber || 0)) + 1,
       };
       setChatSessions([replacement]);
       setActiveSessionId(replacement.id);
@@ -1852,10 +1891,11 @@ export default function Workbench() {
   }
 
   async function executeGraphNode(
-    node: FlowNode,
+    sourceNode: FlowNode,
     context: WorkflowContext,
     availablePortKeys: Set<string>,
   ): Promise<{ emittedPortKeys: string[]; endResult?: { text: string; files: FileAsset[] } }> {
+      const node = expandWorkflowSyntaxInValue(sourceNode, context.syntax);
       const emittedPortKeys = new Set<string>();
       const inputFor = <T,>(portId: string, fallback: T): T => {
         const edges = activeWorkflow.edges.filter(
@@ -2205,13 +2245,14 @@ export default function Workbench() {
       });
 
       if (waitingNode) {
-        const debugInputs = getNodeSchema(waitingNode, plugins).inputs.map((port) => ({
+        const resolvedWaitingNode = expandWorkflowSyntaxInValue(waitingNode, context.syntax);
+        const debugInputs = getNodeSchema(resolvedWaitingNode, plugins).inputs.map((port) => ({
           port: port.id,
           label: port.label,
           type: port.type,
           value: undefined,
         }));
-        addDebugEvent(waitingNode, "waiting", waitingNode.config.prompt || "Waiting for user input.", { inputs: debugInputs });
+        addDebugEvent(resolvedWaitingNode, "waiting", resolvedWaitingNode.config.prompt || "Waiting for user input.", { inputs: debugInputs });
         setPendingInput({
           nodeId: waitingNode.id,
           context,
@@ -2225,9 +2266,9 @@ export default function Workbench() {
         setMessages((current) => [...current, {
           id: uid("message"),
           role: "assistant",
-          text: waitingNode.config.prompt || "What additional information should I know?",
+          text: resolvedWaitingNode.config.prompt || "What additional information should I know?",
           time: timeNow(),
-          meta: getStartSettings(activeWorkflow).agentName,
+          meta: getStartSettings(activeWorkflow, context.syntax).agentName,
         }]);
         setIsRunning(false);
         return;
@@ -2237,9 +2278,9 @@ export default function Workbench() {
     setMessages((current) => [
       ...current,
       ...(endResults.length ? endResults.map((result) => ({
-        id: uid("message"), role: "assistant" as const, text: result.text, time: timeNow(), meta: getStartSettings(activeWorkflow).agentName, files: result.files,
+        id: uid("message"), role: "assistant" as const, text: result.text, time: timeNow(), meta: getStartSettings(activeWorkflow, context.syntax).agentName, files: result.files,
       })) : [{
-        id: uid("message"), role: "assistant" as const, text: "Workflow finished without an End node.", time: timeNow(), meta: getStartSettings(activeWorkflow).agentName,
+        id: uid("message"), role: "assistant" as const, text: "Workflow finished without an End node.", time: timeNow(), meta: getStartSettings(activeWorkflow, context.syntax).agentName,
       }]),
     ]);
     setPendingInput(null);
@@ -2251,7 +2292,7 @@ export default function Workbench() {
     const start = activeWorkflow.nodes.find((node) => node.type === "start");
     if (!start) throw new Error("This workflow needs a Start node.");
     const files = [...(activeWorkflow.files || []), ...messageFiles];
-    const context: WorkflowContext = { userMessage: text, files, values: {} };
+    const context: WorkflowContext = { userMessage: text, files, values: {}, syntax: syntaxContextFor() };
     context.values[portValueKey(start.id, "prompt")] = text;
     context.values[portValueKey(start.id, "files")] = files;
     context.values[portValueKey(start.id, "document")] = files.filter(isDocumentAsset);
@@ -2384,7 +2425,7 @@ export default function Workbench() {
     const workflow = workflows.find((item) => item.id === id);
     setActiveWorkflowId(id);
     if (workflow && !messages.some((message) => message.role === "user")) {
-      setMessages(createStarterMessages(workflow));
+      setMessages(createStarterMessages(workflow, uid("message"), syntaxContextFor(workflow)));
     }
     setSelectedNodeId(null);
     setSelectedNodeIds([]);
@@ -2393,7 +2434,7 @@ export default function Workbench() {
 
   function openWorkflowChat() {
     if (!messages.some((message) => message.role === "user")) {
-      setMessages(createStarterMessages(activeWorkflow));
+      setMessages(createStarterMessages(activeWorkflow, uid("message"), syntaxContextFor()));
     }
     setTab("chat");
   }
@@ -2476,6 +2517,19 @@ export default function Workbench() {
                 );
               })}
             </div>
+            <details className="syntax-reference">
+              <summary><span><Braces size={14} /> Syntax</span><ChevronDown size={14} /></summary>
+              <div className="syntax-reference-body">
+                <p>Use these tokens in workflow text fields. They resolve when a run starts.</p>
+                <div className="syntax-list">
+                  {WORKFLOW_SYNTAX.map((item) => (
+                    <button key={item.token} onClick={() => { navigator.clipboard?.writeText(item.token); showToast(`${item.token} copied`); }} title={`Copy ${item.token}`}>
+                      <code>{item.token}</code><small>{item.description}</small>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </details>
             <div className="sidebar-footer">
               <button onClick={() => fileInputRef.current?.click()}><Upload size={15} /> Import JSON</button>
               <button onClick={exportWorkflow}><Download size={15} /> Export</button>
@@ -2778,7 +2832,7 @@ export default function Workbench() {
           <div className="chat-main">
             <div className="chat-header">
               <button className="mobile-menu" onClick={() => setSidebarOpen((open) => !open)} aria-label="Toggle chats"><Menu size={19} /></button>
-              <div className="chat-title"><strong>{getStartSettings(activeWorkflow).agentName}</strong><span><i /> Ready</span></div>
+              <div className="chat-title"><strong>{getStartSettings(activeWorkflow, syntaxContextFor()).agentName}</strong><span><i /> Ready</span></div>
               <div className="chat-header-actions">
                 <button className="icon-button" onClick={undoChat} disabled={!chatUndoRef.current.length || isRunning} aria-label="Undo chat change" title="Undo chat change"><Undo2 size={16} /></button>
                 <button className="icon-button" onClick={redoChat} disabled={!chatRedoRef.current.length || isRunning} aria-label="Redo chat change" title="Redo chat change"><Redo2 size={16} /></button>
@@ -2801,7 +2855,7 @@ export default function Workbench() {
               {isRunning && (
                 <div className="message-row assistant">
                   <div className="message-avatar"><ConchMark small /></div>
-                  <div className="message-block"><div className="message-meta"><strong>{getStartSettings(activeWorkflow).agentName}</strong><span>Running workflow</span></div><div className="message-bubble typing"><i /><i /><i /></div></div>
+                  <div className="message-block"><div className="message-meta"><strong>{getStartSettings(activeWorkflow, syntaxContextFor()).agentName}</strong><span>Running workflow</span></div><div className="message-bubble typing"><i /><i /><i /></div></div>
                 </div>
               )}
             </div>

@@ -49,5 +49,5 @@ test("uses Start node settings for the chat agent and opening message", async ()
   assert.match(workbench, /function getStartSettings/);
   assert.match(workbench, />Agent name<input/);
   assert.match(workbench, />Start message<textarea/);
-  assert.match(workbench, /meta: getStartSettings\(activeWorkflow\)\.agentName/);
+  assert.match(workbench, /meta: getStartSettings\(activeWorkflow, context\.syntax\)\.agentName/);
 });
