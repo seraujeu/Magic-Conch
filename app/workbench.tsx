@@ -103,6 +103,8 @@ type FlowNode = {
   y: number;
   config: {
     prompt?: string;
+    agentName?: string;
+    startMessage?: string;
     provider?: AIProvider;
     model?: string;
     systemPrompt?: string;
@@ -530,7 +532,17 @@ const initialWorkflow: Workflow = {
   version: 2,
   updatedAt: new Date().toISOString(),
   nodes: [
-    { id: "start-1", type: "start", name: "New message", x: 80, y: 190, config: {} },
+    {
+      id: "start-1",
+      type: "start",
+      name: "New message",
+      x: 80,
+      y: 190,
+      config: {
+        agentName: "Research Assistant",
+        startMessage: "Hello — I’m your research assistant. What would you like to work on?",
+      },
+    },
     {
       id: "input-1",
       type: "input",
@@ -573,15 +585,23 @@ const initialWorkflow: Workflow = {
   ],
 };
 
-const starterMessages: Message[] = [
-  {
-    id: "welcome",
-    role: "assistant",
-    text: "Hello — I’m ready to run your workflows. Choose one above, then tell me what you’d like to accomplish.",
-    time: "Now",
-    meta: "Magic Conch",
-  },
-];
+const DEFAULT_AGENT_NAME = "Magic Conch";
+const DEFAULT_START_MESSAGE = "Hello — I’m ready to run your workflow. What would you like to accomplish?";
+
+function getStartSettings(workflow: Workflow) {
+  const start = workflow.nodes.find((node) => node.type === "start");
+  return {
+    agentName: start?.config.agentName?.trim() || workflow.name.trim() || DEFAULT_AGENT_NAME,
+    startMessage: start?.config.startMessage?.trim() || DEFAULT_START_MESSAGE,
+  };
+}
+
+function createStarterMessages(workflow: Workflow, id = uid("message")): Message[] {
+  const { agentName, startMessage } = getStartSettings(workflow);
+  return [{ id, role: "assistant", text: startMessage, time: "Now", meta: agentName }];
+}
+
+const starterMessages = createStarterMessages(initialWorkflow, "welcome");
 const initialChatSession: ChatSession = {
   id: "session-default",
   title: "New conversation",
@@ -888,17 +908,18 @@ export default function Workbench() {
   }
 
   function createChatSession() {
+    const openingMessages = createStarterMessages(activeWorkflow);
     const session: ChatSession = {
       id: uid("session"),
       title: "New conversation",
-      messages: starterMessages,
+      messages: openingMessages,
       workflowId: activeWorkflowId,
       pinned: false,
       updatedAt: new Date().toISOString(),
     };
     setChatSessions((current) => [session, ...current]);
     setActiveSessionId(session.id);
-    setMessages(starterMessages);
+    setMessages(openingMessages);
     setPendingInput(null);
     setDebugEvents([]);
     setAttachedFiles([]);
@@ -961,7 +982,13 @@ export default function Workbench() {
   function deleteChatSession(sessionId: string) {
     const remaining = chatSessions.filter((session) => session.id !== sessionId);
     if (!remaining.length) {
-      const replacement: ChatSession = { ...initialChatSession, id: uid("session"), workflowId: activeWorkflowId, updatedAt: new Date().toISOString() };
+      const replacement: ChatSession = {
+        ...initialChatSession,
+        id: uid("session"),
+        messages: createStarterMessages(activeWorkflow),
+        workflowId: activeWorkflowId,
+        updatedAt: new Date().toISOString(),
+      };
       setChatSessions([replacement]);
       setActiveSessionId(replacement.id);
       setMessages(replacement.messages);
@@ -1508,7 +1535,14 @@ export default function Workbench() {
       version: 2,
       updatedAt: new Date().toISOString(),
       nodes: [
-        { id: uid("start"), type: "start", name: "Start", x: 100, y: 180, config: {} },
+        {
+          id: uid("start"),
+          type: "start",
+          name: "Start",
+          x: 100,
+          y: 180,
+          config: { agentName: DEFAULT_AGENT_NAME, startMessage: DEFAULT_START_MESSAGE },
+        },
         { id: uid("end"), type: "end", name: "End", x: 440, y: 180, config: {} },
       ],
       edges: [],
@@ -2193,7 +2227,7 @@ export default function Workbench() {
           role: "assistant",
           text: waitingNode.config.prompt || "What additional information should I know?",
           time: timeNow(),
-          meta: waitingNode.name,
+          meta: getStartSettings(activeWorkflow).agentName,
         }]);
         setIsRunning(false);
         return;
@@ -2203,9 +2237,9 @@ export default function Workbench() {
     setMessages((current) => [
       ...current,
       ...(endResults.length ? endResults.map((result) => ({
-        id: uid("message"), role: "assistant" as const, text: result.text, time: timeNow(), meta: activeWorkflow.name, files: result.files,
+        id: uid("message"), role: "assistant" as const, text: result.text, time: timeNow(), meta: getStartSettings(activeWorkflow).agentName, files: result.files,
       })) : [{
-        id: uid("message"), role: "assistant" as const, text: "Workflow finished without an End node.", time: timeNow(), meta: activeWorkflow.name,
+        id: uid("message"), role: "assistant" as const, text: "Workflow finished without an End node.", time: timeNow(), meta: getStartSettings(activeWorkflow).agentName,
       }]),
     ]);
     setPendingInput(null);
@@ -2347,10 +2381,21 @@ export default function Workbench() {
   }
 
   function switchWorkflow(id: string) {
+    const workflow = workflows.find((item) => item.id === id);
     setActiveWorkflowId(id);
+    if (workflow && !messages.some((message) => message.role === "user")) {
+      setMessages(createStarterMessages(workflow));
+    }
     setSelectedNodeId(null);
     setSelectedNodeIds([]);
     setPendingInput(null);
+  }
+
+  function openWorkflowChat() {
+    if (!messages.some((message) => message.role === "user")) {
+      setMessages(createStarterMessages(activeWorkflow));
+    }
+    setTab("chat");
   }
 
   return (
@@ -2365,7 +2410,7 @@ export default function Workbench() {
         </div>
 
         <nav className="tab-switcher" aria-label="Main views">
-          <button className={tab === "chat" ? "active" : ""} onClick={() => setTab("chat")}>
+          <button className={tab === "chat" ? "active" : ""} onClick={openWorkflowChat}>
             <MessageSquare size={16} /> Chat
           </button>
           <button
@@ -2455,7 +2500,7 @@ export default function Workbench() {
                 <button className="icon-button" onClick={redoWorkflow} aria-label="Redo workflow change" title="Redo (Ctrl+Shift+Z)"><Redo2 size={16} /></button>
                 <button className="secondary-button" onClick={() => workflowAssetInputRef.current?.click()}><Paperclip size={15} /> Files {activeWorkflow.files?.length ? `(${activeWorkflow.files.length})` : ""}</button>
                 <button className="secondary-button" onClick={saveWorkflow}><Save size={15} /> Save</button>
-                <button className="primary-button" onClick={() => setTab("chat")}><Play size={15} fill="currentColor" /> Test workflow</button>
+                <button className="primary-button" onClick={openWorkflowChat}><Play size={15} fill="currentColor" /> Test workflow</button>
                 <button className="icon-button hide-mobile" aria-label="More options"><MoreHorizontal size={18} /></button>
                 <input ref={workflowAssetInputRef} type="file" multiple hidden onChange={addWorkflowFiles} />
               </div>
@@ -2577,6 +2622,12 @@ export default function Workbench() {
                     <span><strong>{selectedMeta?.label}</strong><small>{selectedNode.id}</small></span>
                   </div>
                   <label className="field-label">Name<input value={selectedNode.name} onChange={(event) => updateNode({ name: event.target.value })} /></label>
+                  {selectedNode.type === "start" && (
+                    <>
+                      <label className="field-label">Agent name<input value={selectedNode.config.agentName || ""} placeholder={DEFAULT_AGENT_NAME} onChange={(event) => updateNode({ config: { agentName: event.target.value } })} /><small className="field-help">Shown beside every message sent by this workflow.</small></label>
+                      <label className="field-label">Start message<textarea rows={4} value={selectedNode.config.startMessage || ""} placeholder={DEFAULT_START_MESSAGE} onChange={(event) => updateNode({ config: { startMessage: event.target.value } })} /><small className="field-help">Shown when a new chat starts or this workflow is opened for testing.</small></label>
+                    </>
+                  )}
                   {selectedNode.type === "input" && (
                     <label className="field-label">Question<textarea rows={4} value={selectedNode.config.prompt || ""} onChange={(event) => updateNode({ config: { prompt: event.target.value } })} /></label>
                   )}
@@ -2727,7 +2778,7 @@ export default function Workbench() {
           <div className="chat-main">
             <div className="chat-header">
               <button className="mobile-menu" onClick={() => setSidebarOpen((open) => !open)} aria-label="Toggle chats"><Menu size={19} /></button>
-              <div className="chat-title"><strong>Chat</strong><span><i /> Ready</span></div>
+              <div className="chat-title"><strong>{getStartSettings(activeWorkflow).agentName}</strong><span><i /> Ready</span></div>
               <div className="chat-header-actions">
                 <button className="icon-button" onClick={undoChat} disabled={!chatUndoRef.current.length || isRunning} aria-label="Undo chat change" title="Undo chat change"><Undo2 size={16} /></button>
                 <button className="icon-button" onClick={redoChat} disabled={!chatRedoRef.current.length || isRunning} aria-label="Redo chat change" title="Redo chat change"><Redo2 size={16} /></button>
@@ -2750,7 +2801,7 @@ export default function Workbench() {
               {isRunning && (
                 <div className="message-row assistant">
                   <div className="message-avatar"><ConchMark small /></div>
-                  <div className="message-block"><div className="message-meta"><strong>{activeWorkflow.name}</strong><span>Running workflow</span></div><div className="message-bubble typing"><i /><i /><i /></div></div>
+                  <div className="message-block"><div className="message-meta"><strong>{getStartSettings(activeWorkflow).agentName}</strong><span>Running workflow</span></div><div className="message-bubble typing"><i /><i /><i /></div></div>
                 </div>
               )}
             </div>

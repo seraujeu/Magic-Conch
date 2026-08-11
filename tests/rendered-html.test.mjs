@@ -40,3 +40,14 @@ test("uses typed data edges as concurrent workflow dependencies", async () => {
   assert.match(workbench, /function migrateWorkflow/);
   assert.doesNotMatch(css, /\.type-flow|\.edge-flow/);
 });
+
+test("uses Start node settings for the chat agent and opening message", async () => {
+  const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
+
+  assert.match(workbench, /agentName\?: string/);
+  assert.match(workbench, /startMessage\?: string/);
+  assert.match(workbench, /function getStartSettings/);
+  assert.match(workbench, />Agent name<input/);
+  assert.match(workbench, />Start message<textarea/);
+  assert.match(workbench, /meta: getStartSettings\(activeWorkflow\)\.agentName/);
+});
