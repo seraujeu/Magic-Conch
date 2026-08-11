@@ -1,0 +1,38 @@
+{
+  "id": "text-tools",
+  "name": "Text Tools",
+  "version": "1.0.0",
+  "description": "Example custom nodes for transforming workflow text.",
+  "nodes": [
+    {
+      "type": "text-tools:template",
+      "label": "Text Template",
+      "subtitle": "Wrap text in a template",
+      "color": "#8b5db7",
+      "category": "text/formatting",
+      "inputTypes": {
+        "required": {
+          "prompt": { "type": "PROMPT", "label": "prompt" }
+        },
+        "optional": {
+          "files": { "type": "FILES", "label": "files" }
+        }
+      },
+      "returnTypes": ["PROMPT", "FILES"],
+      "returnNames": ["prompt", "files"],
+      "functionName": "format_text",
+      "fields": [
+        {
+          "key": "prefix",
+          "label": "Prefix",
+          "type": "text",
+          "default": "Result: "
+        }
+      ],
+      "executor": {
+        "kind": "javascript",
+        "code": "return { prompt: String(config.prefix || '') + String(inputs.prompt || ''), files: inputs.files || [] };"
+      }
+    }
+  ]
+}
