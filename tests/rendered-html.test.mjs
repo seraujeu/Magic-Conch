@@ -51,3 +51,46 @@ test("uses Start node settings for the chat agent and opening message", async ()
   assert.match(workbench, />Start message<textarea/);
   assert.match(workbench, /meta: getStartSettings\(activeWorkflow, context\.syntax\)\.agentName/);
 });
+
+test("renders chat messages as GitHub-flavored Markdown", async () => {
+  const [workbench, css] = await Promise.all([
+    readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(workbench, /<ReactMarkdown remarkPlugins=\{\[remarkGfm\]\}>\{message\.text\}<\/ReactMarkdown>/);
+  assert.match(workbench, /className="message-bubble message-markdown"/);
+  assert.match(css, /\.message-markdown pre/);
+  assert.match(css, /\.message-markdown table/);
+});
+
+test("groups locally saved chats into manageable folders", async () => {
+  const [workbench, css] = await Promise.all([
+    readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(workbench, /type ChatFolder =/);
+  assert.match(workbench, /magic-conch-chat-folders/);
+  assert.match(workbench, /aria-label="Create chat folder"/);
+  assert.match(workbench, /function moveChatSession/);
+  assert.match(workbench, /Folder removed; its chats were kept/);
+  assert.match(css, /\.chat-folder-heading/);
+  assert.match(css, /\.session-folder-menu/);
+});
+
+test("keeps the application responsive when the browser viewport changes with page zoom", async () => {
+  const [workbench, css] = await Promise.all([
+    readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(workbench, /if \(event\.ctrlKey \|\| event\.metaKey\) return;/);
+  assert.match(css, /\.app-shell \{[^}]*height: 100dvh;[^}]*min-height: 0;/);
+  assert.match(css, /\.workflow-view \{[^}]*height: calc\(100dvh - 70px\);[^}]*min-height: 0;/);
+  assert.match(css, /\.chat-view \{[^}]*height: calc\(100dvh - 70px\);[^}]*min-height: 0;/);
+  assert.match(css, /\.workflow-sidebar, \.chat-sidebar \{[^}]*min-height: 0;/);
+  assert.match(css, /\.workflow-main \{[^}]*min-width: 0;[^}]*min-height: 0;/);
+  assert.match(css, /@media \(max-width: 980px\)/);
+  assert.doesNotMatch(css, /\.app-shell \{[^}]*min-height: (?:560|650)px;/);
+});

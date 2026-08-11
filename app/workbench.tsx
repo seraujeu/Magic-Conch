@@ -66,6 +66,8 @@ import {
   useRef,
   useState,
 } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { AIProvider, ProviderSettings, requestAI } from "../lib/ai-providers";
 import {
   BranchableMessage,
@@ -187,9 +189,16 @@ type ChatSession = {
   title: string;
   messages: Message[];
   workflowId: string;
+  folderId?: string | null;
   pinned: boolean;
   updatedAt: string;
   sessionNumber: number;
+};
+type ChatFolder = {
+  id: string;
+  name: string;
+  collapsed: boolean;
+  createdAt: string;
 };
 type DebugDatum = {
   port: string;
@@ -616,6 +625,7 @@ const initialChatSession: ChatSession = {
   title: "New conversation",
   messages: starterMessages,
   workflowId: initialWorkflow.id,
+  folderId: null,
   pinned: false,
   updatedAt: new Date(0).toISOString(),
   sessionNumber: 1,
@@ -678,6 +688,7 @@ export default function Workbench() {
   const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>(["request-1"]);
   const [messages, setMessages] = useState<Message[]>(starterMessages);
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([initialChatSession]);
+  const [chatFolders, setChatFolders] = useState<ChatFolder[]>([]);
   const [activeSessionId, setActiveSessionId] = useState(initialChatSession.id);
   const [messageInput, setMessageInput] = useState("");
   const [isRunning, setIsRunning] = useState(false);
@@ -687,6 +698,9 @@ export default function Workbench() {
   const [editingMessage, setEditingMessage] = useState<{ id: string; text: string } | null>(null);
   const [editingWorkflow, setEditingWorkflow] = useState<{ id: string; name: string } | null>(null);
   const [editingChatSession, setEditingChatSession] = useState<{ id: string; title: string } | null>(null);
+  const [newChatFolderName, setNewChatFolderName] = useState<string | null>(null);
+  const [editingChatFolder, setEditingChatFolder] = useState<{ id: string; name: string } | null>(null);
+  const [moveMenuSessionId, setMoveMenuSessionId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -715,6 +729,7 @@ export default function Workbench() {
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const workflowAssetInputRef = useRef<HTMLInputElement>(null);
   const chatSessionTitleInputRef = useRef<HTMLInputElement>(null);
+  const chatFolderNameInputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const undoHistoryRef = useRef<Record<string, Workflow[]>>({});
   const redoHistoryRef = useRef<Record<string, Workflow[]>>({});
@@ -747,6 +762,11 @@ export default function Workbench() {
     }),
     [chatSessions],
   );
+  const knownChatFolderIds = useMemo(() => new Set(chatFolders.map((folder) => folder.id)), [chatFolders]);
+  const unfiledChatSessions = useMemo(
+    () => sortedChatSessions.filter((session) => !session.folderId || !knownChatFolderIds.has(session.folderId)),
+    [knownChatFolderIds, sortedChatSessions],
+  );
   const editingChatSessionId = editingChatSession?.id;
 
   function syntaxContextFor(workflow = activeWorkflow, sessionId = activeSessionId): WorkflowSyntaxContext {
@@ -765,6 +785,12 @@ export default function Workbench() {
     chatSessionTitleInputRef.current?.focus();
     chatSessionTitleInputRef.current?.select();
   }, [editingChatSessionId]);
+
+  useEffect(() => {
+    if (newChatFolderName === null && !editingChatFolder) return;
+    chatFolderNameInputRef.current?.focus();
+    chatFolderNameInputRef.current?.select();
+  }, [editingChatFolder, newChatFolderName]);
   const selectedNode = activeWorkflow?.nodes.find((node) => node.id === selectedNodeId) ?? null;
   const selectedMeta = selectedNode ? getNodeMeta(selectedNode.type, plugins) : null;
   const selectedPluginNode: PluginNodeDefinition | undefined = selectedNode
@@ -779,6 +805,7 @@ export default function Workbench() {
         const savedPlugins = localStorage.getItem("magic-conch-plugins");
         const savedUndoLimit = localStorage.getItem("magic-conch-undo-limit");
         const savedSessions = localStorage.getItem("magic-conch-chat-sessions");
+        const savedChatFolders = localStorage.getItem("magic-conch-chat-folders");
         const savedActiveSession = localStorage.getItem("magic-conch-active-session");
         const restoredPlugins = savedPlugins ? JSON.parse(savedPlugins) as MagicConchPlugin[] : [];
         if (savedFlows) {
@@ -810,6 +837,15 @@ export default function Workbench() {
         if (savedSettings) setProviderSettings(JSON.parse(savedSettings));
         if (savedPlugins) setPlugins(restoredPlugins);
         if (savedUndoLimit) setUndoLimit(Math.max(1, Math.min(500, Number(savedUndoLimit))));
+        if (savedChatFolders) {
+          const restoredFolders = JSON.parse(savedChatFolders) as Partial<ChatFolder>[];
+          setChatFolders(restoredFolders.filter((folder) => folder.id && folder.name).map((folder, index) => ({
+            id: folder.id!,
+            name: folder.name!,
+            collapsed: Boolean(folder.collapsed),
+            createdAt: folder.createdAt || new Date(index).toISOString(),
+          })));
+        }
         if (savedSessions) {
           const restored = JSON.parse(savedSessions) as Partial<ChatSession>[];
           const byAge = [...restored].sort((a, b) => (Date.parse(a.updatedAt || "") || 0) - (Date.parse(b.updatedAt || "") || 0));
@@ -878,6 +914,11 @@ export default function Workbench() {
     localStorage.setItem("magic-conch-chat-sessions", JSON.stringify(chatSessions));
     localStorage.setItem("magic-conch-active-session", activeSessionId);
   }, [activeSessionId, chatSessions]);
+
+  useEffect(() => {
+    if (!storageRestoredRef.current) return;
+    localStorage.setItem("magic-conch-chat-folders", JSON.stringify(chatFolders));
+  }, [chatFolders]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -950,6 +991,7 @@ export default function Workbench() {
       title: "New conversation",
       messages: openingMessages,
       workflowId: activeWorkflowId,
+      folderId: null,
       pinned: false,
       updatedAt: new Date().toISOString(),
       sessionNumber,
@@ -960,6 +1002,7 @@ export default function Workbench() {
     setPendingInput(null);
     setDebugEvents([]);
     setAttachedFiles([]);
+    setMoveMenuSessionId(null);
     chatUndoRef.current = [];
     chatRedoRef.current = [];
   }
@@ -973,12 +1016,73 @@ export default function Workbench() {
     setPendingInput(null);
     setDebugEvents([]);
     setEditingMessage(null);
+    setMoveMenuSessionId(null);
     chatUndoRef.current = [];
     chatRedoRef.current = [];
   }
 
   function togglePinSession(sessionId: string) {
     setChatSessions((current) => current.map((session) => session.id === sessionId ? { ...session, pinned: !session.pinned } : session));
+  }
+
+  function createChatFolder() {
+    const name = newChatFolderName?.trim();
+    if (!name) {
+      setNewChatFolderName(null);
+      return;
+    }
+    if (chatFolders.some((folder) => folder.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+      showToast("A folder with that name already exists");
+      return;
+    }
+    setChatFolders((current) => [...current, {
+      id: uid("chat-folder"),
+      name,
+      collapsed: false,
+      createdAt: new Date().toISOString(),
+    }]);
+    setNewChatFolderName(null);
+    showToast("Chat folder created");
+  }
+
+  function saveChatFolderRename() {
+    if (!editingChatFolder) return;
+    const name = editingChatFolder.name.trim();
+    if (!name) {
+      setEditingChatFolder(null);
+      return;
+    }
+    if (chatFolders.some((folder) => folder.id !== editingChatFolder.id && folder.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+      showToast("A folder with that name already exists");
+      return;
+    }
+    setChatFolders((current) => current.map((folder) => folder.id === editingChatFolder.id ? { ...folder, name } : folder));
+    setEditingChatFolder(null);
+    showToast("Chat folder renamed");
+  }
+
+  function toggleChatFolder(folderId: string) {
+    setChatFolders((current) => current.map((folder) => folder.id === folderId ? { ...folder, collapsed: !folder.collapsed } : folder));
+  }
+
+  function removeChatFolder(folderId: string) {
+    setChatFolders((current) => current.filter((folder) => folder.id !== folderId));
+    setChatSessions((current) => current.map((session) => session.folderId === folderId ? { ...session, folderId: null } : session));
+    setMoveMenuSessionId(null);
+    showToast("Folder removed; its chats were kept");
+  }
+
+  function moveChatSession(sessionId: string, folderId: string | null) {
+    setChatSessions((current) => current.map((session) => session.id === sessionId ? {
+      ...session,
+      folderId,
+      updatedAt: new Date().toISOString(),
+    } : session));
+    if (folderId) {
+      setChatFolders((current) => current.map((folder) => folder.id === folderId ? { ...folder, collapsed: false } : folder));
+    }
+    setMoveMenuSessionId(null);
+    showToast(folderId ? "Chat moved to folder" : "Chat moved out of folder");
   }
 
   function saveChatSessionRename() {
@@ -1467,6 +1571,10 @@ export default function Workbench() {
 
   function zoomCanvasWithWheel(event: ReactWheelEvent<HTMLDivElement>) {
     if (!canvasRef.current) return;
+    // Let the browser handle its native page zoom gesture. Canvas coordinates
+    // already use CSS pixels, so intercepting Ctrl/Cmd + wheel here makes the
+    // scene zoom independently from the rest of the page.
+    if (event.ctrlKey || event.metaKey) return;
     event.preventDefault();
 
     const rect = canvasRef.current.getBoundingClientRect();
@@ -2439,6 +2547,54 @@ export default function Workbench() {
     setTab("chat");
   }
 
+  function renderChatSession(session: ChatSession) {
+    const moveMenuOpen = moveMenuSessionId === session.id;
+    return (
+      <div className={`history-item ${session.id === activeSessionId ? "active" : ""} ${moveMenuOpen ? "menu-open" : ""}`} key={session.id}>
+        {editingChatSession?.id === session.id ? (
+          <div className="session-main session-edit">
+            <MessageSquare size={15} />
+            <input
+              ref={chatSessionTitleInputRef}
+              value={editingChatSession.title}
+              onChange={(event) => setEditingChatSession({ ...editingChatSession, title: event.target.value })}
+              onBlur={saveChatSessionRename}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") saveChatSessionRename();
+                if (event.key === "Escape") setEditingChatSession(null);
+              }}
+              aria-label="Chat session name"
+            />
+          </div>
+        ) : (
+          <button className="session-main" onClick={() => selectChatSession(session.id)}>
+            <MessageSquare size={15} />
+            <span><strong>{session.title}</strong><small>{workflows.find((workflow) => workflow.id === session.workflowId)?.name || "Workflow"}</small></span>
+          </button>
+        )}
+        <span className="session-actions">
+          <button onClick={() => setEditingChatSession({ id: session.id, title: session.title })} aria-label={`Rename ${session.title}`} title="Rename"><Pencil size={11} /></button>
+          <button className={session.pinned ? "pinned" : ""} onClick={() => togglePinSession(session.id)} aria-label={`${session.pinned ? "Unpin" : "Pin"} ${session.title}`} title={session.pinned ? "Unpin" : "Pin"}><Pin size={11} fill={session.pinned ? "currentColor" : "none"} /></button>
+          <button className={session.folderId ? "in-folder" : ""} onClick={() => setMoveMenuSessionId((current) => current === session.id ? null : session.id)} aria-expanded={moveMenuOpen} aria-label={`Move ${session.title} to folder`} title="Move to folder"><FolderOpen size={11} /></button>
+          <button onClick={() => duplicateChatSession(session.id)} aria-label={`Duplicate ${session.title}`} title="Duplicate"><Copy size={11} /></button>
+          <button onClick={() => deleteChatSession(session.id)} aria-label={`Delete ${session.title}`} title="Delete"><Trash2 size={11} /></button>
+        </span>
+        {moveMenuOpen && (
+          <div className="session-folder-menu">
+            <span>Move to folder</span>
+            {session.folderId && <button onClick={() => moveChatSession(session.id, null)}><MessageSquare size={12} /> Chats</button>}
+            {chatFolders.map((folder) => (
+              <button className={session.folderId === folder.id ? "active" : ""} key={folder.id} onClick={() => moveChatSession(session.id, folder.id)} disabled={session.folderId === folder.id}>
+                <FolderOpen size={12} /> {folder.name}{session.folderId === folder.id && <Check size={11} />}
+              </button>
+            ))}
+            {!chatFolders.length && <button onClick={() => { setNewChatFolderName(""); setMoveMenuSessionId(null); }}><Plus size={12} /> Create a folder</button>}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -2785,40 +2941,77 @@ export default function Workbench() {
         >
           {isDraggingFiles && <div className="file-drop-overlay"><span><Upload size={24} /><strong>Drop files into this chat</strong><small>They’ll be attached to your next message.</small></span></div>}
           <aside className={`chat-sidebar ${sidebarOpen ? "open" : ""}`}>
-            <button className="new-chat-button" onClick={createChatSession}><Plus size={16} /> New chat</button>
+            <div className="chat-sidebar-actions">
+              <button className="new-chat-button" onClick={createChatSession}><Plus size={16} /> New chat</button>
+              <button className="new-folder-button" onClick={() => { setNewChatFolderName(""); setEditingChatFolder(null); }} aria-label="Create chat folder" title="Create folder"><FolderOpen size={16} /><Plus size={9} /></button>
+            </div>
+            {newChatFolderName !== null && (
+              <div className="new-folder-form">
+                <FolderOpen size={15} />
+                <input
+                  ref={chatFolderNameInputRef}
+                  value={newChatFolderName}
+                  onChange={(event) => setNewChatFolderName(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") createChatFolder();
+                    if (event.key === "Escape") setNewChatFolderName(null);
+                  }}
+                  placeholder="Folder name"
+                  aria-label="New chat folder name"
+                />
+                <button onClick={createChatFolder} aria-label="Save chat folder"><Check size={12} /></button>
+                <button onClick={() => setNewChatFolderName(null)} aria-label="Cancel folder creation"><X size={12} /></button>
+              </div>
+            )}
             <div className="chat-side-section">
-              <span className="eyebrow">Saved sessions</span>
-              {sortedChatSessions.map((session) => (
-                <div className={`history-item ${session.id === activeSessionId ? "active" : ""}`} key={session.id}>
-                  {editingChatSession?.id === session.id ? (
-                    <div className="session-main session-edit">
-                      <MessageSquare size={15} />
-                      <input
-                        ref={chatSessionTitleInputRef}
-                        value={editingChatSession.title}
-                        onChange={(event) => setEditingChatSession({ ...editingChatSession, title: event.target.value })}
-                        onBlur={saveChatSessionRename}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter") saveChatSessionRename();
-                          if (event.key === "Escape") setEditingChatSession(null);
-                        }}
-                        aria-label="Chat session name"
-                      />
-                    </div>
-                  ) : (
-                    <button className="session-main" onClick={() => selectChatSession(session.id)}>
-                      <MessageSquare size={15} />
-                      <span><strong>{session.title}</strong><small>{workflows.find((workflow) => workflow.id === session.workflowId)?.name || "Workflow"}</small></span>
-                    </button>
-                  )}
-                  <span className="session-actions">
-                    <button onClick={() => setEditingChatSession({ id: session.id, title: session.title })} aria-label={`Rename ${session.title}`} title="Rename"><Pencil size={11} /></button>
-                    <button className={session.pinned ? "pinned" : ""} onClick={() => togglePinSession(session.id)} aria-label={`${session.pinned ? "Unpin" : "Pin"} ${session.title}`} title={session.pinned ? "Unpin" : "Pin"}><Pin size={11} fill={session.pinned ? "currentColor" : "none"} /></button>
-                    <button onClick={() => duplicateChatSession(session.id)} aria-label={`Duplicate ${session.title}`} title="Duplicate"><Copy size={11} /></button>
-                    <button onClick={() => deleteChatSession(session.id)} aria-label={`Delete ${session.title}`} title="Delete"><Trash2 size={11} /></button>
-                  </span>
+              {!!unfiledChatSessions.length && (
+                <div className="chat-group" role="group" aria-label="Chats without a folder">
+                  <span className="eyebrow">Chats <small>{unfiledChatSessions.length}</small></span>
+                  {unfiledChatSessions.map(renderChatSession)}
                 </div>
-              ))}
+              )}
+              {chatFolders.map((folder) => {
+                const folderSessions = sortedChatSessions.filter((session) => session.folderId === folder.id);
+                return (
+                  <div className="chat-folder" key={folder.id} role="group" aria-label={`${folder.name} folder`}>
+                    <div className="chat-folder-heading">
+                      {editingChatFolder?.id === folder.id ? (
+                        <div className="chat-folder-edit">
+                          <FolderOpen size={14} />
+                          <input
+                            ref={chatFolderNameInputRef}
+                            value={editingChatFolder.name}
+                            onChange={(event) => setEditingChatFolder({ ...editingChatFolder, name: event.target.value })}
+                            onBlur={saveChatFolderRename}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") saveChatFolderRename();
+                              if (event.key === "Escape") setEditingChatFolder(null);
+                            }}
+                            aria-label="Chat folder name"
+                          />
+                        </div>
+                      ) : (
+                        <button className="chat-folder-main" onClick={() => toggleChatFolder(folder.id)} aria-expanded={!folder.collapsed}>
+                          {folder.collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+                          <FolderOpen size={14} />
+                          <strong>{folder.name}</strong>
+                          <small>{folderSessions.length}</small>
+                        </button>
+                      )}
+                      <span className="folder-actions">
+                        <button onClick={() => { setEditingChatFolder({ id: folder.id, name: folder.name }); setNewChatFolderName(null); }} aria-label={`Rename ${folder.name} folder`} title="Rename folder"><Pencil size={11} /></button>
+                        <button onClick={() => removeChatFolder(folder.id)} aria-label={`Remove ${folder.name} folder`} title="Remove folder"><Trash2 size={11} /></button>
+                      </span>
+                    </div>
+                    {!folder.collapsed && (
+                      <div className="chat-folder-sessions">
+                        {folderSessions.length ? folderSessions.map(renderChatSession) : <span className="empty-folder">Move chats here using the folder icon.</span>}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {!unfiledChatSessions.length && !chatFolders.length && <span className="empty-folder standalone">No chats yet.</span>}
             </div>
             <div className="chat-sidebar-bottom">
               <div className="storage-card">
@@ -2847,7 +3040,7 @@ export default function Workbench() {
                   <div className="message-avatar">{message.role === "user" ? "YOU" : message.role === "system" ? <Info size={17} /> : <ConchMark small />}</div>
                   <div className="message-block">
                     <div className="message-meta"><strong>{message.role === "user" ? "You" : message.meta || "Magic Conch"}</strong><span>{message.time}</span>{message.role === "user" && !isRunning && <><button className="edit-message-button" onClick={() => resendMessage(message)} aria-label="Resend message" title="Run this message again"><Redo2 size={11} /> Resend</button><button className="edit-message-button" onClick={() => setEditingMessage({ id: message.id, text: message.text })} aria-label="Edit message"><Pencil size={11} /> Edit</button></>}{message.role === "user" && message.branch && <span className="message-version-controls" aria-label="Message versions"><button disabled={isRunning || message.branch.activeIndex === 0} onClick={() => switchMessageVersion(message, message.branch!.activeIndex - 1)} aria-label="Show previous message version" title="Previous version"><ChevronLeft size={11} /></button><span>{message.branch.activeIndex + 1} / {message.branch.versions.length}</span><button disabled={isRunning || message.branch.activeIndex === message.branch.versions.length - 1} onClick={() => switchMessageVersion(message, message.branch!.activeIndex + 1)} aria-label="Show next message version" title="Next version"><ChevronRight size={11} /></button></span>}</div>
-                    {editingMessage?.id === message.id ? <div className="message-editor"><textarea value={editingMessage.text} onChange={(event) => setEditingMessage({ ...editingMessage, text: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) saveEditedMessage(); if (event.key === "Escape") setEditingMessage(null); }} /><div><button onClick={() => setEditingMessage(null)}>Cancel</button><button className="save-edit" onClick={saveEditedMessage}><Check size={12} /> Save</button></div></div> : <div className="message-bubble">{message.text}</div>}
+                    {editingMessage?.id === message.id ? <div className="message-editor"><textarea value={editingMessage.text} onChange={(event) => setEditingMessage({ ...editingMessage, text: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) saveEditedMessage(); if (event.key === "Escape") setEditingMessage(null); }} /><div><button onClick={() => setEditingMessage(null)}>Cancel</button><button className="save-edit" onClick={saveEditedMessage}><Check size={12} /> Save</button></div></div> : <div className="message-bubble message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.text}</ReactMarkdown></div>}
                     {!!message.files?.length && <div className="message-files">{message.files.map((file, index) => <span key={`${file.name}-${index}`}><FileJson size={12} /> {file.name}<small>{Math.max(1, Math.round(file.size / 1024))} KB</small></span>)}</div>}
                   </div>
                 </div>
