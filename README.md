@@ -16,6 +16,11 @@ npm run dev
 npm run build
 ```
 
+On Windows, `Launch Magic Conch.bat` starts the app on the first available port
+at or above 3000 and opens that address automatically. To prefer a particular
+port, pass it as an argument (for example, `Launch Magic Conch.bat 4173`) or set
+the `PORT` environment variable.
+
 This starter does not use `wrangler.jsonc`.
 
 ## Included Shape

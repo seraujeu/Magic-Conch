@@ -41,6 +41,18 @@ test("uses typed data edges as concurrent workflow dependencies", async () => {
   assert.doesNotMatch(css, /\.type-flow|\.edge-flow/);
 });
 
+test("anchors workflow connections to the rendered port centers", async () => {
+  const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
+
+  assert.match(workbench, /useLayoutEffect\(\(\) => \{/);
+  assert.match(workbench, /querySelectorAll<HTMLElement>\("\[data-node-port-id\]"\)/);
+  assert.match(workbench, /portRect\.left \+ portRect\.width \/ 2 - nodeRect\.left/);
+  assert.match(workbench, /portRect\.top \+ portRect\.height \/ 2 - nodeRect\.top/);
+  assert.match(workbench, /data-port-side="input"/);
+  assert.match(workbench, /data-port-side="output"/);
+  assert.doesNotMatch(workbench, /node\.y \+ 62 \+ index \* 25/);
+});
+
 test("uses Start node settings for the chat agent and opening message", async () => {
   const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
 
@@ -50,6 +62,32 @@ test("uses Start node settings for the chat agent and opening message", async ()
   assert.match(workbench, />Agent name<input/);
   assert.match(workbench, />Start message<textarea/);
   assert.match(workbench, /meta: getStartSettings\(activeWorkflow, context\.syntax\)\.agentName/);
+});
+
+test("supports scalar and media data ports, connectable attributes, and directory loading", async () => {
+  const [workbench, css] = await Promise.all([
+    readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  for (const type of ["string", "integer", "float", "image", "video", "audio"]) {
+    assert.match(workbench, new RegExp(`PortDataType = [^;]*"${type}"`));
+    assert.match(css, new RegExp(`\\.type-${type}`));
+  }
+  assert.match(workbench, /"list-directory": \{ label: "Load Directory"/);
+  assert.match(workbench, /async function loadDirectoryFiles/);
+  assert.match(workbench, /id: "system_prompt", label: "system prompt", type: "string"/);
+  assert.match(workbench, /id: "start_message", label: "start message", type: "string"/);
+  assert.match(workbench, /inputFor\("system_prompt", node\.config\.systemPrompt/);
+  assert.match(workbench, /connectedConfiguredValue\(workflow, start\.id, "start_message"\)/);
+  assert.match(workbench, /node\.type === "save"[^\n]+\.\.\.mediaInputs[^\n]+\.\.\.mediaOutputs/);
+  assert.match(workbench, /node\.type === "load"[^\n]+\.\.\.mediaOutputs/);
+  assert.match(workbench, /output\("image", mediaAssets\(loaded\.files, "image"\)\)/);
+  assert.match(workbench, /output\("video", mediaAssets\(loaded\.files, "video"\)\)/);
+  assert.match(workbench, /assets: !folder && node\.config\.saveFiles !== "data" \? files : undefined/);
+  assert.match(workbench, /fileAssetsPromptSections\(fileInput\)/);
+  assert.match(workbench, /collectFileAssets\(suppliedFiles, suppliedMedia, documentInput\)/);
+  assert.match(workbench, /files: fileInput/);
 });
 
 test("renders chat messages as GitHub-flavored Markdown", async () => {
@@ -77,6 +115,21 @@ test("groups locally saved chats into manageable folders", async () => {
   assert.match(workbench, /Folder removed; its chats were kept/);
   assert.match(css, /\.chat-folder-heading/);
   assert.match(css, /\.session-folder-menu/);
+});
+
+test("searches and groups the Workflow node library", async () => {
+  const [workbench, css] = await Promise.all([
+    readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(workbench, /const BUILTIN_NODE_GROUPS/);
+  assert.match(workbench, /aria-label="Search nodes by name"/);
+  assert.match(workbench, /label\.toLocaleLowerCase\(\)\.includes\(query\)/);
+  assert.match(workbench, /aria-expanded=\{isOpen\}/);
+  assert.match(workbench, /plugin-\$\{plugin\.id\}/);
+  assert.match(css, /\.node-search:focus-within/);
+  assert.match(css, /\.node-group-toggle\.collapsed/);
 });
 
 test("keeps the application responsive when the browser viewport changes with page zoom", async () => {
