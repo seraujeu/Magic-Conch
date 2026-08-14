@@ -70,6 +70,139 @@ test("loads installed Ollama model options", async () => {
   }
 });
 
+test("passes OpenAI reasoning and generation settings in Chat Completions fields", async () => {
+  const originalFetch = globalThis.fetch;
+  let body;
+  globalThis.fetch = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return new Response(JSON.stringify({ choices: [{ message: { content: "configured" } }] }), { status: 200 });
+  };
+  try {
+    await requestAI({
+      provider: "openai",
+      model: "reasoning-model",
+      prompt: "Test settings.",
+      temperature: 0.25,
+      openai: {
+        reasoningEffort: "high",
+        verbosity: "low",
+        maxCompletionTokens: 4096,
+        topP: 0.8,
+        frequencyPenalty: 0.2,
+        presencePenalty: -0.1,
+        seed: 42,
+        stop: ["END"],
+      },
+    }, { openaiKey: "test-key" });
+
+    assert.equal(body.reasoning_effort, "high");
+    assert.equal(body.verbosity, "low");
+    assert.equal(body.max_completion_tokens, 4096);
+    assert.equal(body.top_p, 0.8);
+    assert.equal(body.frequency_penalty, 0.2);
+    assert.equal(body.presence_penalty, -0.1);
+    assert.equal(body.seed, 42);
+    assert.deepEqual(body.stop, ["END"]);
+    assert.equal("temperature" in body, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("passes Gemini thinking and generation settings in generationConfig", async () => {
+  const originalFetch = globalThis.fetch;
+  let body;
+  globalThis.fetch = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "configured" }] } }] }), { status: 200 });
+  };
+  try {
+    await requestAI({
+      provider: "gemini",
+      model: "gemini-model",
+      prompt: "Test settings.",
+      temperature: 0.4,
+      gemini: {
+        thinkingLevel: "high",
+        maxOutputTokens: 8192,
+        topP: 0.85,
+        topK: 20,
+        seed: 7,
+        stopSequences: ["END", "STOP"],
+      },
+    }, { geminiKey: "test-key" });
+
+    assert.deepEqual(body.generationConfig, {
+      temperature: 0.4,
+      maxOutputTokens: 8192,
+      topP: 0.85,
+      topK: 20,
+      seed: 7,
+      stopSequences: ["END", "STOP"],
+      thinkingConfig: { thinkingLevel: "high" },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("passes Anthropic adaptive thinking, effort, and generation settings", async () => {
+  const originalFetch = globalThis.fetch;
+  let body;
+  globalThis.fetch = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return new Response(JSON.stringify({ content: [{ type: "text", text: "configured" }] }), { status: 200 });
+  };
+  try {
+    await requestAI({
+      provider: "claude",
+      model: "claude-model",
+      prompt: "Test settings.",
+      temperature: 0.3,
+      claude: {
+        thinking: "adaptive",
+        effort: "medium",
+        maxTokens: 12000,
+        topP: 0.9,
+        topK: 30,
+        stopSequences: ["END"],
+      },
+    }, { claudeKey: "test-key" });
+
+    assert.equal(body.max_tokens, 12000);
+    assert.deepEqual(body.thinking, { type: "adaptive" });
+    assert.deepEqual(body.output_config, { effort: "medium" });
+    assert.equal(body.top_p, 0.9);
+    assert.equal(body.top_k, 30);
+    assert.deepEqual(body.stop_sequences, ["END"]);
+    assert.equal("temperature" in body, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("passes Anthropic legacy thinking budgets for compatible models", async () => {
+  const originalFetch = globalThis.fetch;
+  let body;
+  globalThis.fetch = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return new Response(JSON.stringify({ content: [{ type: "text", text: "configured" }] }), { status: 200 });
+  };
+  try {
+    await requestAI({
+      provider: "claude",
+      model: "claude-legacy-model",
+      prompt: "Test settings.",
+      claude: { thinking: "enabled", thinkingBudget: 4096, maxTokens: 8192 },
+    }, { claudeKey: "test-key" });
+
+    assert.deepEqual(body.thinking, { type: "enabled", budget_tokens: 4096 });
+    assert.equal(body.max_tokens, 8192);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("passes images to Ollama's multimodal message payload", async () => {
   const originalFetch = globalThis.fetch;
   let body;

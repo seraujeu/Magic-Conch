@@ -64,6 +64,19 @@ test("uses Start node settings for the chat agent and opening message", async ()
   assert.match(workbench, /meta: getStartSettings\(activeWorkflow, context\.syntax\)\.agentName/);
 });
 
+test("runs one workflow from another through the Use Workflow node", async () => {
+  const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
+
+  assert.match(workbench, /workflow: \{ label: "Use Workflow", subtitle: "Run another workflow"/);
+  assert.match(workbench, /if \(node\.type === "workflow"\) return \{ inputs: \[\{ id: "prompt"/);
+  assert.match(workbench, /calledWorkflowId\?: string/);
+  assert.match(workbench, /async function executeCalledWorkflow/);
+  assert.match(workbench, /result: await executeGraphNode\(node, context, emitted, workflow\)/);
+  assert.match(workbench, /Workflow recursion detected/);
+  assert.match(workbench, /Reusable workflows must run from Start to End without requesting another message/);
+  assert.match(workbench, />Select a workflow…<\/option>/);
+});
+
 test("supports scalar and media data ports, connectable attributes, and directory loading", async () => {
   const [workbench, css] = await Promise.all([
     readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
@@ -76,6 +89,13 @@ test("supports scalar and media data ports, connectable attributes, and director
   }
   assert.match(workbench, /"list-directory": \{ label: "Load Directory"/);
   assert.match(workbench, /async function loadDirectoryFiles/);
+  assert.match(workbench, /loadMode\?: "latest" \| "all" \| "exact" \| "folder"/);
+  assert.match(workbench, /<option value="folder">All files in folder<\/option>/);
+  assert.match(workbench, /node\.config\.loadMode === "folder"[\s\S]*?loadDirectoryFiles/);
+  assert.match(workbench, /rememberNodeDirectoryHandle\(nodeId, handle\)/);
+  assert.match(workbench, /restoreNodeDirectoryHandles\(\)/);
+  assert.match(workbench, /Reconnect the “\$\{node\.config\.directoryName\}” Node directory/);
+  assert.match(workbench, /Absolute paths work only when they contain the selected directory/);
   assert.match(workbench, /id: "system_prompt", label: "system prompt", type: "string"/);
   assert.match(workbench, /id: "start_message", label: "start message", type: "string"/);
   assert.match(workbench, /inputFor\("system_prompt", node\.config\.systemPrompt/);
@@ -112,6 +132,9 @@ test("groups locally saved chats into manageable folders", async () => {
   assert.match(workbench, /magic-conch-chat-folders/);
   assert.match(workbench, /aria-label="Create chat folder"/);
   assert.match(workbench, /function moveChatSession/);
+  assert.match(workbench, /readStoredChatSessions/);
+  assert.match(workbench, /writeStoredChatSessions\(chatSessions\)/);
+  assert.doesNotMatch(workbench, /localStorage\.setItem\("magic-conch-chat-sessions", JSON\.stringify\(chatSessions\)\)/);
   assert.match(workbench, /Folder removed; its chats were kept/);
   assert.match(css, /\.chat-folder-heading/);
   assert.match(css, /\.session-folder-menu/);

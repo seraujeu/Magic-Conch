@@ -43,7 +43,7 @@ button { color: inherit; }
 .icon-button:hover, .mini-icon:hover, .mobile-menu:hover { background: #f2f3ef; }
 .mini-icon { width: 28px; height: 28px; border: 0; background: transparent; border-radius: 7px; }
 .avatar-button { width: 34px; height: 34px; border: 0; border-radius: 50%; background: var(--deep); color: white; font-size: 10px; font-weight: 700; cursor: pointer; }
-.workflow-view { height: calc(100vh - 70px); height: calc(100dvh - 70px); min-height: 0; display: grid; grid-template-columns: 222px minmax(0,1fr) 276px; }
+.workflow-view { height: calc(100vh - 70px); height: calc(100dvh - 70px); min-height: 0; display: grid; grid-template-columns: 222px minmax(0,1fr) 276px; position: relative; }
 .workflow-sidebar, .chat-sidebar { background: #f7f7f3; border-right: 1px solid var(--line); display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; z-index: 12; }
 .sidebar-heading { height: 50px; padding: 0 14px 0 18px; display: flex; align-items: center; justify-content: space-between; color: #7b837e; font-size: 10px; font-weight: 700; letter-spacing: .9px; text-transform: uppercase; }
 .workflow-list { padding: 0 9px; display: flex; flex-direction: column; gap: 3px; }
@@ -225,17 +225,17 @@ button { color: inherit; }
 .join-inputs-editor code { max-width: 92px; overflow: hidden; text-overflow: ellipsis; color: #765aa3; background: #f1edf7; border-radius: 5px; padding: 4px 5px; font-size: 8px; white-space: nowrap; }
 .check-field { display: flex; align-items: center; gap: 7px; color: #69726c; font-size: 9px; margin: -2px 0 14px; }
 .check-field input { accent-color: #748e3e; }
-.ollama-advanced { margin: 2px 0 15px; border: 1px solid #dfe5d4; border-radius: 10px; background: #f8faf3; overflow: hidden; }
-.ollama-advanced > summary { min-height: 48px; padding: 8px 10px; display: grid; grid-template-columns: 16px 1fr 14px; gap: 8px; align-items: center; color: #657348; cursor: pointer; list-style: none; }
-.ollama-advanced > summary::-webkit-details-marker { display: none; }
-.ollama-advanced > summary > span { display: flex; flex-direction: column; gap: 2px; }
-.ollama-advanced > summary b { color: #4f5d36; font-size: 9px; }
-.ollama-advanced > summary small { color: #879176; font-size: 7px; font-weight: 400; }
-.ollama-advanced > summary > svg:last-child { transition: transform .15s; }
-.ollama-advanced[open] > summary > svg:last-child { transform: rotate(180deg); }
-.ollama-fields { border-top: 1px solid #e1e6d8; padding: 11px 10px 1px; background: white; }
-.ollama-number-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 8px; }
-.ollama-number-grid .field-label { min-width: 0; }
+.ollama-advanced, .provider-advanced { margin: 2px 0 15px; border: 1px solid #dfe5d4; border-radius: 10px; background: #f8faf3; overflow: hidden; }
+.ollama-advanced > summary, .provider-advanced > summary { min-height: 48px; padding: 8px 10px; display: grid; grid-template-columns: 16px 1fr 14px; gap: 8px; align-items: center; color: #657348; cursor: pointer; list-style: none; }
+.ollama-advanced > summary::-webkit-details-marker, .provider-advanced > summary::-webkit-details-marker { display: none; }
+.ollama-advanced > summary > span, .provider-advanced > summary > span { display: flex; flex-direction: column; gap: 2px; }
+.ollama-advanced > summary b, .provider-advanced > summary b { color: #4f5d36; font-size: 9px; }
+.ollama-advanced > summary small, .provider-advanced > summary small { color: #879176; font-size: 7px; font-weight: 400; }
+.ollama-advanced > summary > svg:last-child, .provider-advanced > summary > svg:last-child { transition: transform .15s; }
+.ollama-advanced[open] > summary > svg:last-child, .provider-advanced[open] > summary > svg:last-child { transform: rotate(180deg); }
+.ollama-fields, .provider-fields { border-top: 1px solid #e1e6d8; padding: 11px 10px 1px; background: white; }
+.ollama-number-grid, .provider-number-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 8px; }
+.ollama-number-grid .field-label, .provider-number-grid .field-label { min-width: 0; }
 .inspector-note { display: flex; gap: 8px; padding: 10px; background: #f4f6ed; color: #748064; border-radius: 8px; font-size: 9px; line-height: 1.4; margin: 6px 0 16px; }
 .inspector-note svg { flex: 0 0 auto; }
 .danger-button { color: #b84a51; border: 1px solid #f0dadd; background: white; width: 100%; box-shadow: none; }

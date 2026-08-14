@@ -17,7 +17,47 @@ export type AIRequest = {
   prompt: string;
   temperature?: number;
   files?: AIFile[];
+  openai?: OpenAIRequestSettings;
+  gemini?: GeminiRequestSettings;
+  claude?: ClaudeRequestSettings;
   ollama?: OllamaRequestSettings;
+};
+
+export type OpenAIReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export type OpenAIRequestSettings = {
+  reasoningEffort?: OpenAIReasoningEffort;
+  verbosity?: "low" | "medium" | "high";
+  maxCompletionTokens?: number;
+  topP?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  seed?: number;
+  stop?: string[];
+};
+
+export type GeminiThinkingLevel = "minimal" | "low" | "medium" | "high";
+
+export type GeminiRequestSettings = {
+  thinkingLevel?: GeminiThinkingLevel;
+  thinkingBudget?: number;
+  maxOutputTokens?: number;
+  topP?: number;
+  topK?: number;
+  seed?: number;
+  stopSequences?: string[];
+};
+
+export type ClaudeThinkingMode = "adaptive" | "disabled" | "enabled";
+
+export type ClaudeRequestSettings = {
+  thinking?: ClaudeThinkingMode;
+  thinkingBudget?: number;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  maxTokens?: number;
+  topP?: number;
+  topK?: number;
+  stopSequences?: string[];
 };
 
 export type OllamaThink = boolean | "low" | "medium" | "high";
@@ -188,15 +228,24 @@ export async function requestAI(
   if (request.provider === "openai") {
     if (!settings.openaiKey) throw new Error("Add an OpenAI API key in Settings.");
     const baseUrl = (settings.openaiUrl || "https://api.openai.com/v1").replace(/\/$/, "");
+    const openai = request.openai || {};
     const response = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${settings.openaiKey}`,
       },
-      body: JSON.stringify({
+      body: JSON.stringify(definedObject({
         model: request.model,
-        temperature,
+        temperature: openai.reasoningEffort && openai.reasoningEffort !== "none" ? undefined : temperature,
+        reasoning_effort: openai.reasoningEffort,
+        verbosity: openai.verbosity,
+        max_completion_tokens: openai.maxCompletionTokens,
+        top_p: openai.topP,
+        frequency_penalty: openai.frequencyPenalty,
+        presence_penalty: openai.presencePenalty,
+        seed: openai.seed,
+        stop: openai.stop?.length ? openai.stop : undefined,
         messages: [
           ...(request.systemPrompt
             ? [{ role: "system", content: request.systemPrompt }]
@@ -211,7 +260,7 @@ export async function requestAI(
               : request.prompt,
           },
         ],
-      }),
+      })),
     });
     const data = await readJson(response, "OpenAI");
     return data.choices?.[0]?.message?.content ?? "";
@@ -221,6 +270,11 @@ export async function requestAI(
     if (!settings.geminiKey) throw new Error("Add a Gemini API key in Settings.");
     const baseUrl = (settings.geminiUrl || "https://generativelanguage.googleapis.com/v1beta").replace(/\/$/, "");
     const url = `${baseUrl}/models/${encodeURIComponent(request.model)}:generateContent?key=${encodeURIComponent(settings.geminiKey)}`;
+    const gemini = request.gemini || {};
+    const thinkingConfig = definedObject({
+      thinkingLevel: gemini.thinkingLevel,
+      thinkingBudget: gemini.thinkingBudget,
+    });
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -237,7 +291,15 @@ export async function requestAI(
               .map((file) => ({ inlineData: { mimeType: file.type, data: dataUrlBase64(file.data) } })),
           ],
         }],
-        generationConfig: { temperature },
+        generationConfig: definedObject({
+          temperature,
+          maxOutputTokens: gemini.maxOutputTokens,
+          topP: gemini.topP,
+          topK: gemini.topK,
+          seed: gemini.seed,
+          stopSequences: gemini.stopSequences?.length ? gemini.stopSequences : undefined,
+          thinkingConfig: Object.keys(thinkingConfig).length ? thinkingConfig : undefined,
+        }),
       }),
     });
     const data = await readJson(response, "Gemini");
@@ -249,6 +311,10 @@ export async function requestAI(
   if (request.provider === "claude") {
     if (!settings.claudeKey) throw new Error("Add an Anthropic API key in Settings.");
     const baseUrl = (settings.claudeUrl || "https://api.anthropic.com/v1").replace(/\/$/, "");
+    const claude = request.claude || {};
+    const thinking = claude.thinking === "enabled"
+      ? { type: "enabled", budget_tokens: claude.thinkingBudget ?? 1024 }
+      : claude.thinking ? { type: claude.thinking } : undefined;
     const response = await fetch(`${baseUrl}/messages`, {
       method: "POST",
       headers: {
@@ -257,10 +323,15 @@ export async function requestAI(
         "anthropic-version": "2023-06-01",
         "anthropic-dangerous-direct-browser-access": "true",
       },
-      body: JSON.stringify({
+      body: JSON.stringify(definedObject({
         model: request.model,
-        max_tokens: 2048,
-        temperature,
+        max_tokens: claude.maxTokens ?? 2048,
+        temperature: claude.thinking || claude.effort ? undefined : temperature,
+        top_p: claude.topP,
+        top_k: claude.topK,
+        stop_sequences: claude.stopSequences?.length ? claude.stopSequences : undefined,
+        thinking,
+        output_config: claude.effort ? { effort: claude.effort } : undefined,
         system: request.systemPrompt || undefined,
         messages: [{
           role: "user",
@@ -278,7 +349,7 @@ export async function requestAI(
               ]
             : request.prompt,
         }],
-      }),
+      })),
     });
     const data = await readJson(response, "Claude");
     return data.content

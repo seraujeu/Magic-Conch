@@ -70,8 +70,19 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AIProvider, listAvailableModels, OllamaRequestSettings, ProviderSettings, requestAI } from "../lib/ai-providers";
+import {
+  AIProvider,
+  ClaudeRequestSettings,
+  GeminiRequestSettings,
+  listAvailableModels,
+  OllamaRequestSettings,
+  OpenAIRequestSettings,
+  ProviderSettings,
+  requestAI,
+} from "../lib/ai-providers";
 import { collectFileAssets, fileAssetsPromptSections } from "../lib/file-content";
+import { directorySubfolderSegments } from "../lib/directory-path";
+import { chatSessionsFallbackJson, readStoredChatSessions, writeStoredChatSessions } from "../lib/chat-storage";
 import {
   BranchableMessage,
   MessageBranch,
@@ -99,8 +110,10 @@ import {
   WORKFLOW_SYNTAX,
   WorkflowSyntaxContext,
 } from "../lib/workflow-syntax";
+import { isWorkflowNodeActive } from "../lib/workflow-scheduler";
+import { workflowExportFilename, workflowFileText } from "../lib/workflow-files";
 
-type BuiltinNodeType = "start" | "input" | "request" | "string" | "integer" | "float" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "router-condition" | "router-ai" | "router-rule" | "end";
+type BuiltinNodeType = "start" | "input" | "request" | "workflow" | "string" | "integer" | "float" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
 type FileAsset = { name: string; type: string; data: string; size: number };
 type PortDataType = "prompt" | "files" | "document" | "text" | "number" | "boolean" | "string" | "integer" | "float" | "image" | "video" | "audio" | "any";
@@ -117,6 +130,7 @@ type WorkflowContext = {
   files: FileAsset[];
   values: Record<string, unknown>;
   syntax: WorkflowSyntaxContext;
+  workflowStack?: string[];
 };
 type FlowNode = {
   id: string;
@@ -132,6 +146,28 @@ type FlowNode = {
     model?: string;
     systemPrompt?: string;
     temperature?: number;
+    openaiReasoningEffort?: OpenAIRequestSettings["reasoningEffort"];
+    openaiVerbosity?: OpenAIRequestSettings["verbosity"];
+    openaiMaxCompletionTokens?: number;
+    openaiTopP?: number;
+    openaiFrequencyPenalty?: number;
+    openaiPresencePenalty?: number;
+    openaiSeed?: number;
+    openaiStop?: string;
+    geminiThinkingMode?: "minimal" | "low" | "medium" | "high" | "dynamic" | "off" | "budget";
+    geminiThinkingBudget?: number;
+    geminiMaxOutputTokens?: number;
+    geminiTopP?: number;
+    geminiTopK?: number;
+    geminiSeed?: number;
+    geminiStop?: string;
+    claudeThinkingMode?: ClaudeRequestSettings["thinking"];
+    claudeEffort?: ClaudeRequestSettings["effort"];
+    claudeThinkingBudget?: number;
+    claudeMaxTokens?: number;
+    claudeTopP?: number;
+    claudeTopK?: number;
+    claudeStop?: string;
     ollamaThink?: "auto" | "on" | "off" | "low" | "medium" | "high";
     ollamaKeepAlive?: string;
     ollamaNumCtx?: number;
@@ -145,7 +181,7 @@ type FlowNode = {
     ollamaStop?: string;
     key?: string;
     collision?: "overwrite" | "timestamp" | "increment";
-    loadMode?: "latest" | "all" | "exact";
+    loadMode?: "latest" | "all" | "exact" | "folder";
     directoryName?: string;
     subfolder?: string;
     saveFiles?: "data" | "files" | "both";
@@ -181,6 +217,7 @@ type FlowNode = {
     integerValue?: number;
     floatValue?: number;
     includeSubfolders?: boolean;
+    calledWorkflowId?: string;
   };
 };
 type FlowEdge = { id: string; from: string; fromPort?: string; to: string; toPort?: string; dataType?: PortDataType | "flow" };
@@ -258,6 +295,8 @@ type LiveModelActivity = {
 
 type DirectoryHandle = {
   name: string;
+  queryPermission?: (descriptor?: { mode?: "read" | "readwrite" }) => Promise<PermissionState>;
+  requestPermission?: (descriptor?: { mode?: "read" | "readwrite" }) => Promise<PermissionState>;
   getDirectoryHandle: (name: string, options?: { create?: boolean }) => Promise<DirectoryHandle>;
   getFileHandle: (
     name: string,
@@ -274,6 +313,60 @@ type DirectoryHandle = {
   }>;
 };
 
+const DIRECTORY_HANDLE_DATABASE = "magic-conch-directory-handles";
+const DIRECTORY_HANDLE_STORE = "node-directories";
+
+function openDirectoryHandleDatabase() {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(DIRECTORY_HANDLE_DATABASE, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(DIRECTORY_HANDLE_STORE)) {
+        request.result.createObjectStore(DIRECTORY_HANDLE_STORE);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function rememberNodeDirectoryHandle(nodeId: string, handle: DirectoryHandle) {
+  if (typeof indexedDB === "undefined") return;
+  const database = await openDirectoryHandleDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(DIRECTORY_HANDLE_STORE, "readwrite");
+    transaction.objectStore(DIRECTORY_HANDLE_STORE).put(handle, nodeId);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+  database.close();
+}
+
+async function restoreNodeDirectoryHandles() {
+  if (typeof indexedDB === "undefined") return {} as Record<string, DirectoryHandle>;
+  const database = await openDirectoryHandleDatabase();
+  const handles = await new Promise<Record<string, DirectoryHandle>>((resolve, reject) => {
+    const transaction = database.transaction(DIRECTORY_HANDLE_STORE, "readonly");
+    const store = transaction.objectStore(DIRECTORY_HANDLE_STORE);
+    const keysRequest = store.getAllKeys();
+    const valuesRequest = store.getAll();
+    transaction.oncomplete = () => resolve(Object.fromEntries(
+      keysRequest.result.map((key, index) => [String(key), valuesRequest.result[index] as DirectoryHandle]),
+    ));
+    transaction.onerror = () => reject(transaction.error);
+  });
+  database.close();
+  return handles;
+}
+
+async function ensureDirectoryPermission(handle: DirectoryHandle, mode: "read" | "readwrite") {
+  let permission = await handle.queryPermission?.({ mode });
+  if (permission === "granted" || permission === undefined) return;
+  permission = await handle.requestPermission?.({ mode });
+  if (permission !== "granted") {
+    throw new Error(`Allow ${mode === "readwrite" ? "read and write" : "read"} access to “${handle.name}”, or choose the directory again.`);
+  }
+}
+
 const NODE_META: Record<
   BuiltinNodeType,
   { label: string; subtitle: string; color: string; icon: typeof Play }
@@ -281,6 +374,7 @@ const NODE_META: Record<
   start: { label: "Start", subtitle: "Entry point", color: "#27a36a", icon: Play },
   input: { label: "Message", subtitle: "Prompt and file output", color: "#7c63e8", icon: MessageCircleQuestion },
   request: { label: "Request", subtitle: "Call an AI model", color: "#e17444", icon: Cloud },
+  workflow: { label: "Use Workflow", subtitle: "Run another workflow", color: "#6c68c9", icon: WorkflowIcon },
   string: { label: "String", subtitle: "Provide a string value", color: "#3689b5", icon: Variable },
   integer: { label: "Integer", subtitle: "Provide a whole number", color: "#b49332", icon: Variable },
   float: { label: "Float", subtitle: "Provide a decimal number", color: "#d09032", icon: Variable },
@@ -308,7 +402,7 @@ const BUILTIN_NODE_GROUPS: { id: string; label: string; types: BuiltinNodeType[]
   { id: "values", label: "Values", types: ["string", "integer", "float", "set-state"] },
   { id: "files", label: "Files", types: ["list-directory", "load", "save"] },
   { id: "processing", label: "Processing", types: ["transform", "code", "parser", "join"] },
-  { id: "flow-control", label: "Flow control", types: ["loop", "retry", "wait", "parallel"] },
+  { id: "flow-control", label: "Flow control", types: ["workflow", "loop", "retry", "wait", "parallel"] },
   { id: "routing", label: "Routing", types: ["router-condition", "router-ai", "router-rule"] },
 ];
 
@@ -350,12 +444,13 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
   if (node.type === "start") return { inputs: [{ id: "agent_name", label: "agent name", type: "string" }, { id: "start_message", label: "start message", type: "string" }], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
   if (node.type === "input") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "question", label: "question", type: "string" }, { id: "files", label: "files", type: "files" }, ...mediaInputs, documentIn], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
   if (node.type === "request") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "system_prompt", label: "system prompt", type: "string" }, { id: "model", label: "model", type: "string" }, { id: "temperature", label: "temperature", type: "float" }, { id: "output_file_name", label: "output file", type: "string" }, { id: "files", label: "files", type: "files" }, ...mediaInputs, documentIn], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
+  if (node.type === "workflow") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaInputs, documentIn], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
   if (node.type === "string") return { inputs: [], outputs: [{ id: "value", label: "value", type: "string" }] };
   if (node.type === "integer") return { inputs: [], outputs: [{ id: "value", label: "value", type: "integer" }] };
   if (node.type === "float") return { inputs: [], outputs: [{ id: "value", label: "value", type: "float" }] };
   if (node.type === "list-directory") return { inputs: [{ id: "trigger", label: "trigger", type: "any" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "recursive", label: "recursive", type: "boolean" }], outputs: [{ id: "files", label: "files", type: "files" }, { id: "image", label: "images", type: "image" }, { id: "video", label: "videos", type: "video" }, { id: "audio", label: "audio", type: "audio" }, { id: "names", label: "names", type: "any" }, { id: "count", label: "count", type: "integer" }] };
   if (node.type === "save") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "key", label: "file key", type: "string" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "files", label: "files", type: "files" }, ...mediaInputs], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs] };
-  if (node.type === "load") return { inputs: [{ id: "trigger", label: "trigger", type: "any" }, { id: "key", label: "file key", type: "string" }, { id: "subfolder", label: "subfolder", type: "string" }], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
+  if (node.type === "load") return { inputs: [{ id: "trigger", label: "trigger", type: "any" }, { id: "key", label: "file key", type: "string" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "recursive", label: "recursive", type: "boolean" }], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
   if (node.type === "set-state") return { inputs: [{ id: "value", label: "value", type: "any" }], outputs: [{ id: "value", label: node.config.variableName || "value", type: "any" }] };
   if (node.type === "transform") return { inputs: [{ id: "value", label: "value", type: "any" }], outputs: [{ id: "result", label: "result", type: "any" }] };
   if (node.type === "loop") return { inputs: [{ id: "items", label: "items", type: "any" }], outputs: [{ id: "item", label: "item", type: "any" }, { id: "index", label: "index", type: "number" }, { id: "has_more", label: "has more", type: "boolean" }, { id: "done", label: "done", type: "boolean" }] };
@@ -764,6 +859,48 @@ const modelDefaults: Record<AIProvider, string> = {
   ollama: "llama3.2",
 };
 
+function lines(value?: string) {
+  return value?.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+}
+
+function openAIRequestSettings(node: FlowNode): OpenAIRequestSettings {
+  return {
+    reasoningEffort: node.config.openaiReasoningEffort,
+    verbosity: node.config.openaiVerbosity,
+    maxCompletionTokens: node.config.openaiMaxCompletionTokens,
+    topP: node.config.openaiTopP,
+    frequencyPenalty: node.config.openaiFrequencyPenalty,
+    presencePenalty: node.config.openaiPresencePenalty,
+    seed: node.config.openaiSeed,
+    stop: lines(node.config.openaiStop),
+  };
+}
+
+function geminiRequestSettings(node: FlowNode): GeminiRequestSettings {
+  const mode = node.config.geminiThinkingMode;
+  return {
+    thinkingLevel: mode === "minimal" || mode === "low" || mode === "medium" || mode === "high" ? mode : undefined,
+    thinkingBudget: mode === "dynamic" ? -1 : mode === "off" ? 0 : mode === "budget" ? node.config.geminiThinkingBudget : undefined,
+    maxOutputTokens: node.config.geminiMaxOutputTokens,
+    topP: node.config.geminiTopP,
+    topK: node.config.geminiTopK,
+    seed: node.config.geminiSeed,
+    stopSequences: lines(node.config.geminiStop),
+  };
+}
+
+function claudeRequestSettings(node: FlowNode): ClaudeRequestSettings {
+  return {
+    thinking: node.config.claudeThinkingMode,
+    thinkingBudget: node.config.claudeThinkingBudget,
+    effort: node.config.claudeEffort,
+    maxTokens: node.config.claudeMaxTokens,
+    topP: node.config.claudeTopP,
+    topK: node.config.claudeTopK,
+    stopSequences: lines(node.config.claudeStop),
+  };
+}
+
 function ollamaRequestSettings(node: FlowNode): OllamaRequestSettings {
   const think = node.config.ollamaThink;
   return {
@@ -777,7 +914,7 @@ function ollamaRequestSettings(node: FlowNode): OllamaRequestSettings {
     seed: node.config.ollamaSeed,
     repeatPenalty: node.config.ollamaRepeatPenalty,
     repeatLastN: node.config.ollamaRepeatLastN,
-    stop: node.config.ollamaStop?.split("\n").map((value) => value.trim()).filter(Boolean),
+    stop: lines(node.config.ollamaStop),
   };
 }
 
@@ -846,6 +983,7 @@ export default function Workbench() {
   const [debugEvents, setDebugEvents] = useState<DebugEvent[]>([]);
   const [liveModelActivities, setLiveModelActivities] = useState<Record<string, LiveModelActivity>>({});
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [isDraggingWorkflowFile, setIsDraggingWorkflowFile] = useState(false);
   const [editingMessage, setEditingMessage] = useState<{ id: string; text: string } | null>(null);
   const [editingWorkflow, setEditingWorkflow] = useState<{ id: string; name: string } | null>(null);
   const [editingChatSession, setEditingChatSession] = useState<{ id: string; title: string } | null>(null);
@@ -892,8 +1030,10 @@ export default function Workbench() {
   const chatUndoRef = useRef<ChatSnapshot[]>([]);
   const chatRedoRef = useRef<ChatSnapshot[]>([]);
   const dragDepthRef = useRef(0);
+  const workflowDragDepthRef = useRef(0);
   const storageRestoredRef = useRef(false);
-  const nodeFolderHandlesRef = useRef<Record<string, DirectoryHandle>>({});
+  const storageWarningShownRef = useRef(false);
+  const [nodeFolderHandles, setNodeFolderHandles] = useState<Record<string, DirectoryHandle>>({});
   const dragRef = useRef<{
     startX: number;
     startY: number;
@@ -909,6 +1049,13 @@ export default function Workbench() {
     () => workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0],
     [activeWorkflowId, workflows],
   );
+  useEffect(() => {
+    let active = true;
+    restoreNodeDirectoryHandles()
+      .then((handles) => { if (active) setNodeFolderHandles((current) => ({ ...handles, ...current })); })
+      .catch(() => { /* Folder access can still be reconnected with Choose. */ });
+    return () => { active = false; };
+  }, []);
   const portLayoutKey = useMemo(
     () => activeWorkflow.nodes.map((node) => {
       const schema = getNodeSchema(node, plugins);
@@ -1023,13 +1170,15 @@ export default function Workbench() {
   const matchingNodeCount = nodeLibraryGroups.reduce((total, group) => total + group.items.length, 0);
 
   useEffect(() => {
-    const restore = window.setTimeout(() => {
+    const restore = window.setTimeout(async () => {
       try {
         const savedFlows = localStorage.getItem("magic-conch-workflows");
         const savedSettings = localStorage.getItem("magic-conch-provider-settings");
         const savedPlugins = localStorage.getItem("magic-conch-plugins");
         const savedUndoLimit = localStorage.getItem("magic-conch-undo-limit");
-        const savedSessions = localStorage.getItem("magic-conch-chat-sessions");
+        const savedSessionsJson = localStorage.getItem("magic-conch-chat-sessions");
+        const indexedSessions = await readStoredChatSessions<Partial<ChatSession>[]>().catch(() => null);
+        const savedSessions = indexedSessions ?? (savedSessionsJson ? JSON.parse(savedSessionsJson) as Partial<ChatSession>[] : null);
         const savedChatFolders = localStorage.getItem("magic-conch-chat-folders");
         const savedActiveSession = localStorage.getItem("magic-conch-active-session");
         const restoredPlugins = savedPlugins ? JSON.parse(savedPlugins) as MagicConchPlugin[] : [];
@@ -1072,7 +1221,7 @@ export default function Workbench() {
           })));
         }
         if (savedSessions) {
-          const restored = JSON.parse(savedSessions) as Partial<ChatSession>[];
+          const restored = savedSessions;
           const byAge = [...restored].sort((a, b) => (Date.parse(a.updatedAt || "") || 0) - (Date.parse(b.updatedAt || "") || 0));
           const assignedNumbers = new Map(byAge.map((session, index) => [session.id, session.sessionNumber || index + 1]));
           const sessions = restored.map((session, index) => ({
@@ -1085,6 +1234,11 @@ export default function Workbench() {
             setActiveSessionId(chosen.id);
             setMessages(chosen.messages);
             setActiveWorkflowId(chosen.workflowId);
+          }
+          if (!indexedSessions && savedSessionsJson) {
+            await writeStoredChatSessions(sessions)
+              .then(() => localStorage.removeItem("magic-conch-chat-sessions"))
+              .catch(() => { /* The quota-safe fallback remains available. */ });
           }
         }
       } catch {
@@ -1136,8 +1290,23 @@ export default function Workbench() {
 
   useEffect(() => {
     if (!storageRestoredRef.current) return;
-    localStorage.setItem("magic-conch-chat-sessions", JSON.stringify(chatSessions));
-    localStorage.setItem("magic-conch-active-session", activeSessionId);
+    writeStoredChatSessions(chatSessions)
+      .then(() => localStorage.removeItem("magic-conch-chat-sessions"))
+      .catch(() => {
+        try {
+          localStorage.setItem("magic-conch-chat-sessions", chatSessionsFallbackJson(chatSessions));
+        } catch {
+          if (!storageWarningShownRef.current) {
+            storageWarningShownRef.current = true;
+            showToast("Chat text is available now, but this browser could not save more history");
+          }
+        }
+      });
+    try {
+      localStorage.setItem("magic-conch-active-session", activeSessionId);
+    } catch {
+      // A full localStorage must never interrupt the active chat.
+    }
   }, [activeSessionId, chatSessions]);
 
   useEffect(() => {
@@ -1422,6 +1591,18 @@ export default function Workbench() {
     showToast(`${assets.length} file${assets.length === 1 ? "" : "s"} attached`);
   }
 
+  function handleWorkflowDragEnter(event: ReactDragEvent<HTMLElement>) {
+    event.preventDefault();
+    workflowDragDepthRef.current += 1;
+    if (event.dataTransfer.types.includes("Files")) setIsDraggingWorkflowFile(true);
+  }
+
+  function handleWorkflowDragLeave(event: ReactDragEvent<HTMLElement>) {
+    event.preventDefault();
+    workflowDragDepthRef.current = Math.max(0, workflowDragDepthRef.current - 1);
+    if (workflowDragDepthRef.current === 0) setIsDraggingWorkflowFile(false);
+  }
+
   function rememberWorkflow(workflow: Workflow) {
     const history = undoHistoryRef.current[workflow.id] || [];
     undoHistoryRef.current[workflow.id] = [...history, structuredClone(workflow)].slice(-undoLimit);
@@ -1507,6 +1688,8 @@ export default function Workbench() {
       config:
         type === "request"
           ? { provider: "openai", model: modelDefaults.openai, temperature: 0.7 }
+          : type === "workflow"
+            ? { calledWorkflowId: workflows.find((workflow) => workflow.id !== activeWorkflow.id)?.id || "" }
           : type === "string"
             ? { stringValue: "" }
             : type === "integer"
@@ -1991,7 +2174,7 @@ export default function Workbench() {
   async function writeJsonToFolder(folder: DirectoryHandle, filename: string, value: unknown) {
     const file = await folder.getFileHandle(filename, { create: true });
     const writable = await file.createWritable();
-    await writable.write(JSON.stringify(value, null, 2));
+    await writable.write(new Blob([JSON.stringify(value, null, 2)], { type: "application/json;charset=utf-8" }));
     await writable.close();
   }
 
@@ -2030,19 +2213,6 @@ export default function Workbench() {
     await writable.close();
   }
 
-  function subfolderSegments(path = "") {
-    const normalized = path.trim().replace(/\\/g, "/");
-    if (!normalized || normalized === ".") return [];
-    if (normalized.startsWith("/") || /^[a-zA-Z]:/.test(normalized)) {
-      throw new Error("Subfolder paths must be relative to the selected directory.");
-    }
-    const segments = normalized.split("/").filter((segment) => segment && segment !== ".");
-    if (segments.some((segment) => segment === ".." || /[<>:"|?*]/.test(segment) || [...segment].some((character) => character.charCodeAt(0) < 32))) {
-      throw new Error("The subfolder path contains an unsupported segment.");
-    }
-    return segments;
-  }
-
   async function resolveSubfolder(folder: DirectoryHandle, segments: string[], create: boolean) {
     let current = folder;
     for (const segment of segments) {
@@ -2067,7 +2237,8 @@ export default function Workbench() {
       if (kind === "workflow") setWorkflowFolder(handle);
       else if (kind === "database") setDatabaseFolder(handle);
       else if (nodeId) {
-        nodeFolderHandlesRef.current[nodeId] = handle;
+        setNodeFolderHandles((current) => ({ ...current, [nodeId]: handle }));
+        await rememberNodeDirectoryHandle(nodeId, handle).catch(() => { /* The handle remains usable for this session. */ });
         if (nodeId === selectedNodeId) updateNode({ config: { directoryName: handle.name } });
       }
       showToast(`${handle.name} connected`);
@@ -2135,7 +2306,7 @@ export default function Workbench() {
   async function saveWorkflow() {
     if (!activeWorkflow) return;
     if (workflowFolder) {
-      const filename = `${activeWorkflow.name.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "workflow"}.json`;
+      const filename = workflowExportFilename(activeWorkflow.name);
       await writeJsonToFolder(workflowFolder, filename, activeWorkflow);
       for (const asset of activeWorkflow.files || []) {
         const assetName = await collisionSafeName(workflowFolder, asset.name, "increment");
@@ -2148,43 +2319,62 @@ export default function Workbench() {
   }
 
   function exportWorkflow() {
-    const blob = new Blob([JSON.stringify(activeWorkflow, null, 2)], {
-      type: "application/json",
+    const json = JSON.stringify(activeWorkflow, null, 2);
+    const blob = new Blob([new TextEncoder().encode(json)], {
+      type: "application/json;charset=utf-8",
     });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `${activeWorkflow.name.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "workflow"}.json`;
+    link.download = workflowExportFilename(activeWorkflow.name);
     link.click();
     URL.revokeObjectURL(url);
     showToast("Workflow exported");
   }
 
-  function importWorkflow(event: ChangeEvent<HTMLInputElement>) {
+  async function importWorkflowFile(file: File): Promise<boolean> {
+    try {
+      const parsed = JSON.parse(workflowFileText(await file.text())) as Workflow;
+      if (!parsed.nodes || !parsed.edges || !parsed.name) throw new Error();
+      const imported = migrateWorkflow({ ...parsed, id: uid("workflow"), updatedAt: new Date().toISOString() }, plugins);
+      setWorkflows((current) => [...current, imported]);
+      setActiveWorkflowId(imported.id);
+      setSelectedNodeId(null);
+      setSelectedNodeIds([]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function importWorkflow(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const parsed = JSON.parse(String(reader.result)) as Workflow;
-        if (!parsed.nodes || !parsed.edges || !parsed.name) throw new Error();
-        const imported = migrateWorkflow({ ...parsed, id: uid("workflow"), updatedAt: new Date().toISOString() }, plugins);
-        setWorkflows((current) => [...current, imported]);
-        setActiveWorkflowId(imported.id);
-        showToast("Workflow imported");
-      } catch {
-        showToast("That file is not a valid workflow");
-      }
-      event.target.value = "";
-    };
-    reader.readAsText(file);
+    if (file) showToast(await importWorkflowFile(file) ? "Workflow imported" : "That file is not a valid workflow");
+    event.target.value = "";
+  }
+
+  async function handleWorkflowDrop(event: ReactDragEvent<HTMLElement>) {
+    event.preventDefault();
+    workflowDragDepthRef.current = 0;
+    setIsDraggingWorkflowFile(false);
+    const files = Array.from(event.dataTransfer.files);
+    if (!files.length) return;
+
+    let importedCount = 0;
+    for (const file of files) {
+      if (await importWorkflowFile(file)) importedCount += 1;
+    }
+    showToast(importedCount
+      ? `${importedCount} workflow${importedCount === 1 ? "" : "s"} imported`
+      : "No valid workflow files were dropped");
   }
 
   async function persistRecord(node: FlowNode, value: string, files: FileAsset[]) {
     const key = node.config.key || "workflow-result";
     const safeKey = (key || "workflow-result").replace(/[^a-zA-Z0-9-_]/g, "-");
-    const segments = subfolderSegments(node.config.subfolder);
-    const rootFolder = nodeFolderHandlesRef.current[node.id] || databaseFolder;
+    const rootFolder = nodeFolderHandles[node.id] || databaseFolder;
+    if (rootFolder) await ensureDirectoryPermission(rootFolder, "readwrite");
+    const segments = directorySubfolderSegments(node.config.subfolder, rootFolder?.name);
     const folder = rootFolder ? await resolveSubfolder(rootFolder, segments, true) : null;
     const savedFiles: string[] = [];
     if (folder && node.config.saveFiles !== "data") {
@@ -2212,8 +2402,9 @@ export default function Workbench() {
 
   async function loadRecord(node: FlowNode) {
     const safeKey = (node.config.key || "workflow-result").replace(/[^a-zA-Z0-9-_]/g, "-");
-    const segments = subfolderSegments(node.config.subfolder);
-    const rootFolder = nodeFolderHandlesRef.current[node.id] || databaseFolder;
+    const rootFolder = nodeFolderHandles[node.id] || databaseFolder;
+    if (rootFolder) await ensureDirectoryPermission(rootFolder, "read");
+    const segments = directorySubfolderSegments(node.config.subfolder, rootFolder?.name);
     type StoredRecord = { value?: unknown; files?: string[]; assets?: FileAsset[] };
     const localRecord = () => {
       const raw = localStorage.getItem(localRecordKey(safeKey, segments));
@@ -2277,9 +2468,14 @@ export default function Workbench() {
   }
 
   async function loadDirectoryFiles(node: FlowNode, subfolder: string, recursive: boolean) {
-    const rootFolder = nodeFolderHandlesRef.current[node.id] || databaseFolder;
-    if (!rootFolder) throw new Error("Choose a directory for this Load Directory node first.");
-    const folder = await resolveSubfolder(rootFolder, subfolderSegments(subfolder), false);
+    const rootFolder = nodeFolderHandles[node.id] || databaseFolder;
+    if (!rootFolder) {
+      throw new Error(node.config.directoryName
+        ? `Reconnect the “${node.config.directoryName}” Node directory; its browser permission is no longer available.`
+        : `Choose a directory for this ${node.type === "load" ? "Load" : "Load Directory"} node first.`);
+    }
+    await ensureDirectoryPermission(rootFolder, "read");
+    const folder = await resolveSubfolder(rootFolder, directorySubfolderSegments(subfolder, rootFolder.name), false);
     const assets: FileAsset[] = [];
     const visit = async (current: DirectoryHandle, prefix = "") => {
       for await (const entry of current.values()) {
@@ -2307,15 +2503,114 @@ export default function Workbench() {
     return files.filter((file) => file.type.startsWith(`${kind}/`) || extensions[kind].test(file.name));
   }
 
+  async function executeCalledWorkflow(
+    workflow: Workflow,
+    prompt: string,
+    incomingFiles: FileAsset[],
+    parentContext: WorkflowContext,
+    callerWorkflow: Workflow,
+  ) {
+    const workflowStack = parentContext.workflowStack?.length ? parentContext.workflowStack : [callerWorkflow.id];
+    if (workflowStack.includes(workflow.id)) {
+      const names = [...workflowStack, workflow.id].map((id) => workflows.find((item) => item.id === id)?.name || id);
+      throw new Error(`Workflow recursion detected: ${names.join(" → ")}.`);
+    }
+
+    const start = workflow.nodes.find((node) => node.type === "start");
+    if (!start) throw new Error(`Called workflow “${workflow.name}” needs a Start node.`);
+    const files = [...(workflow.files || []), ...incomingFiles];
+    const context: WorkflowContext = {
+      userMessage: prompt,
+      files,
+      values: {},
+      syntax: syntaxContextFor(workflow),
+      workflowStack: [...workflowStack, workflow.id],
+    };
+    context.values[portValueKey(start.id, "prompt")] = prompt;
+    context.values[portValueKey(start.id, "files")] = files;
+    context.values[portValueKey(start.id, "image")] = mediaAssets(files, "image");
+    context.values[portValueKey(start.id, "video")] = mediaAssets(files, "video");
+    context.values[portValueKey(start.id, "audio")] = mediaAssets(files, "audio");
+    context.values[portValueKey(start.id, "document")] = files.filter(isDocumentAsset);
+
+    const reachable = new Set<string>([start.id]);
+    const queue = [start.id];
+    while (queue.length) {
+      const sourceId = queue.shift()!;
+      workflow.edges.filter((edge) => edge.from === sourceId).forEach((edge) => {
+        if (!reachable.has(edge.to)) { reachable.add(edge.to); queue.push(edge.to); }
+      });
+    }
+    let addedDependency = true;
+    while (addedDependency) {
+      addedDependency = false;
+      workflow.edges.forEach((edge) => {
+        if (reachable.has(edge.to) && !reachable.has(edge.from)) {
+          reachable.add(edge.from);
+          addedDependency = true;
+        }
+      });
+    }
+
+    const completed = new Set([start.id]);
+    const skipped = new Set<string>();
+    const emitted = new Set([
+      portValueKey(start.id, "prompt"),
+      portValueKey(start.id, "files"),
+      portValueKey(start.id, "image"),
+      portValueKey(start.id, "video"),
+      portValueKey(start.id, "audio"),
+      portValueKey(start.id, "document"),
+    ]);
+    const endResults: { text: string; files: FileAsset[] }[] = [];
+
+    while (true) {
+      const settled = new Set([...completed, ...skipped]);
+      const pending = workflow.nodes.filter((node) => reachable.has(node.id) && !settled.has(node.id));
+      if (!pending.length) break;
+      const ready = pending.filter((node) => workflow.edges
+        .filter((edge) => edge.to === node.id && reachable.has(edge.from))
+        .every((edge) => settled.has(edge.from)));
+      if (!ready.length) throw new Error(`Called workflow “${workflow.name}” contains a cycle.`);
+      const activeReady = ready.filter((node) => isWorkflowNodeActive({
+        nodeType: node.type,
+        inputPorts: getNodeSchema(node, plugins).inputs,
+        incoming: workflow.edges.filter((edge) => edge.to === node.id && reachable.has(edge.from)),
+        emittedPortKeys: emitted,
+      }));
+      ready.filter((node) => !activeReady.includes(node)).forEach((node) => skipped.add(node.id));
+      if (activeReady.some((node) => node.type === "input")) {
+        throw new Error(`Called workflow “${workflow.name}” pauses at a Message node. Reusable workflows must run from Start to End without requesting another message.`);
+      }
+      const results = await Promise.all(activeReady.map(async (node) => ({
+        node,
+        result: await executeGraphNode(node, context, emitted, workflow),
+      })));
+      results.forEach(({ node, result }) => {
+        completed.add(node.id);
+        result.emittedPortKeys.forEach((key) => emitted.add(key));
+        if (result.endResult) endResults.push(result.endResult);
+      });
+    }
+
+    if (!endResults.length) throw new Error(`Called workflow “${workflow.name}” finished without reaching an End node.`);
+    return {
+      text: endResults.map((result) => result.text).filter(Boolean).join("\n\n"),
+      files: collectFileAssets(endResults.map((result) => result.files)) as FileAsset[],
+      endCount: endResults.length,
+    };
+  }
+
   async function executeGraphNode(
     sourceNode: FlowNode,
     context: WorkflowContext,
     availablePortKeys: Set<string>,
+    workflow: Workflow = activeWorkflow,
   ): Promise<{ emittedPortKeys: string[]; endResult?: { text: string; files: FileAsset[] } }> {
       const node = expandWorkflowSyntaxInValue(sourceNode, context.syntax);
       const emittedPortKeys = new Set<string>();
       const inputFor = <T,>(portId: string, fallback: T): T => {
-        const edges = activeWorkflow.edges.filter(
+        const edges = workflow.edges.filter(
           (candidate) => candidate.to === node.id && candidate.toPort === portId && availablePortKeys.has(portValueKey(candidate.from, candidate.fromPort || "")),
         );
         if (!edges.length) return fallback;
@@ -2426,6 +2721,9 @@ export default function Workbench() {
             temperature: Number(inputFor("temperature", node.config.temperature ?? 0.7)),
             prompt,
             files: fileInput,
+            openai: provider === "openai" ? openAIRequestSettings(node) : undefined,
+            gemini: provider === "gemini" ? geminiRequestSettings(node) : undefined,
+            claude: provider === "claude" ? claudeRequestSettings(node) : undefined,
             ollama: provider === "ollama" ? ollamaRequestSettings(node) : undefined,
           },
           providerSettings,
@@ -2469,6 +2767,22 @@ export default function Workbench() {
         debugDetail = `Generated ${context.lastOutput.length} prompt characters and passed ${fileInput.length} file${fileInput.length === 1 ? "" : "s"}.`;
       }
 
+      if (node.type === "workflow") {
+        const calledWorkflowId = node.config.calledWorkflowId;
+        const calledWorkflow = workflows.find((item) => item.id === calledWorkflowId);
+        if (!calledWorkflowId) throw new Error(`Choose a workflow for “${node.name}”.`);
+        if (!calledWorkflow) throw new Error(`The workflow selected by “${node.name}” no longer exists.`);
+        const result = await executeCalledWorkflow(calledWorkflow, String(promptInput), fileInput, context, workflow);
+        context.lastOutput = result.text;
+        output("prompt", result.text);
+        output("files", result.files);
+        output("image", mediaAssets(result.files, "image"));
+        output("video", mediaAssets(result.files, "video"));
+        output("audio", mediaAssets(result.files, "audio"));
+        output("document", result.files.filter(isDocumentAsset));
+        debugDetail = `Ran “${calledWorkflow.name}” and collected ${result.endCount} End result${result.endCount === 1 ? "" : "s"}.`;
+      }
+
       if (node.type === "save") {
         const effectiveNode = { ...node, config: { ...node.config, key: String(inputFor("key", node.config.key || "workflow-result")), subfolder: String(inputFor("subfolder", node.config.subfolder || "")) } };
         await persistRecord(effectiveNode, String(promptInput), fileInput);
@@ -2482,7 +2796,16 @@ export default function Workbench() {
 
       if (node.type === "load") {
         const effectiveNode = { ...node, config: { ...node.config, key: String(inputFor("key", node.config.key || "workflow-result")), subfolder: String(inputFor("subfolder", node.config.subfolder || "")) } };
-        const loaded = await loadRecord(effectiveNode);
+        const loaded = node.config.loadMode === "folder"
+          ? await (async () => {
+              const files = await loadDirectoryFiles(
+                effectiveNode,
+                effectiveNode.config.subfolder || "",
+                Boolean(inputFor("recursive", node.config.includeSubfolders || false)),
+              );
+              return { value: files.map((file) => file.name).join("\n"), files };
+            })()
+          : await loadRecord(effectiveNode);
         context.loadedData = loaded.value;
         context.lastOutput = loaded.value;
         output("prompt", loaded.value);
@@ -2491,7 +2814,9 @@ export default function Workbench() {
         output("video", mediaAssets(loaded.files, "video"));
         output("audio", mediaAssets(loaded.files, "audio"));
         output("document", loaded.files.filter(isDocumentAsset));
-        debugDetail = `Loaded ${loaded.value.length} prompt characters and ${loaded.files.length} file${loaded.files.length === 1 ? "" : "s"} from storage.`;
+        debugDetail = node.config.loadMode === "folder"
+          ? `Loaded all ${loaded.files.length} file${loaded.files.length === 1 ? "" : "s"} from ${node.config.directoryName || "the selected folder"}.`
+          : `Loaded ${loaded.value.length} prompt characters and ${loaded.files.length} file${loaded.files.length === 1 ? "" : "s"} from storage.`;
       }
 
       if (node.type === "set-state") {
@@ -2635,14 +2960,18 @@ export default function Workbench() {
 
       if (node.type === "router-ai") {
         const options = node.config.routeOptions?.length ? node.config.routeOptions : [{ id: "route-1", label: "Option 1" }];
+        const provider = node.config.provider || "openai";
         const decision = await requestAI(
           {
-            provider: node.config.provider || "openai",
-            model: node.config.model || modelDefaults[node.config.provider || "openai"],
+            provider,
+            model: node.config.model || modelDefaults[provider],
             temperature: 0,
             systemPrompt: `You are a routing classifier. Reply with only the option number from 1 to ${options.length}.`,
             prompt: `${node.config.routeCriteria || "Choose the best path."}\n\n${options.map((option, index) => `${index + 1}. ${option.label}`).join("\n")}\n\nInput:\n${String(promptInput)}`,
-            ollama: node.config.provider === "ollama" ? ollamaRequestSettings(node) : undefined,
+            openai: provider === "openai" ? openAIRequestSettings(node) : undefined,
+            gemini: provider === "gemini" ? geminiRequestSettings(node) : undefined,
+            claude: provider === "claude" ? claudeRequestSettings(node) : undefined,
+            ollama: provider === "ollama" ? ollamaRequestSettings(node) : undefined,
           },
           providerSettings,
         );
@@ -2732,12 +3061,11 @@ export default function Workbench() {
 
       const activeReady = ready.filter((node) => {
         const incoming = activeWorkflow.edges.filter((edge) => edge.to === node.id && reachable.has(edge.from));
-        const activeIncoming = incoming.filter((edge) => emitted.has(portValueKey(edge.from, edge.fromPort || "")));
-        if (!incoming.length) return getNodeSchema(node, plugins).inputs.length === 0;
-        if (!activeIncoming.length) return false;
-        return getNodeSchema(node, plugins).inputs.every((port) => {
-          const portEdges = incoming.filter((edge) => edge.toPort === port.id);
-          return !portEdges.length || port.multiple || portEdges.some((edge) => activeIncoming.includes(edge));
+        return isWorkflowNodeActive({
+          nodeType: node.type,
+          inputPorts: getNodeSchema(node, plugins).inputs,
+          incoming,
+          emittedPortKeys: emitted,
         });
       });
       ready.filter((node) => !activeReady.includes(node)).forEach((node) => skipped.add(node.id));
@@ -2787,12 +3115,17 @@ export default function Workbench() {
       }
     }
 
+    const hasReachableEnd = activeWorkflow.nodes.some((node) => node.type === "end" && reachable.has(node.id));
     setMessages((current) => [
       ...current,
       ...(endResults.length ? endResults.map((result) => ({
         id: uid("message"), role: "assistant" as const, text: result.text, time: timeNow(), meta: getStartSettings(activeWorkflow, context.syntax).agentName, files: result.files,
       })) : [{
-        id: uid("message"), role: "assistant" as const, text: "Workflow finished without an End node.", time: timeNow(), meta: getStartSettings(activeWorkflow, context.syntax).agentName,
+        id: uid("message"), role: "assistant" as const,
+        text: hasReachableEnd
+          ? "Workflow stopped before reaching its End node. Check for an inactive route or upstream trigger."
+          : "Workflow finished without a reachable End node.",
+        time: timeNow(), meta: getStartSettings(activeWorkflow, context.syntax).agentName,
       }]),
     ]);
     setPendingInput(null);
@@ -2804,7 +3137,7 @@ export default function Workbench() {
     const start = activeWorkflow.nodes.find((node) => node.type === "start");
     if (!start) throw new Error("This workflow needs a Start node.");
     const files = [...(activeWorkflow.files || []), ...messageFiles];
-    const context: WorkflowContext = { userMessage: text, files, values: {}, syntax: syntaxContextFor() };
+    const context: WorkflowContext = { userMessage: text, files, values: {}, syntax: syntaxContextFor(), workflowStack: [activeWorkflow.id] };
     context.values[portValueKey(start.id, "prompt")] = text;
     context.values[portValueKey(start.id, "files")] = files;
     context.values[portValueKey(start.id, "image")] = mediaAssets(files, "image");
@@ -3041,7 +3374,14 @@ export default function Workbench() {
       </header>
 
       {tab === "workflow" ? (
-        <section className="workflow-view">
+        <section
+          className={`workflow-view ${isDraggingWorkflowFile ? "dragging-files" : ""}`}
+          onDragEnter={handleWorkflowDragEnter}
+          onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; }}
+          onDragLeave={handleWorkflowDragLeave}
+          onDrop={handleWorkflowDrop}
+        >
+          {isDraggingWorkflowFile && <div className="file-drop-overlay"><span><FileJson size={24} /><strong>Drop workflow files to import</strong><small>Magic Conch workflow JSON files are supported.</small></span></div>}
           <aside className={`workflow-sidebar ${sidebarOpen ? "open" : ""}`}>
             <div className="sidebar-heading">
               <span>Workflows</span>
@@ -3216,7 +3556,7 @@ export default function Workbench() {
                         <span className="node-icon"><Icon size={17} /></span>
                         <span className="node-text">
                           <strong>{node.name}</strong>
-                          <small>{node.type === "request" || node.type === "router-ai" ? `${node.config.provider || "openai"} · ${node.config.model || "model"}` : meta.subtitle}</small>
+                          <small>{node.type === "request" || node.type === "router-ai" ? `${node.config.provider || "openai"} · ${node.config.model || "model"}` : node.type === "workflow" ? workflows.find((workflow) => workflow.id === node.config.calledWorkflowId)?.name || "Select a workflow" : meta.subtitle}</small>
                         </span>
                       </div>
                       <div className="node-ports">
@@ -3272,6 +3612,15 @@ export default function Workbench() {
                   {selectedNode.type === "input" && (
                     <label className="field-label">Question<textarea rows={4} value={selectedNode.config.prompt || ""} onChange={(event) => updateNode({ config: { prompt: event.target.value } })} /></label>
                   )}
+                  {selectedNode.type === "workflow" && (
+                    <label className="field-label">Workflow
+                      <div className="select-wrap"><select value={selectedNode.config.calledWorkflowId || ""} onChange={(event) => updateNode({ config: { calledWorkflowId: event.target.value } })}>
+                        <option value="">Select a workflow…</option>
+                        {workflows.filter((workflow) => workflow.id !== activeWorkflow.id).map((workflow) => <option key={workflow.id} value={workflow.id}>{workflow.name}</option>)}
+                      </select><ChevronDown size={14} /></div>
+                      <small className="field-help">The selected workflow runs from Start to End using this node&apos;s prompt and files. Called workflows cannot pause at a Message node.</small>
+                    </label>
+                  )}
                   {selectedNode.type === "set-state" && <>
                     <label className="field-label">Variable name<input value={selectedNode.config.variableName || ""} placeholder="result" onChange={(event) => updateNode({ config: { variableName: event.target.value } })} /></label>
                     <label className="field-label">Value type<div className="select-wrap"><select value={selectedNode.config.valueType || "text"} onChange={(event) => updateNode({ config: { valueType: event.target.value as FlowNode["config"]["valueType"] } })}><option value="text">Text</option><option value="number">Number</option><option value="boolean">Boolean</option><option value="json">JSON</option></select><ChevronDown size={14} /></div></label>
@@ -3316,6 +3665,55 @@ export default function Workbench() {
                         <label className="field-label">Routing criteria<textarea rows={4} value={selectedNode.config.routeCriteria || ""} placeholder="Describe when to choose path A or B…" onChange={(event) => updateNode({ config: { routeCriteria: event.target.value } })} /></label>
                       </>}
                       <label className="field-label range-label"><span>Temperature <b>{selectedNode.config.temperature ?? 0.7}</b></span><input type="range" min="0" max="2" step="0.1" value={selectedNode.config.temperature ?? 0.7} onChange={(event) => updateNode({ config: { temperature: Number(event.target.value) } })} /></label>
+                      {(selectedNode.config.provider || "openai") === "openai" && (
+                        <details className="provider-advanced" open>
+                          <summary><BrainCircuit size={14} /><span><b>OpenAI generation settings</b><small>Reasoning effort, response length, sampling, and limits</small></span><ChevronDown size={14} /></summary>
+                          <div className="provider-fields">
+                            <label className="field-label">Reasoning effort<div className="select-wrap"><select value={selectedNode.config.openaiReasoningEffort || "default"} onChange={(event) => updateNode({ config: { openaiReasoningEffort: event.target.value === "default" ? undefined : event.target.value as OpenAIRequestSettings["reasoningEffort"] } })}><option value="default">Model default</option><option value="none">None</option><option value="minimal">Minimal</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option><option value="max">Maximum</option></select><ChevronDown size={14} /></div><small className="field-help">Available levels depend on the model. Temperature is omitted above none.</small></label>
+                            <label className="field-label">Verbosity<div className="select-wrap"><select value={selectedNode.config.openaiVerbosity || "default"} onChange={(event) => updateNode({ config: { openaiVerbosity: event.target.value === "default" ? undefined : event.target.value as OpenAIRequestSettings["verbosity"] } })}><option value="default">Model default</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select><ChevronDown size={14} /></div></label>
+                            <div className="provider-number-grid">
+                              <label className="field-label">Max output tokens<input type="number" min="1" step="1" placeholder="Model default" value={selectedNode.config.openaiMaxCompletionTokens ?? ""} onChange={(event) => updateNode({ config: { openaiMaxCompletionTokens: optionalNumber(event.target.value) } })} /></label>
+                              <label className="field-label">Top P<input type="number" min="0" max="1" step="0.01" placeholder="Model default" value={selectedNode.config.openaiTopP ?? ""} onChange={(event) => updateNode({ config: { openaiTopP: optionalNumber(event.target.value) } })} /></label>
+                              <label className="field-label">Frequency penalty<input type="number" min="-2" max="2" step="0.1" placeholder="Model default" value={selectedNode.config.openaiFrequencyPenalty ?? ""} onChange={(event) => updateNode({ config: { openaiFrequencyPenalty: optionalNumber(event.target.value) } })} /></label>
+                              <label className="field-label">Presence penalty<input type="number" min="-2" max="2" step="0.1" placeholder="Model default" value={selectedNode.config.openaiPresencePenalty ?? ""} onChange={(event) => updateNode({ config: { openaiPresencePenalty: optionalNumber(event.target.value) } })} /></label>
+                              <label className="field-label">Seed<input type="number" step="1" placeholder="Random" value={selectedNode.config.openaiSeed ?? ""} onChange={(event) => updateNode({ config: { openaiSeed: optionalNumber(event.target.value) } })} /></label>
+                            </div>
+                            <label className="field-label">Stop sequences<textarea rows={3} value={selectedNode.config.openaiStop || ""} placeholder="One sequence per line" onChange={(event) => updateNode({ config: { openaiStop: event.target.value } })} /></label>
+                          </div>
+                        </details>
+                      )}
+                      {selectedNode.config.provider === "gemini" && (
+                        <details className="provider-advanced" open>
+                          <summary><BrainCircuit size={14} /><span><b>Gemini generation settings</b><small>Thinking level or budget, sampling, and limits</small></span><ChevronDown size={14} /></summary>
+                          <div className="provider-fields">
+                            <label className="field-label">Thinking<div className="select-wrap"><select value={selectedNode.config.geminiThinkingMode || "default"} onChange={(event) => updateNode({ config: { geminiThinkingMode: event.target.value === "default" ? undefined : event.target.value as FlowNode["config"]["geminiThinkingMode"] } })}><option value="default">Model default</option><optgroup label="Gemini 3"><option value="minimal">Minimal</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></optgroup><optgroup label="Gemini 2.5"><option value="dynamic">Dynamic budget</option><option value="off">Off (supported Flash models)</option><option value="budget">Custom token budget</option></optgroup></select><ChevronDown size={14} /></div><small className="field-help">Gemini 3 uses levels; Gemini 2.5 uses a token budget. Support varies by model.</small></label>
+                            {selectedNode.config.geminiThinkingMode === "budget" && <label className="field-label">Thinking token budget<input type="number" min="0" step="1" placeholder="1024" value={selectedNode.config.geminiThinkingBudget ?? ""} onChange={(event) => updateNode({ config: { geminiThinkingBudget: optionalNumber(event.target.value) } })} /></label>}
+                            <div className="provider-number-grid">
+                              <label className="field-label">Max output tokens<input type="number" min="1" step="1" placeholder="Model default" value={selectedNode.config.geminiMaxOutputTokens ?? ""} onChange={(event) => updateNode({ config: { geminiMaxOutputTokens: optionalNumber(event.target.value) } })} /></label>
+                              <label className="field-label">Top P<input type="number" min="0" max="1" step="0.01" placeholder="Model default" value={selectedNode.config.geminiTopP ?? ""} onChange={(event) => updateNode({ config: { geminiTopP: optionalNumber(event.target.value) } })} /></label>
+                              <label className="field-label">Top K<input type="number" min="1" step="1" placeholder="Model default" value={selectedNode.config.geminiTopK ?? ""} onChange={(event) => updateNode({ config: { geminiTopK: optionalNumber(event.target.value) } })} /></label>
+                              <label className="field-label">Seed<input type="number" step="1" placeholder="Random" value={selectedNode.config.geminiSeed ?? ""} onChange={(event) => updateNode({ config: { geminiSeed: optionalNumber(event.target.value) } })} /></label>
+                            </div>
+                            <label className="field-label">Stop sequences<textarea rows={3} value={selectedNode.config.geminiStop || ""} placeholder="One sequence per line" onChange={(event) => updateNode({ config: { geminiStop: event.target.value } })} /></label>
+                          </div>
+                        </details>
+                      )}
+                      {selectedNode.config.provider === "claude" && (
+                        <details className="provider-advanced" open>
+                          <summary><BrainCircuit size={14} /><span><b>Anthropic generation settings</b><small>Adaptive thinking, effort, sampling, and limits</small></span><ChevronDown size={14} /></summary>
+                          <div className="provider-fields">
+                            <label className="field-label">Thinking mode<div className="select-wrap"><select value={selectedNode.config.claudeThinkingMode || "default"} onChange={(event) => updateNode({ config: { claudeThinkingMode: event.target.value === "default" ? undefined : event.target.value as ClaudeRequestSettings["thinking"] } })}><option value="default">Model default</option><option value="adaptive">Adaptive</option><option value="disabled">Disabled</option><option value="enabled">Manual budget (legacy models)</option></select><ChevronDown size={14} /></div><small className="field-help">Current Claude models use adaptive thinking; older supported models use a manual budget.</small></label>
+                            <label className="field-label">Effort<div className="select-wrap"><select value={selectedNode.config.claudeEffort || "default"} onChange={(event) => updateNode({ config: { claudeEffort: event.target.value === "default" ? undefined : event.target.value as ClaudeRequestSettings["effort"] } })}><option value="default">Model default</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option><option value="max">Maximum</option></select><ChevronDown size={14} /></div><small className="field-help">Effort controls total response work and, in adaptive mode, thinking depth. Temperature is omitted when set.</small></label>
+                            {selectedNode.config.claudeThinkingMode === "enabled" && <label className="field-label">Thinking token budget<input type="number" min="1024" step="1" placeholder="1024" value={selectedNode.config.claudeThinkingBudget ?? ""} onChange={(event) => updateNode({ config: { claudeThinkingBudget: optionalNumber(event.target.value) } })} /><small className="field-help">Must be lower than max output tokens.</small></label>}
+                            <div className="provider-number-grid">
+                              <label className="field-label">Max output tokens<input type="number" min="1" step="1" placeholder="2048" value={selectedNode.config.claudeMaxTokens ?? ""} onChange={(event) => updateNode({ config: { claudeMaxTokens: optionalNumber(event.target.value) } })} /></label>
+                              <label className="field-label">Top P<input type="number" min="0" max="1" step="0.01" placeholder="Model default" value={selectedNode.config.claudeTopP ?? ""} onChange={(event) => updateNode({ config: { claudeTopP: optionalNumber(event.target.value) } })} /></label>
+                              <label className="field-label">Top K<input type="number" min="0" step="1" placeholder="Model default" value={selectedNode.config.claudeTopK ?? ""} onChange={(event) => updateNode({ config: { claudeTopK: optionalNumber(event.target.value) } })} /></label>
+                            </div>
+                            <label className="field-label">Stop sequences<textarea rows={3} value={selectedNode.config.claudeStop || ""} placeholder="One sequence per line" onChange={(event) => updateNode({ config: { claudeStop: event.target.value } })} /></label>
+                          </div>
+                        </details>
+                      )}
                       {selectedNode.config.provider === "ollama" && (
                         <details className="ollama-advanced" open>
                           <summary><BrainCircuit size={14} /><span><b>Ollama generation settings</b><small>Thinking, context, sampling, and model lifetime</small></span><ChevronDown size={14} /></summary>
@@ -3349,21 +3747,24 @@ export default function Workbench() {
                     <>
                       <label className="field-label">Subfolder path<input value={selectedNode.config.subfolder || ""} placeholder="Optional relative subfolder" onChange={(event) => updateNode({ config: { subfolder: event.target.value } })} /><small className="field-help">May also be supplied through the string attribute port.</small></label>
                       <label className="check-field"><input type="checkbox" checked={selectedNode.config.includeSubfolders || false} onChange={(event) => updateNode({ config: { includeSubfolders: event.target.checked } })} /><span>Include files in subfolders</span></label>
-                      <div className="node-folder-picker"><span><FolderOpen size={15} /><span><strong>Directory to load</strong><small>{selectedNode.config.directoryName || databaseFolder?.name || "No directory selected"}</small></span></span><button className="secondary-button" onClick={() => chooseFolder("node", selectedNode.id)}>Choose</button></div>
+                      <div className="node-folder-picker"><span><FolderOpen size={15} /><span><strong>Directory to load</strong><small>{nodeFolderHandles[selectedNode.id]?.name || databaseFolder?.name || (selectedNode.config.directoryName ? `Reconnect “${selectedNode.config.directoryName}”` : "No directory selected")}</small></span></span><button className="secondary-button" onClick={() => chooseFolder("node", selectedNode.id)}>{nodeFolderHandles[selectedNode.id] ? "Change" : "Choose"}</button></div>
                     </>
                   )}
                   {(selectedNode.type === "save" || selectedNode.type === "load") && (
                     <>
-                      <label className="field-label">File key<input value={selectedNode.config.key || ""} placeholder="record-name" onChange={(event) => updateNode({ config: { key: event.target.value } })} /><small className="field-help">Versioned files with the same key can coexist.</small></label>
-                      <label className="field-label">Subfolder path<input value={selectedNode.config.subfolder || ""} placeholder="./bla/blaba" onChange={(event) => updateNode({ config: { subfolder: event.target.value } })} /><small className="field-help">Relative to the directory below. Save creates missing folders; Load reads existing folders.</small></label>
-                      <div className="node-folder-picker"><span><FolderOpen size={15} /><span><strong>Node directory</strong><small>{selectedNode.config.directoryName || databaseFolder?.name || "Use workspace database folder"}</small></span></span><button className="secondary-button" onClick={() => chooseFolder("node", selectedNode.id)}>Choose</button></div>
+                      {(selectedNode.type === "save" || selectedNode.config.loadMode !== "folder") && <label className="field-label">File key<input value={selectedNode.config.key || ""} placeholder="record-name" onChange={(event) => updateNode({ config: { key: event.target.value } })} /><small className="field-help">Versioned files with the same key can coexist.</small></label>}
+                      <label className="field-label">Subfolder path<input value={selectedNode.config.subfolder || ""} placeholder="Optional, relative to the directory below" onChange={(event) => updateNode({ config: { subfolder: event.target.value } })} /><small className="field-help">Leave blank to use the selected directory itself. Absolute paths work only when they contain the selected directory.</small></label>
+                      <div className="node-folder-picker"><span><FolderOpen size={15} /><span><strong>Node directory</strong><small>{nodeFolderHandles[selectedNode.id]?.name || databaseFolder?.name || (selectedNode.config.directoryName ? `Reconnect “${selectedNode.config.directoryName}”` : "No directory selected")}</small></span></span><button className="secondary-button" onClick={() => chooseFolder("node", selectedNode.id)}>{nodeFolderHandles[selectedNode.id] ? "Change" : "Choose"}</button></div>
                       {selectedNode.type === "save" ? (
                         <>
                           <label className="field-label">When a name already exists<div className="select-wrap"><select value={selectedNode.config.collision || "increment"} onChange={(event) => updateNode({ config: { collision: event.target.value as FlowNode["config"]["collision"] } })}><option value="increment">Add number (file-2)</option><option value="timestamp">Add timestamp</option><option value="overwrite">Overwrite</option></select><ChevronDown size={14} /></div></label>
                           <label className="field-label">Save<div className="select-wrap"><select value={selectedNode.config.saveFiles || "both"} onChange={(event) => updateNode({ config: { saveFiles: event.target.value as FlowNode["config"]["saveFiles"] } })}><option value="both">Data and files</option><option value="data">Data only</option><option value="files">Files only</option></select><ChevronDown size={14} /></div></label>
                         </>
                       ) : (
-                        <label className="field-label">When multiple files match<div className="select-wrap"><select value={selectedNode.config.loadMode || "latest"} onChange={(event) => updateNode({ config: { loadMode: event.target.value as FlowNode["config"]["loadMode"] } })}><option value="latest">Load newest</option><option value="all">Load all</option><option value="exact">Exact name only</option></select><ChevronDown size={14} /></div></label>
+                        <>
+                          <label className="field-label">Load mode<div className="select-wrap"><select value={selectedNode.config.loadMode || "latest"} onChange={(event) => updateNode({ config: { loadMode: event.target.value as FlowNode["config"]["loadMode"] } })}><option value="latest">Newest saved record</option><option value="all">All matching saved records</option><option value="exact">Exact saved record name</option><option value="folder">All files in folder</option></select><ChevronDown size={14} /></div></label>
+                          {selectedNode.config.loadMode === "folder" && <label className="check-field"><input type="checkbox" checked={selectedNode.config.includeSubfolders || false} onChange={(event) => updateNode({ config: { includeSubfolders: event.target.checked } })} /><span>Include files in subfolders</span></label>}
+                        </>
                       )}
                     </>
                   )}
