@@ -6,6 +6,13 @@ export type PluginField = {
   options?: string[];
 };
 
+export type PluginFileAsset = {
+  name: string;
+  type: string;
+  data: string;
+  size: number;
+};
+
 export type PluginNodeDefinition = {
   type: string;
   label: string;
@@ -21,9 +28,9 @@ export type PluginNodeDefinition = {
   returnNames?: string[];
   functionName?: string;
   executor:
-    | { kind: "template"; template: string }
+    | { kind: "template"; template?: string; file?: string }
     | { kind: "http"; url: string; method?: "GET" | "POST" }
-    | { kind: "javascript"; code: string };
+    | { kind: "javascript"; code?: string; file?: string };
 };
 
 export type MagicConchPlugin = {
@@ -32,6 +39,7 @@ export type MagicConchPlugin = {
   version: string;
   description?: string;
   nodes: PluginNodeDefinition[];
+  files?: PluginFileAsset[];
 };
 
 export function validatePlugin(value: unknown): MagicConchPlugin {
@@ -39,12 +47,28 @@ export function validatePlugin(value: unknown): MagicConchPlugin {
   if (!plugin?.id || !plugin.name || !plugin.version || !Array.isArray(plugin.nodes)) {
     throw new Error("The plug-in manifest is missing an id, name, version, or nodes array.");
   }
+  if (plugin.files !== undefined && !Array.isArray(plugin.files)) {
+    throw new Error("The plug-in files field must be an array.");
+  }
+  for (const file of plugin.files || []) {
+    if (!file.name || !file.data) throw new Error("Every bundled plug-in file needs a name and data.");
+  }
   for (const node of plugin.nodes) {
     if (!node.type || !node.label || !node.executor?.kind) {
       throw new Error("Every plug-in node needs a type, label, and executor.");
     }
     if (!node.type.startsWith(`${plugin.id}:`)) {
       throw new Error(`Plug-in node types must start with “${plugin.id}:”.`);
+    }
+    if (node.executor.kind === "template" && !node.executor.template && !node.executor.file) {
+      throw new Error(`Plug-in node “${node.label}” needs a template or bundled template file.`);
+    }
+    if (node.executor.kind === "javascript" && !node.executor.code && !node.executor.file) {
+      throw new Error(`Plug-in node “${node.label}” needs JavaScript code or a bundled JavaScript file.`);
+    }
+    if ((node.executor.kind === "javascript" || node.executor.kind === "template")
+      && node.executor.file && !bundledFile(plugin.files || [], node.executor.file)) {
+      throw new Error(`The plug-in file “${node.executor.file}” is missing.`);
     }
   }
   return plugin as MagicConchPlugin;
@@ -60,16 +84,38 @@ function interpolate(template: string, values: Record<string, unknown>) {
   });
 }
 
+function normalizeFileName(value: string) {
+  return value.replace(/\\/g, "/").replace(/^\.?\/?files\//i, "").replace(/^\/+/, "");
+}
+
+function bundledFile(files: PluginFileAsset[], reference: string) {
+  const wanted = normalizeFileName(reference).toLocaleLowerCase();
+  return files.find((file) => normalizeFileName(file.name).toLocaleLowerCase() === wanted);
+}
+
+function bundledFileText(files: PluginFileAsset[], reference: string) {
+  const file = bundledFile(files, reference);
+  if (!file) throw new Error(`The plug-in file “${reference}” is missing.`);
+  const match = /^data:([^;,]*)(;base64)?,([\s\S]*)$/.exec(file.data);
+  if (!match) throw new Error(`The plug-in file “${reference}” has invalid data.`);
+  if (!match[2]) return decodeURIComponent(match[3]);
+  const binary = atob(match[3]);
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
 export async function executePluginNode(
   definition: PluginNodeDefinition,
   inputs: Record<string, unknown>,
   config: Record<string, unknown>,
   context: Record<string, unknown>,
+  files: PluginFileAsset[] = [],
 ): Promise<unknown> {
   const executor = definition.executor;
   const input = inputs.prompt ?? inputs.text ?? inputs.input ?? Object.values(inputs)[0] ?? "";
   if (executor.kind === "template") {
-    return interpolate(executor.template, { input, inputs, config, context });
+    const template = executor.template ?? bundledFileText(files, executor.file!);
+    return interpolate(template, { input, inputs, config, context, files });
   }
 
   if (executor.kind === "http") {
@@ -80,7 +126,7 @@ export async function executePluginNode(
       body:
         (executor.method || "POST") === "GET"
           ? undefined
-          : JSON.stringify({ input, inputs, config, context }),
+          : JSON.stringify({ input, inputs, config, context, files }),
     });
     if (!response.ok) throw new Error(`Plug-in request failed (${response.status}).`);
     const contentType = response.headers.get("content-type") || "";
@@ -95,6 +141,7 @@ export async function executePluginNode(
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
     ...args: string[]
   ) => (...values: unknown[]) => Promise<unknown>;
-  const run = new AsyncFunction("input", "inputs", "config", "context", executor.code);
-  return run(input, inputs, config, context);
+  const code = executor.code ?? bundledFileText(files, executor.file!);
+  const run = new AsyncFunction("input", "inputs", "config", "context", "files", code);
+  return run(input, inputs, config, context, files);
 }

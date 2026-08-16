@@ -84,10 +84,10 @@ import {
   requestAI,
 } from "../lib/ai-providers";
 import { collectFileAssets, fileAssetsPromptSections } from "../lib/file-content";
+import { artifactFallbackJson, readStoredArtifact, writeStoredArtifact } from "../lib/artifact-storage";
 import { fileNameFromAsset, firstFileAsset, getMediaDimensions } from "../lib/file-metadata";
 import { evaluateBooleanRule, parseAIBoolean } from "../lib/boolean-condition";
-import { directorySubfolderSegments } from "../lib/directory-path";
-import { ensureDirectoryPermission, rememberDirectoryPermission } from "../lib/directory-permission";
+import { rememberDirectoryPermission } from "../lib/directory-permission";
 import { chatSessionsFallbackJson, readStoredChatSessions, writeStoredChatSessions } from "../lib/chat-storage";
 import {
   BranchableMessage,
@@ -101,6 +101,7 @@ import {
   PluginNodeDefinition,
   validatePlugin,
 } from "../lib/plugin-system";
+import { createPortableBundles, isZipFile, readPortableBundle, readPortableBundleParts } from "../lib/portable-bundle";
 import {
   aggregateJoinValues,
   createJoinInput,
@@ -125,11 +126,14 @@ import {
   WorkflowSyntaxContext,
 } from "../lib/workflow-syntax";
 import { isWorkflowNodeActive } from "../lib/workflow-scheduler";
-import { workflowExportFilename, workflowFileText } from "../lib/workflow-files";
+import { migrateLegacyNodeDirectory, resolveNodeDirectory } from "../lib/node-directory";
+import { collectWorkflowBundleDependencies, portableDependencySegment, remapPackagedWorkflowIds, workflowRuntimeNodeIds } from "../lib/workflow-bundle";
+import { applyBundledLoadSnapshots, bundledLoadResult, BundledLoadSnapshot, materializedLoadDirectory, workflowInputFiles } from "../lib/workflow-load-bundle";
+import { workflowArchiveFilename, workflowExportFilename, workflowFileText } from "../lib/workflow-files";
 
 type BuiltinNodeType = "start" | "input" | "request" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
-type FileAsset = { name: string; type: string; data: string; size: number };
+type FileAsset = { name: string; type: string; data: string; size: number; bundleLoadNodeId?: string };
 type PortDataType = "prompt" | "files" | "document" | "text" | "number" | "boolean" | "string" | "integer" | "float" | "image" | "video" | "audio" | "any";
 type PortSpec = { id: string; label: string; type: PortDataType; multiple?: boolean };
 type NodeSchema = { inputs: PortSpec[]; outputs: PortSpec[] };
@@ -197,6 +201,7 @@ type FlowNode = {
     collision?: "overwrite" | "timestamp" | "increment";
     loadMode?: "latest" | "all" | "exact" | "folder";
     directoryName?: string;
+    directoryPath?: string;
     subfolder?: string;
     saveFiles?: "data" | "files" | "both";
     outputFileName?: string;
@@ -248,6 +253,7 @@ type Workflow = {
   nodes: FlowNode[];
   edges: FlowEdge[];
   files?: FileAsset[];
+  bundledLoads?: Record<string, { value: string }>;
 };
 type Message = {
   id: string;
@@ -333,10 +339,27 @@ type DirectoryHandle = {
 
 const DIRECTORY_HANDLE_DATABASE = "magic-conch-directory-handles";
 const DIRECTORY_HANDLE_STORE = "node-directories";
-const DATABASE_DIRECTORY_HANDLE_KEY = "global:database";
 const WORKFLOW_DIRECTORY_HANDLE_KEY = "global:workflow";
 const DEFAULT_LOCAL_DIRECTORY = "user-data";
 const LOCAL_DIRECTORY_ENDPOINT = "/api/local-directory";
+
+async function requestLocalDirectory<T>(body: Record<string, unknown>): Promise<T | null> {
+  let response: Response;
+  try {
+    response = await fetch(LOCAL_DIRECTORY_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    return null;
+  }
+  const isJson = response.headers.get("content-type")?.includes("application/json");
+  if (response.status === 404 || !isJson) return null;
+  const result = await response.json() as T & { error?: string };
+  if (!response.ok) throw new Error(result.error || "The configured directory could not be accessed.");
+  return result;
+}
 
 function openDirectoryHandleDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {
@@ -357,18 +380,6 @@ async function rememberDirectoryHandle(key: string, handle: DirectoryHandle) {
   await new Promise<void>((resolve, reject) => {
     const transaction = database.transaction(DIRECTORY_HANDLE_STORE, "readwrite");
     transaction.objectStore(DIRECTORY_HANDLE_STORE).put(handle, key);
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error);
-  });
-  database.close();
-}
-
-async function forgetDirectoryHandle(key: string) {
-  if (typeof indexedDB === "undefined") return;
-  const database = await openDirectoryHandleDatabase();
-  await new Promise<void>((resolve, reject) => {
-    const transaction = database.transaction(DIRECTORY_HANDLE_STORE, "readwrite");
-    transaction.objectStore(DIRECTORY_HANDLE_STORE).delete(key);
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(transaction.error);
   });
@@ -628,7 +639,8 @@ function migrateWorkflow(workflow: Workflow, plugins: MagicConchPlugin[]): Workf
     });
   }
 
-  const nodes = workflow.nodes.map((node) => {
+  const nodes = workflow.nodes.map((originalNode) => {
+    const node = { ...originalNode, config: migrateLegacyNodeDirectory(originalNode.config) };
     if (node.type === "math") {
       const inputs = node.config.mathInputs?.length ? [...node.config.mathInputs] : [];
       const incomingIds = [...new Set(migrated
@@ -670,6 +682,51 @@ function migrateWorkflow(workflow: Workflow, plugins: MagicConchPlugin[]): Workf
   });
 
   return { ...workflow, version: Math.max(4, workflow.version || 1), nodes, edges: migrated };
+}
+
+async function materializeWorkflowLoadFiles(workflow: Workflow) {
+  if (!workflow.bundledLoads || !Object.keys(workflow.bundledLoads).length) return workflow;
+  let nodes = workflow.nodes;
+  let files = workflow.files || [];
+  const remainingLoads = { ...workflow.bundledLoads };
+  for (const nodeId of Object.keys(workflow.bundledLoads)) {
+    const node = nodes.find((candidate) => candidate.id === nodeId);
+    const snapshot = bundledLoadResult({ ...workflow, nodes, files, bundledLoads: remainingLoads }, nodeId);
+    if (!node || !snapshot || (node.type !== "load" && node.type !== "list-directory")) continue;
+    const directory = materializedLoadDirectory(workflow, node);
+    const recordKey = node.config.key || "workflow-result";
+    try {
+      const result = await requestLocalDirectory<{ files: string[] }>({
+        operation: "materialize-load",
+        directory,
+        key: recordKey,
+        value: snapshot.value,
+        files: snapshot.files,
+        writeRecord: node.type === "load" && node.config.loadMode !== "folder",
+      });
+      if (!result) continue;
+    } catch {
+      // Keep the embedded snapshot when the local filesystem is unavailable.
+      continue;
+    }
+    nodes = nodes.map((candidate) => candidate.id === nodeId ? {
+      ...candidate,
+      config: {
+        ...candidate.config,
+        directoryPath: directory,
+        directoryName: undefined,
+        subfolder: "",
+      },
+    } : candidate);
+    files = files.filter((file) => file.bundleLoadNodeId !== nodeId);
+    delete remainingLoads[nodeId];
+  }
+  return {
+    ...workflow,
+    nodes,
+    files,
+    bundledLoads: Object.keys(remainingLoads).length ? remainingLoads : undefined,
+  };
 }
 
 function evaluateRouteRule(node: FlowNode, prompt: string, files: FileAsset[], optionValue?: string) {
@@ -1066,7 +1123,6 @@ export default function Workbench() {
   const [defaultDirectoryPath, setDefaultDirectoryPath] = useState(DEFAULT_LOCAL_DIRECTORY);
   const [attachedFiles, setAttachedFiles] = useState<FileAsset[]>([]);
   const [workflowFolder, setWorkflowFolder] = useState<DirectoryHandle | null>(null);
-  const [databaseFolder, setDatabaseFolder] = useState<DirectoryHandle | null>(null);
   const [pendingInput, setPendingInput] = useState<PendingWorkflowInput | null>(null);
   const [portOffsets, setPortOffsets] = useState<PortOffsets>({});
 
@@ -1088,7 +1144,7 @@ export default function Workbench() {
   const workflowDragDepthRef = useRef(0);
   const storageRestoredRef = useRef(false);
   const storageWarningShownRef = useRef(false);
-  const [nodeFolderHandles, setNodeFolderHandles] = useState<Record<string, DirectoryHandle>>({});
+  const artifactStorageWarningShownRef = useRef(false);
   const dragRef = useRef<{
     startX: number;
     startY: number;
@@ -1110,11 +1166,6 @@ export default function Workbench() {
       .then((handles) => {
         if (!active) return;
         setWorkflowFolder(handles[WORKFLOW_DIRECTORY_HANDLE_KEY] || null);
-        setDatabaseFolder(handles[DATABASE_DIRECTORY_HANDLE_KEY] || null);
-        const restoredNodeHandles = Object.fromEntries(
-          Object.entries(handles).filter(([key]) => !key.startsWith("global:")),
-        );
-        setNodeFolderHandles((current) => ({ ...restoredNodeHandles, ...current }));
       })
       .catch(() => { /* Folder access can still be reconnected with Choose. */ });
     return () => { active = false; };
@@ -1235,19 +1286,25 @@ export default function Workbench() {
   useEffect(() => {
     const restore = window.setTimeout(async () => {
       try {
-        const savedFlows = localStorage.getItem("magic-conch-workflows");
+        const savedFlowsJson = localStorage.getItem("magic-conch-workflows");
         const savedSettings = localStorage.getItem("magic-conch-provider-settings");
-        const savedPlugins = localStorage.getItem("magic-conch-plugins");
+        const savedPluginsJson = localStorage.getItem("magic-conch-plugins");
         const savedUndoLimit = localStorage.getItem("magic-conch-undo-limit");
         const savedDefaultDirectory = localStorage.getItem("magic-conch-default-directory");
         const savedSessionsJson = localStorage.getItem("magic-conch-chat-sessions");
-        const indexedSessions = await readStoredChatSessions<Partial<ChatSession>[]>().catch(() => null);
+        const [indexedFlows, indexedPlugins, indexedSessions] = await Promise.all([
+          readStoredArtifact<Workflow[]>("workflows").catch(() => null),
+          readStoredArtifact<MagicConchPlugin[]>("plugins").catch(() => null),
+          readStoredChatSessions<Partial<ChatSession>[]>().catch(() => null),
+        ]);
+        const savedFlows = indexedFlows ?? (savedFlowsJson ? JSON.parse(savedFlowsJson) as Workflow[] : null);
+        const savedPlugins = indexedPlugins ?? (savedPluginsJson ? JSON.parse(savedPluginsJson) as MagicConchPlugin[] : []);
         const savedSessions = indexedSessions ?? (savedSessionsJson ? JSON.parse(savedSessionsJson) as Partial<ChatSession>[] : null);
         const savedChatFolders = localStorage.getItem("magic-conch-chat-folders");
         const savedActiveSession = localStorage.getItem("magic-conch-active-session");
-        const restoredPlugins = savedPlugins ? JSON.parse(savedPlugins) as MagicConchPlugin[] : [];
+        const restoredPlugins = savedPlugins;
         if (savedFlows) {
-          const parsed = JSON.parse(savedFlows) as Workflow[];
+          const parsed = savedFlows;
           if (parsed.length) {
             const migrated = parsed.map((workflow) => migrateWorkflow({
               ...workflow,
@@ -1268,12 +1325,14 @@ export default function Workbench() {
                 dataType: edge.dataType || "flow",
               })),
             }, restoredPlugins));
-            setWorkflows(migrated);
-            setActiveWorkflowId(migrated[0].id);
+            const materialized: Workflow[] = [];
+            for (const workflow of migrated) materialized.push(await materializeWorkflowLoadFiles(workflow));
+            setWorkflows(materialized);
+            setActiveWorkflowId(materialized[0].id);
           }
         }
         if (savedSettings) setProviderSettings(JSON.parse(savedSettings));
-        if (savedPlugins) setPlugins(restoredPlugins);
+        if (restoredPlugins.length) setPlugins(restoredPlugins);
         if (savedUndoLimit) setUndoLimit(Math.max(1, Math.min(500, Number(savedUndoLimit))));
         if (savedDefaultDirectory) setDefaultDirectoryPath(savedDefaultDirectory);
         if (savedChatFolders) {
@@ -1306,6 +1365,20 @@ export default function Workbench() {
               .catch(() => { /* The quota-safe fallback remains available. */ });
           }
         }
+        if (!indexedFlows && savedFlowsJson) {
+          await writeStoredArtifact("workflows", savedFlows)
+            .then(() => localStorage.removeItem("magic-conch-workflows"))
+            .catch(() => { /* The lightweight localStorage fallback remains available. */ });
+        } else if (indexedFlows) {
+          localStorage.removeItem("magic-conch-workflows");
+        }
+        if (!indexedPlugins && savedPluginsJson) {
+          await writeStoredArtifact("plugins", restoredPlugins)
+            .then(() => localStorage.removeItem("magic-conch-plugins"))
+            .catch(() => { /* The lightweight localStorage fallback remains available. */ });
+        } else if (indexedPlugins) {
+          localStorage.removeItem("magic-conch-plugins");
+        }
       } catch {
         showToast("Some saved settings could not be restored");
       } finally {
@@ -1317,7 +1390,21 @@ export default function Workbench() {
 
   useEffect(() => {
     if (!storageRestoredRef.current) return;
-    localStorage.setItem("magic-conch-workflows", JSON.stringify(workflows));
+    const save = window.setTimeout(() => {
+      writeStoredArtifact("workflows", workflows)
+        .then(() => localStorage.removeItem("magic-conch-workflows"))
+        .catch(() => {
+          try {
+            localStorage.setItem("magic-conch-workflows", artifactFallbackJson(workflows));
+          } catch {
+            if (!artifactStorageWarningShownRef.current) {
+              artifactStorageWarningShownRef.current = true;
+              showToast("Workflow changes are available now, but this browser could not save the large bundled files");
+            }
+          }
+        });
+    }, 200);
+    return () => window.clearTimeout(save);
   }, [workflows]);
 
   useEffect(() => {
@@ -1327,7 +1414,21 @@ export default function Workbench() {
 
   useEffect(() => {
     if (!storageRestoredRef.current) return;
-    localStorage.setItem("magic-conch-plugins", JSON.stringify(plugins));
+    const save = window.setTimeout(() => {
+      writeStoredArtifact("plugins", plugins)
+        .then(() => localStorage.removeItem("magic-conch-plugins"))
+        .catch(() => {
+          try {
+            localStorage.setItem("magic-conch-plugins", artifactFallbackJson(plugins));
+          } catch {
+            if (!artifactStorageWarningShownRef.current) {
+              artifactStorageWarningShownRef.current = true;
+              showToast("Plug-ins are available now, but this browser could not save their bundled files");
+            }
+          }
+        });
+    }, 200);
+    return () => window.clearTimeout(save);
   }, [plugins]);
 
   useEffect(() => {
@@ -2296,14 +2397,6 @@ export default function Workbench() {
     await writable.close();
   }
 
-  async function resolveSubfolder(folder: DirectoryHandle, segments: string[], create: boolean) {
-    let current = folder;
-    for (const segment of segments) {
-      current = await current.getDirectoryHandle(segment, { create });
-    }
-    return current;
-  }
-
   function localRecordKey(safeKey: string, segments: string[]) {
     return `magic-conch-record:${segments.length ? `${segments.join("/")}/` : ""}${safeKey}`;
   }
@@ -2312,40 +2405,15 @@ export default function Workbench() {
     return defaultDirectoryPath.trim() || DEFAULT_LOCAL_DIRECTORY;
   }
 
+  function resolvedDirectoryForNode(node: FlowNode, subfolder = node.config.subfolder || "") {
+    return resolveNodeDirectory(node.config, configuredDefaultDirectory(), subfolder);
+  }
+
   async function localDirectoryRequest<T>(body: Record<string, unknown>): Promise<T | null> {
-    let response: Response;
-    try {
-      response = await fetch(LOCAL_DIRECTORY_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ directory: configuredDefaultDirectory(), ...body }),
-      });
-    } catch {
-      return null;
-    }
-    const isJson = response.headers.get("content-type")?.includes("application/json");
-    if (response.status === 404 || !isJson) return null;
-    const result = await response.json() as T & { error?: string };
-    if (!response.ok) throw new Error(result.error || "The default directory could not be accessed.");
-    return result;
+    return requestLocalDirectory<T>({ directory: configuredDefaultDirectory(), ...body });
   }
 
-  async function resetDatabaseDirectoryToConfiguredPath() {
-    setDatabaseFolder(null);
-    await forgetDirectoryHandle(DATABASE_DIRECTORY_HANDLE_KEY).catch(() => { /* The in-memory selection is already cleared. */ });
-    showToast(`Using ${configuredDefaultDirectory()} by default`);
-  }
-
-  async function resetNodeDirectoryToDefault(nodeId: string) {
-    setNodeFolderHandles((current) => Object.fromEntries(
-      Object.entries(current).filter(([id]) => id !== nodeId),
-    ));
-    await forgetDirectoryHandle(nodeId).catch(() => { /* The in-memory selection is already cleared. */ });
-    if (nodeId === selectedNodeId) updateNode({ config: { directoryName: undefined } });
-    showToast(databaseFolder ? `Using ${databaseFolder.name}` : `Using ${configuredDefaultDirectory()}`);
-  }
-
-  async function chooseFolder(kind: "workflow" | "database" | "node", nodeId?: string) {
+  async function chooseWorkflowFolder() {
     const picker = (window as unknown as {
       showDirectoryPicker?: (options?: { id?: string; mode?: "read" | "readwrite" }) => Promise<DirectoryHandle>;
     })
@@ -2355,27 +2423,13 @@ export default function Workbench() {
       return;
     }
     try {
-      const selectedNode = nodeId
-        ? activeWorkflow.nodes.find((node) => node.id === nodeId)
-        : undefined;
-      const mode = kind === "node" && selectedNode?.type !== "save" ? "read" : "readwrite";
       const handle = await picker({
-        id: kind === "workflow" ? "magic-conch-workflows" : "magic-conch-data",
-        mode,
+        id: "magic-conch-workflows",
+        mode: "readwrite",
       });
-      rememberDirectoryPermission(handle, mode);
-      if (kind === "workflow") {
-        setWorkflowFolder(handle);
-        await rememberDirectoryHandle(WORKFLOW_DIRECTORY_HANDLE_KEY, handle).catch(() => { /* The handle remains usable for this session. */ });
-      } else if (kind === "database") {
-        setDatabaseFolder(handle);
-        await rememberDirectoryHandle(DATABASE_DIRECTORY_HANDLE_KEY, handle).catch(() => { /* The handle remains usable for this session. */ });
-      }
-      else if (nodeId) {
-        setNodeFolderHandles((current) => ({ ...current, [nodeId]: handle }));
-        await rememberDirectoryHandle(nodeId, handle).catch(() => { /* The handle remains usable for this session. */ });
-        if (nodeId === selectedNodeId) updateNode({ config: { directoryName: handle.name } });
-      }
+      rememberDirectoryPermission(handle, "readwrite");
+      setWorkflowFolder(handle);
+      await rememberDirectoryHandle(WORKFLOW_DIRECTORY_HANDLE_KEY, handle).catch(() => { /* The handle remains usable for this session. */ });
       showToast(`${handle.name} connected`);
     } catch {
       // The user may intentionally cancel the picker.
@@ -2407,21 +2461,20 @@ export default function Workbench() {
     event.target.value = "";
   }
 
-  function importPlugin(event: ChangeEvent<HTMLInputElement>) {
+  async function importPlugin(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const plugin = validatePlugin(JSON.parse(String(reader.result)));
-        setPlugins((current) => [...current.filter((item) => item.id !== plugin.id), plugin]);
-        showToast(`${plugin.name} installed`);
-      } catch (error) {
-        showToast(error instanceof Error ? error.message : "Invalid plug-in manifest");
-      }
-      event.target.value = "";
-    };
-    reader.readAsText(file);
+    try {
+      const value = isZipFile(file)
+        ? readPortableBundle(new Uint8Array(await file.arrayBuffer()), "plugin.json")
+        : JSON.parse(workflowFileText(await file.text()));
+      const plugin = validatePlugin(value);
+      setPlugins((current) => [...current.filter((item) => item.id !== plugin.id), plugin]);
+      showToast(`${plugin.name} installed${plugin.files?.length ? ` with ${plugin.files.length} file${plugin.files.length === 1 ? "" : "s"}` : ""}`);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Invalid plug-in manifest");
+    }
+    event.target.value = "";
   }
 
   async function refreshAvailableModels(provider: AIProvider) {
@@ -2467,13 +2520,112 @@ export default function Workbench() {
     showToast("Workflow exported");
   }
 
+  async function captureWorkflowLoadFiles(workflow: Workflow) {
+    const snapshots: Record<string, BundledLoadSnapshot<FileAsset>> = {};
+    const runtimeNodeIds = workflowRuntimeNodeIds(workflow);
+    for (const sourceNode of workflow.nodes.filter((node) => runtimeNodeIds.has(node.id) && (node.type === "load" || node.type === "list-directory"))) {
+      const existing = bundledLoadResult(workflow, sourceNode.id);
+      if (existing) {
+        snapshots[sourceNode.id] = existing;
+        continue;
+      }
+      const syntax = syntaxContextFor(workflow);
+      const node = expandWorkflowSyntaxInValue(sourceNode, syntax);
+      const effectiveNode = {
+        ...node,
+        config: {
+          ...node.config,
+          key: expandWorkflowSyntax(String(connectedConfiguredValue(workflow, node.id, "key") ?? node.config.key ?? "workflow-result"), syntax),
+          subfolder: expandWorkflowSyntax(String(connectedConfiguredValue(workflow, node.id, "subfolder") ?? node.config.subfolder ?? ""), syntax),
+        },
+      };
+      try {
+        if (node.type === "list-directory" || node.config.loadMode === "folder") {
+          const recursive = Boolean(connectedConfiguredValue(workflow, node.id, "recursive") ?? node.config.includeSubfolders ?? false);
+          const files = await loadDirectoryFiles(effectiveNode, effectiveNode.config.subfolder || "", recursive);
+          snapshots[node.id] = { value: files.map((file) => file.name).join("\n"), files };
+        } else {
+          snapshots[node.id] = await loadRecord(effectiveNode);
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "The configured source could not be read.";
+        throw new Error(`Could not include runtime files for “${node.name}” in “${workflow.name}”: ${reason}`);
+      }
+    }
+    return applyBundledLoadSnapshots(workflow, snapshots);
+  }
+
+  async function exportWorkflowWithFiles() {
+    try {
+      const bundled = collectWorkflowBundleDependencies(activeWorkflow, workflows, plugins);
+      const preparedWorkflows: Workflow[] = [];
+      for (const workflow of bundled.workflows) preparedWorkflows.push(await captureWorkflowLoadFiles(workflow));
+      const parts = [
+        { manifest: preparedWorkflows[0], manifestPath: "workflow.json" },
+        ...preparedWorkflows.slice(1).map((workflow, index) => ({
+          manifest: workflow,
+          manifestPath: `dependencies/workflows/${index + 1}-${portableDependencySegment(workflow.id)}/workflow.json`,
+        })),
+        ...bundled.plugins.map((plugin, index) => ({
+          manifest: plugin,
+          manifestPath: `dependencies/plugins/${index + 1}-${portableDependencySegment(plugin.id)}/plugin.json`,
+        })),
+      ];
+      const blob = new Blob([new Uint8Array(createPortableBundles(parts))], { type: "application/zip" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = workflowArchiveFilename(activeWorkflow.name);
+      link.click();
+      URL.revokeObjectURL(url);
+      const fileCount = preparedWorkflows.reduce((total, workflow) => total + (workflow.files?.length || 0), 0)
+        + bundled.plugins.reduce((total, plugin) => total + (plugin.files?.length || 0), 0);
+      showToast(`Workflow exported with ${fileCount} file${fileCount === 1 ? "" : "s"} and all used dependencies`);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Could not export workflow files");
+    }
+  }
+
   async function importWorkflowFile(file: File): Promise<boolean> {
     try {
-      const parsed = JSON.parse(workflowFileText(await file.text())) as Workflow;
-      if (!parsed.nodes || !parsed.edges || !parsed.name) throw new Error();
-      const imported = migrateWorkflow({ ...parsed, id: uid("workflow"), updatedAt: new Date().toISOString() }, plugins);
-      setWorkflows((current) => [...current, imported]);
-      setActiveWorkflowId(imported.id);
+      let packagedWorkflows: Workflow[];
+      let packagedPlugins: MagicConchPlugin[] = [];
+      if (isZipFile(file)) {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const workflowParts = readPortableBundleParts(bytes, "workflow.json");
+        const rootPart = workflowParts.find((part) => part.manifestPath.toLocaleLowerCase() === "workflow.json")
+          || [...workflowParts].sort((a, b) => a.manifestPath.length - b.manifestPath.length)[0];
+        if (!rootPart) throw new Error("The ZIP does not contain workflow.json.");
+        packagedWorkflows = [
+          rootPart.manifest as Workflow,
+          ...workflowParts.filter((part) => part !== rootPart).map((part) => part.manifest as Workflow),
+        ];
+        packagedPlugins = readPortableBundleParts(bytes, "plugin.json").map((part) => validatePlugin(part.manifest));
+      } else {
+        packagedWorkflows = [JSON.parse(workflowFileText(await file.text())) as Workflow];
+      }
+      if (packagedWorkflows.some((workflow) => !workflow.nodes || !workflow.edges || !workflow.name)) throw new Error();
+      packagedWorkflows = packagedWorkflows.map((workflow, index) => ({
+        ...workflow,
+        id: workflow.id || `packaged-workflow-${index + 1}`,
+      }));
+      if (new Set(packagedWorkflows.map((workflow) => workflow.id)).size !== packagedWorkflows.length) {
+        throw new Error("The workflow bundle contains duplicate workflow ids.");
+      }
+
+      const availablePlugins = [
+        ...plugins.filter((plugin) => !packagedPlugins.some((packaged) => packaged.id === plugin.id)),
+        ...packagedPlugins,
+      ];
+      const migrated = remapPackagedWorkflowIds(packagedWorkflows, () => uid("workflow")).map((workflow) => migrateWorkflow({
+        ...workflow,
+        updatedAt: new Date().toISOString(),
+      }, availablePlugins));
+      const imported: Workflow[] = [];
+      for (const workflow of migrated) imported.push(await materializeWorkflowLoadFiles(workflow));
+      if (packagedPlugins.length) setPlugins(availablePlugins);
+      setWorkflows((current) => [...current, ...imported]);
+      setActiveWorkflowId(imported[0].id);
       setSelectedNodeId(null);
       setSelectedNodeIds([]);
       return true;
@@ -2507,20 +2659,10 @@ export default function Workbench() {
   async function persistRecord(node: FlowNode, value: string, files: FileAsset[]) {
     const key = node.config.key || "workflow-result";
     const safeKey = (key || "workflow-result").replace(/[^a-zA-Z0-9-_]/g, "-");
-    const rootFolder = nodeFolderHandles[node.id] || databaseFolder;
-    const useLocalDirectory = !rootFolder && !node.config.directoryName;
-    if (rootFolder) await ensureDirectoryPermission(rootFolder, "readwrite");
-    const segments = directorySubfolderSegments(node.config.subfolder, rootFolder?.name);
-    const folder = rootFolder ? await resolveSubfolder(rootFolder, segments, true) : null;
-    const savedFiles: string[] = [];
-    if (folder && node.config.saveFiles !== "data") {
-      for (const asset of files) {
-        const filename = await collisionSafeName(folder, asset.name, node.config.collision);
-        await writeAssetToFolder(folder, asset, filename);
-        savedFiles.push(filename);
-      }
-    }
-    const localResult = useLocalDirectory ? await localDirectoryRequest<{ record: { files: string[] } }>({
+    const location = resolvedDirectoryForNode(node);
+    const segments = location.subfolder;
+    const localResult = await localDirectoryRequest<{ record: { files: string[] } }>({
+      directory: location.directory,
       operation: "save-record",
       subfolder: segments,
       key: safeKey,
@@ -2528,143 +2670,57 @@ export default function Workbench() {
       files,
       saveFiles: node.config.saveFiles || "both",
       collision: node.config.collision || "increment",
-    }) : null;
+    });
     const record = {
       key: safeKey,
       value,
-      files: localResult?.record.files || savedFiles,
-      // Folder-backed records reference the written files. Browser-only records
-      // retain the assets themselves so Load can restore media without a handle.
-      assets: !folder && !localResult && node.config.saveFiles !== "data" ? files : undefined,
+      files: localResult?.record.files || [],
+      // Hosted builds without the local bridge retain assets in browser storage.
+      assets: !localResult && node.config.saveFiles !== "data" ? files : undefined,
       savedAt: new Date().toISOString(),
     };
     localStorage.setItem(localRecordKey(safeKey, segments), JSON.stringify(record));
-    if (folder && node.config.saveFiles !== "files") {
-      const filename = await collisionSafeName(folder, `${safeKey}.json`, node.config.collision);
-      await writeJsonToFolder(folder, filename, record);
-    }
   }
 
   async function loadRecord(node: FlowNode) {
     const safeKey = (node.config.key || "workflow-result").replace(/[^a-zA-Z0-9-_]/g, "-");
-    const nodeFolder = nodeFolderHandles[node.id];
-    const rootFolder = nodeFolder || databaseFolder;
-    const useLocalDirectory = !rootFolder && !node.config.directoryName;
-    // The shared database can serve both Load and Save nodes, so authorize it
-    // once for both operations instead of prompting again when a Save runs.
-    if (rootFolder) await ensureDirectoryPermission(rootFolder, nodeFolder ? "read" : "readwrite");
-    const segments = directorySubfolderSegments(node.config.subfolder, rootFolder?.name);
+    const location = resolvedDirectoryForNode(node);
+    const segments = location.subfolder;
     type StoredRecord = { value?: unknown; files?: string[]; assets?: FileAsset[] };
     const localRecord = () => {
       const raw = localStorage.getItem(localRecordKey(safeKey, segments));
       if (!raw) return null;
       try { return JSON.parse(raw) as StoredRecord; } catch { return null; }
     };
-    const hydrateFiles = async (record: StoredRecord, folder?: DirectoryHandle) => {
-      const assets = [...(record.assets || [])];
-      if (!folder) return assets;
-      for (const filename of record.files || []) {
-        try {
-          const handle = await folder.getFileHandle(filename);
-          assets.push(await readFileAsset(await handle.getFile()));
-        } catch {
-          // Keep loading the remaining files when one referenced asset moved.
-        }
-      }
-      return assets;
-    };
-    if (useLocalDirectory) {
-      const result = await localDirectoryRequest<{
-        found: boolean;
-        reason?: "folder" | "record";
-        value?: string;
-        files?: FileAsset[];
-      }>({
-        operation: "load-record",
-        subfolder: segments,
-        key: safeKey,
-        loadMode: node.config.loadMode || "latest",
-      });
-      if (result?.found) return { value: result.value || "", files: result.files || [] };
-      if (result?.reason === "folder") return { value: "The configured subfolder was not found.", files: [] };
-    }
-    if (!rootFolder) {
-      const record = localRecord();
-      return record
-        ? { value: String(record.value ?? ""), files: await hydrateFiles(record) }
-        : { value: "No saved record was found.", files: [] };
-    }
-    let folder: DirectoryHandle;
-    try {
-      folder = await resolveSubfolder(rootFolder, segments, false);
-    } catch {
-      return { value: "The configured subfolder was not found.", files: [] };
-    }
-    const matches: { name: string; modified: number; text: string }[] = [];
-    for await (const entry of folder.values()) {
-      if (entry.kind !== "file" || !entry.getFile) continue;
-      const exact = entry.name === `${safeKey}.json`;
-      const versioned = entry.name.startsWith(`${safeKey}-`) && entry.name.endsWith(".json");
-      if ((node.config.loadMode === "exact" ? exact : exact || versioned)) {
-        const file = await entry.getFile();
-        matches.push({ name: entry.name, modified: file.lastModified, text: await file.text() });
-      }
-    }
-    if (!matches.length) {
-      const record = localRecord();
-      return record
-        ? { value: String(record.value ?? ""), files: await hydrateFiles(record, folder) }
-        : { value: "No matching files were found.", files: [] };
-    }
-    matches.sort((a, b) => b.modified - a.modified);
-    const selected = node.config.loadMode === "all" ? matches : [matches[0]];
-    const values: string[] = [];
-    const assets: FileAsset[] = [];
-    for (const match of selected) {
-      let record: StoredRecord;
-      try { record = JSON.parse(match.text) as StoredRecord; }
-      catch { record = { value: match.text }; }
-      values.push(String(record.value ?? match.text));
-      assets.push(...await hydrateFiles(record, folder));
-    }
-    const uniqueFiles = assets.filter((asset, index) => assets.findIndex((candidate) => candidate.name === asset.name && candidate.data === asset.data) === index);
-    return { value: values.join("\n\n"), files: uniqueFiles };
+    const result = await localDirectoryRequest<{
+      found: boolean;
+      reason?: "folder" | "record";
+      value?: string;
+      files?: FileAsset[];
+    }>({
+      directory: location.directory,
+      operation: "load-record",
+      subfolder: segments,
+      key: safeKey,
+      loadMode: node.config.loadMode || "latest",
+    });
+    if (result?.found) return { value: result.value || "", files: result.files || [] };
+    const record = localRecord();
+    if (record) return { value: String(record.value ?? ""), files: record.assets || [] };
+    if (result?.reason === "folder") return { value: "The configured subfolder was not found.", files: [] };
+    return { value: "No saved record was found.", files: [] };
   }
 
   async function loadDirectoryFiles(node: FlowNode, subfolder: string, recursive: boolean) {
-    const nodeFolder = nodeFolderHandles[node.id];
-    const rootFolder = nodeFolder || databaseFolder;
-    if (!rootFolder) {
-      if (!node.config.directoryName) {
-        const result = await localDirectoryRequest<{ files: FileAsset[] }>({
-          operation: "list-files",
-          subfolder: directorySubfolderSegments(subfolder),
-          recursive,
-        });
-        if (result) return result.files;
-      }
-      throw new Error(node.config.directoryName
-        ? `Reconnect the “${node.config.directoryName}” Node directory; its browser permission is no longer available.`
-        : `The default directory is unavailable. Choose a directory for this ${node.type === "load" ? "Load" : "Load Directory"} node.`);
-    }
-    await ensureDirectoryPermission(rootFolder, nodeFolder ? "read" : "readwrite");
-    const folder = await resolveSubfolder(rootFolder, directorySubfolderSegments(subfolder, rootFolder.name), false);
-    const assets: FileAsset[] = [];
-    const visit = async (current: DirectoryHandle, prefix = "") => {
-      for await (const entry of current.values()) {
-        const relativeName = prefix ? `${prefix}/${entry.name}` : entry.name;
-        if (entry.kind === "directory") {
-          if (recursive && entry.values) await visit(entry as unknown as DirectoryHandle, relativeName);
-          continue;
-        }
-        if (!entry.getFile) continue;
-        const file = await entry.getFile();
-        const asset = await readFileAsset(file);
-        assets.push({ ...asset, name: relativeName });
-      }
-    };
-    await visit(folder);
-    return assets;
+    const location = resolvedDirectoryForNode(node, subfolder);
+    const result = await localDirectoryRequest<{ files: FileAsset[] }>({
+      directory: location.directory,
+      operation: "list-files",
+      subfolder: location.subfolder,
+      recursive,
+    });
+    if (result) return result.files;
+    throw new Error(`The local directory service is unavailable for this ${node.type === "load" ? "Load" : "Load Directory"} node.`);
   }
 
   function mediaAssets(files: FileAsset[], kind: "image" | "video" | "audio") {
@@ -2691,7 +2747,7 @@ export default function Workbench() {
 
     const start = workflow.nodes.find((node) => node.type === "start");
     if (!start) throw new Error(`Called workflow “${workflow.name}” needs a Start node.`);
-    const files = [...(workflow.files || []), ...incomingFiles];
+    const files = [...workflowInputFiles(workflow), ...incomingFiles];
     const context: WorkflowContext = {
       userMessage: prompt,
       files,
@@ -2913,14 +2969,15 @@ export default function Workbench() {
       if (node.type === "list-directory") {
         const subfolder = String(inputFor("subfolder", node.config.subfolder || ""));
         const recursive = Boolean(inputFor("recursive", node.config.includeSubfolders || false));
-        const files = await loadDirectoryFiles(node, subfolder, recursive);
+        const bundledDirectory = bundledLoadResult(workflow, node.id);
+        const files = bundledDirectory?.files ?? await loadDirectoryFiles(node, subfolder, recursive);
         output("files", files);
         output("image", mediaAssets(files, "image"));
         output("video", mediaAssets(files, "video"));
         output("audio", mediaAssets(files, "audio"));
         output("names", files.map((file) => file.name));
         output("count", files.length);
-        debugDetail = `Loaded ${files.length} file${files.length === 1 ? "" : "s"} from ${node.config.directoryName || "the selected directory"}.`;
+        debugDetail = `Loaded ${files.length} file${files.length === 1 ? "" : "s"} from ${bundledDirectory ? "the bundled export snapshot" : resolvedDirectoryForNode(node, subfolder).directory}.`;
       }
 
       if (node.type === "request") {
@@ -3019,7 +3076,8 @@ export default function Workbench() {
 
       if (node.type === "load") {
         const effectiveNode = { ...node, config: { ...node.config, key: String(inputFor("key", node.config.key || "workflow-result")), subfolder: String(inputFor("subfolder", node.config.subfolder || "")) } };
-        const loaded = node.config.loadMode === "folder"
+        const bundledLoaded = bundledLoadResult(workflow, node.id);
+        const loaded = bundledLoaded || (node.config.loadMode === "folder"
           ? await (async () => {
               const files = await loadDirectoryFiles(
                 effectiveNode,
@@ -3028,7 +3086,7 @@ export default function Workbench() {
               );
               return { value: files.map((file) => file.name).join("\n"), files };
             })()
-          : await loadRecord(effectiveNode);
+          : await loadRecord(effectiveNode));
         context.loadedData = loaded.value;
         context.lastOutput = loaded.value;
         output("prompt", loaded.value);
@@ -3038,8 +3096,8 @@ export default function Workbench() {
         output("audio", mediaAssets(loaded.files, "audio"));
         output("document", loaded.files.filter(isDocumentAsset));
         debugDetail = node.config.loadMode === "folder"
-          ? `Loaded all ${loaded.files.length} file${loaded.files.length === 1 ? "" : "s"} from ${node.config.directoryName || "the selected folder"}.`
-          : `Loaded ${loaded.value.length} prompt characters and ${loaded.files.length} file${loaded.files.length === 1 ? "" : "s"} from storage.`;
+          ? `Loaded all ${loaded.files.length} file${loaded.files.length === 1 ? "" : "s"} from ${bundledLoaded ? "the bundled export snapshot" : resolvedDirectoryForNode(effectiveNode).directory}.`
+          : `Loaded ${loaded.value.length} prompt characters and ${loaded.files.length} file${loaded.files.length === 1 ? "" : "s"} from ${bundledLoaded ? "the bundled export snapshot" : "storage"}.`;
       }
 
       if (node.type === "set-state") {
@@ -3243,9 +3301,8 @@ export default function Workbench() {
       }
 
       if (!isBuiltinNodeType(node.type)) {
-        const definition = plugins
-          .flatMap((plugin) => plugin.nodes)
-          .find((candidate) => candidate.type === node.type);
+        const owner = plugins.find((plugin) => plugin.nodes.some((candidate) => candidate.type === node.type));
+        const definition = owner?.nodes.find((candidate) => candidate.type === node.type);
         if (!definition) throw new Error(`The plug-in for “${node.name}” is not installed.`);
         const inputs = Object.fromEntries(
           nodeSchema.inputs
@@ -3256,6 +3313,7 @@ export default function Workbench() {
           inputs,
           node.config.pluginConfig || {},
           context as unknown as Record<string, unknown>,
+          owner?.files || [],
         );
         const dataOutputs = nodeSchema.outputs;
         if (Array.isArray(result)) {
@@ -3397,7 +3455,7 @@ export default function Workbench() {
     setDebugEvents([]);
     const start = activeWorkflow.nodes.find((node) => node.type === "start");
     if (!start) throw new Error("This workflow needs a Start node.");
-    const files = [...(activeWorkflow.files || []), ...messageFiles];
+    const files = [...workflowInputFiles(activeWorkflow), ...messageFiles];
     const context: WorkflowContext = { userMessage: text, files, values: {}, syntax: syntaxContextFor(), workflowStack: [activeWorkflow.id] };
     context.values[portValueKey(start.id, "prompt")] = text;
     context.values[portValueKey(start.id, "files")] = files;
@@ -3715,9 +3773,10 @@ export default function Workbench() {
               </div>
             </details>
             <div className="sidebar-footer">
-              <button onClick={() => fileInputRef.current?.click()}><Upload size={15} /> Import JSON</button>
-              <button onClick={exportWorkflow}><Download size={15} /> Export</button>
-              <input ref={fileInputRef} type="file" accept="application/json,.json" hidden onChange={importWorkflow} />
+              <button onClick={() => fileInputRef.current?.click()}><Upload size={15} /> Import</button>
+              <button onClick={exportWorkflow}><Download size={15} /> Export JSON</button>
+              <button className="export-with-files" onClick={exportWorkflowWithFiles}><Download size={15} /> Export with files</button>
+              <input ref={fileInputRef} type="file" accept="application/json,application/zip,.json,.zip" hidden onChange={importWorkflow} />
             </div>
           </aside>
 
@@ -3736,7 +3795,7 @@ export default function Workbench() {
               <div className="workflow-toolbar-actions">
                 <button className="icon-button" onClick={undoWorkflow} aria-label="Undo last workflow change" title="Undo (Ctrl+Z)"><Undo2 size={16} /></button>
                 <button className="icon-button" onClick={redoWorkflow} aria-label="Redo workflow change" title="Redo (Ctrl+Shift+Z)"><Redo2 size={16} /></button>
-                <button className="secondary-button" onClick={() => workflowAssetInputRef.current?.click()}><Paperclip size={15} /> Files {activeWorkflow.files?.length ? `(${activeWorkflow.files.length})` : ""}</button>
+                <button className="secondary-button" onClick={() => workflowAssetInputRef.current?.click()}><Paperclip size={15} /> Files {workflowInputFiles(activeWorkflow).length ? `(${workflowInputFiles(activeWorkflow).length})` : ""}</button>
                 <button className="secondary-button" onClick={saveWorkflow}><Save size={15} /> Save</button>
                 <button className="primary-button" onClick={openWorkflowChat}><Play size={15} fill="currentColor" /> Test workflow</button>
                 <button className="icon-button hide-mobile" aria-label="More options"><MoreHorizontal size={18} /></button>
@@ -4019,14 +4078,14 @@ export default function Workbench() {
                     <>
                       <label className="field-label">Subfolder path<input value={selectedNode.config.subfolder || ""} placeholder="Optional relative subfolder" onChange={(event) => updateNode({ config: { subfolder: event.target.value } })} /><small className="field-help">May also be supplied through the string attribute port.</small></label>
                       <label className="check-field"><input type="checkbox" checked={selectedNode.config.includeSubfolders || false} onChange={(event) => updateNode({ config: { includeSubfolders: event.target.checked } })} /><span>Include files in subfolders</span></label>
-                      <div className="node-folder-picker"><span><FolderOpen size={15} /><span><strong>Directory to load</strong><small>{nodeFolderHandles[selectedNode.id]?.name || (databaseFolder ? `${databaseFolder.name} (shared default)` : undefined) || (selectedNode.config.directoryName ? `Reconnect “${selectedNode.config.directoryName}”` : `${configuredDefaultDirectory()} (default)`)}</small></span></span><div className="node-folder-actions">{(nodeFolderHandles[selectedNode.id] || selectedNode.config.directoryName) && <button className="secondary-button" onClick={() => resetNodeDirectoryToDefault(selectedNode.id)}>Use default</button>}<button className="secondary-button" onClick={() => chooseFolder("node", selectedNode.id)}>{nodeFolderHandles[selectedNode.id] ? "Change" : "Override"}</button></div></div>
+                      <label className="field-label">Directory path<input value={selectedNode.config.directoryPath ?? selectedNode.config.directoryName ?? ""} placeholder={`${configuredDefaultDirectory()} (default)`} onChange={(event) => updateNode({ config: { directoryPath: event.target.value, directoryName: undefined } })} /><small className="field-help">Relative paths start at the Magic Conch program folder. Absolute paths are supported. No browser permission is required.</small></label>
                     </>
                   )}
                   {(selectedNode.type === "save" || selectedNode.type === "load") && (
                     <>
                       {(selectedNode.type === "save" || selectedNode.config.loadMode !== "folder") && <label className="field-label">File key<input value={selectedNode.config.key || ""} placeholder="record-name" onChange={(event) => updateNode({ config: { key: event.target.value } })} /><small className="field-help">Versioned files with the same key can coexist.</small></label>}
-                      <label className="field-label">Subfolder path<input value={selectedNode.config.subfolder || ""} placeholder="Optional, relative to the directory below" onChange={(event) => updateNode({ config: { subfolder: event.target.value } })} /><small className="field-help">Leave blank to use the selected directory itself. Absolute paths work only when they contain the selected directory.</small></label>
-                      <div className="node-folder-picker"><span><FolderOpen size={15} /><span><strong>Node directory</strong><small>{nodeFolderHandles[selectedNode.id]?.name || (databaseFolder ? `${databaseFolder.name} (shared default)` : undefined) || (selectedNode.config.directoryName ? `Reconnect “${selectedNode.config.directoryName}”` : `${configuredDefaultDirectory()} (default)`)}</small></span></span><div className="node-folder-actions">{(nodeFolderHandles[selectedNode.id] || selectedNode.config.directoryName) && <button className="secondary-button" onClick={() => resetNodeDirectoryToDefault(selectedNode.id)}>Use default</button>}<button className="secondary-button" onClick={() => chooseFolder("node", selectedNode.id)}>{nodeFolderHandles[selectedNode.id] ? "Change" : "Override"}</button></div></div>
+                      <label className="field-label">Subfolder path<input value={selectedNode.config.subfolder || ""} placeholder="Optional, relative to the directory below" onChange={(event) => updateNode({ config: { subfolder: event.target.value } })} /><small className="field-help">Leave blank to use the directory itself.</small></label>
+                      <label className="field-label">Directory path<input value={selectedNode.config.directoryPath ?? selectedNode.config.directoryName ?? ""} placeholder={`${configuredDefaultDirectory()} (default)`} onChange={(event) => updateNode({ config: { directoryPath: event.target.value, directoryName: undefined } })} /><small className="field-help">Relative paths start at the Magic Conch program folder. Absolute paths are supported. No browser permission is required.</small></label>
                       {selectedNode.type === "save" ? (
                         <>
                           <label className="field-label">When a name already exists<div className="select-wrap"><select value={selectedNode.config.collision || "increment"} onChange={(event) => updateNode({ config: { collision: event.target.value as FlowNode["config"]["collision"] } })}><option value="increment">Add number (file-2)</option><option value="timestamp">Add timestamp</option><option value="overwrite">Overwrite</option></select><ChevronDown size={14} /></div></label>
@@ -4154,7 +4213,7 @@ export default function Workbench() {
             <div className="chat-sidebar-bottom">
               <div className="storage-card">
                 <span className="storage-icon"><HardDrive size={16} /></span>
-                <div><strong>Local database</strong><small>{databaseFolder?.name || configuredDefaultDirectory()}</small></div>
+                <div><strong>Local database</strong><small>{configuredDefaultDirectory()}</small></div>
                 <span className="status-dot connected" />
               </div>
               <button onClick={() => setSettingsOpen(true)}><Settings size={16} /> Settings</button>
@@ -4264,22 +4323,21 @@ export default function Workbench() {
                     <label className="field-label history-limit">Undo records<input type="number" min="1" max="500" value={undoLimit} onChange={(event) => setUndoLimit(Math.max(1, Math.min(500, Number(event.target.value) || 1)))} /><small className="field-help">Between 1 and 500 records per workflow.</small></label>
                   </div>
                   <div className="settings-section">
-                    <div className="section-title"><FolderOpen size={17} /><div><strong>Default folders</strong><small>Save and Load nodes use the default path unless a browser folder or node-specific folder overrides it.</small></div></div>
+                    <div className="section-title"><FolderOpen size={17} /><div><strong>Default folders</strong><small>Save and Load nodes use this persistent path unless the node provides its own path.</small></div></div>
                     <label className="field-label default-directory-field">Default Save/Load directory<input value={defaultDirectoryPath} placeholder={DEFAULT_LOCAL_DIRECTORY} onChange={(event) => setDefaultDirectoryPath(event.target.value)} onBlur={() => { if (!defaultDirectoryPath.trim()) setDefaultDirectoryPath(DEFAULT_LOCAL_DIRECTORY); }} /><small className="field-help">Relative paths start at the Magic Conch program folder. Absolute paths are also supported by the local app.</small></label>
-                    <div className="folder-row"><span className="folder-icon"><FileJson size={18} /></span><div><strong>Workflow folder</strong><small>{workflowFolder ? workflowFolder.name : "Not connected — use Export to download files"}</small></div><button className="secondary-button" onClick={() => chooseFolder("workflow")}><FolderOpen size={14} /> Choose</button></div>
-                    <div className="folder-row"><span className="folder-icon"><Database size={18} /></span><div><strong>Browser folder override</strong><small>{databaseFolder ? databaseFolder.name : `None — using ${configuredDefaultDirectory()}`}</small></div><div className="folder-actions">{databaseFolder && <button className="secondary-button" onClick={resetDatabaseDirectoryToConfiguredPath}>Use path</button>}<button className="secondary-button" onClick={() => chooseFolder("database")}><FolderOpen size={14} /> {databaseFolder ? "Change" : "Choose"}</button></div></div>
+                    <div className="folder-row"><span className="folder-icon"><FileJson size={18} /></span><div><strong>Workflow folder</strong><small>{workflowFolder ? workflowFolder.name : "Not connected — use Export to download files"}</small></div><button className="secondary-button" onClick={chooseWorkflowFolder}><FolderOpen size={14} /> Choose</button></div>
                   </div>
                   <div className="local-first-note"><HardDrive size={17} /><div><strong>Local-first by design</strong><span>Your workflows, keys, and saved records stay on this device unless you call an AI provider.</span></div></div>
                 </>
               )}
               {settingsTab === "plugins" && (
                 <div className="settings-section tab-section">
-                  <div className="section-title"><Plug size={17} /><div><strong>Custom node plug-ins</strong><small>Install a JSON manifest to add nodes and custom JavaScript, template, or HTTP functions.</small></div></div>
+                  <div className="section-title"><Plug size={17} /><div><strong>Custom node plug-ins</strong><small>Install a JSON manifest or ZIP bundle to add nodes, code, and supporting files.</small></div></div>
                   <div className="plugin-warning"><Info size={16} /><span>Plug-ins can run code with access to this app. Install only files you trust.</span></div>
                   <button className="primary-button install-plugin" onClick={() => pluginInputRef.current?.click()}><Upload size={14} /> Install plug-in</button>
-                  <input ref={pluginInputRef} type="file" accept="application/json,.json" hidden onChange={importPlugin} />
+                  <input ref={pluginInputRef} type="file" accept="application/json,application/zip,.json,.zip" hidden onChange={importPlugin} />
                   <div className="installed-plugins">
-                    {plugins.length ? plugins.map((plugin) => <div key={plugin.id}><span className="folder-icon"><Plug size={16} /></span><span><strong>{plugin.name}</strong><small>v{plugin.version} · {plugin.nodes.length} node{plugin.nodes.length === 1 ? "" : "s"}</small></span><button className="mini-icon" aria-label={`Remove ${plugin.name}`} onClick={() => setPlugins((current) => current.filter((item) => item.id !== plugin.id))}><Trash2 size={14} /></button></div>) : <div className="no-plugins"><Plug size={22} /><span>No plug-ins installed yet</span><small>An example is included in examples/text-tools.plugin.json.</small></div>}
+                    {plugins.length ? plugins.map((plugin) => <div key={plugin.id}><span className="folder-icon"><Plug size={16} /></span><span><strong>{plugin.name}</strong><small>v{plugin.version} · {plugin.nodes.length} node{plugin.nodes.length === 1 ? "" : "s"}{plugin.files?.length ? ` · ${plugin.files.length} file${plugin.files.length === 1 ? "" : "s"}` : ""}</small></span><button className="mini-icon" aria-label={`Remove ${plugin.name}`} onClick={() => setPlugins((current) => current.filter((item) => item.id !== plugin.id))}><Trash2 size={14} /></button></div>) : <div className="no-plugins"><Plug size={22} /><span>No plug-ins installed yet</span><small>An example is included in examples/text-tools.plugin.json.</small></div>}
                   </div>
                 </div>
               )}

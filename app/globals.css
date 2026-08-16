@@ -90,6 +90,7 @@ button { color: inherit; }
 .node-library-empty span { font-size: 9px; }
 .sidebar-footer { margin-top: auto; padding: 12px 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; border-top: 1px solid var(--line); }
 .sidebar-footer button { border: 1px solid var(--line); background: white; border-radius: 8px; min-width: 0; height: 32px; font-size: 10px; display: flex; gap: 5px; align-items: center; justify-content: center; cursor: pointer; }
+.sidebar-footer .export-with-files { grid-column: 1 / -1; }
 .syntax-reference { flex: 0 0 auto; border-top: 1px solid var(--line); background: #f4f5f0; }
 .syntax-reference summary { height: 39px; padding: 0 12px; list-style: none; display: flex; align-items: center; justify-content: space-between; color: #626b65; cursor: pointer; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .45px; }
 .syntax-reference summary::-webkit-details-marker { display: none; }

@@ -1,5 +1,5 @@
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { extname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, extname, isAbsolute, relative, resolve } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
@@ -12,7 +12,7 @@ type StoredRecord = { key: string; value: string; files: string[]; savedAt: stri
 
 export type LocalDirectoryRequest = {
   directory?: string;
-  operation?: "save-record" | "load-record" | "list-files";
+  operation?: "save-record" | "load-record" | "list-files" | "materialize-load";
   subfolder?: string[];
   key?: string;
   value?: string;
@@ -21,6 +21,7 @@ export type LocalDirectoryRequest = {
   collision?: CollisionMode;
   loadMode?: "latest" | "all" | "exact";
   recursive?: boolean;
+  writeRecord?: boolean;
 };
 
 const MIME_TYPES: Record<string, string> = {
@@ -73,6 +74,23 @@ function safeFilename(name: unknown) {
     throw new Error("The file name is invalid.");
   }
   return name;
+}
+
+function safeRelativeFilename(name: unknown) {
+  if (typeof name !== "string") throw new Error("The file name is invalid.");
+  const normalized = name.replace(/\\/g, "/").replace(/^\/+/, "");
+  const segments = normalized.split("/");
+  if (!segments.length) throw new Error("The file name is invalid.");
+  const filename = safeFilename(segments.pop());
+  return [...validateSubfolder(segments), filename].join("/");
+}
+
+function resolveRelativeFile(folder: string, name: unknown) {
+  const safeName = safeRelativeFilename(name);
+  const path = resolve(folder, ...safeName.split("/"));
+  const fromFolder = relative(folder, path);
+  if (fromFolder.startsWith("..") || isAbsolute(fromFolder)) throw new Error("The file path must stay inside its directory.");
+  return { path, name: safeName };
 }
 
 async function exists(path: string) {
@@ -143,11 +161,35 @@ async function saveRecord(projectRoot: string, request: LocalDirectoryRequest) {
 
 async function readStoredAsset(folder: string, filename: string) {
   try {
-    const safeName = safeFilename(filename);
-    return await fileAsset(resolve(folder, safeName), safeName);
+    const file = resolveRelativeFile(folder, filename);
+    return await fileAsset(file.path, file.name);
   } catch {
     return null;
   }
+}
+
+async function materializeLoad(projectRoot: string, request: LocalDirectoryRequest) {
+  const root = resolveConfiguredDirectory(projectRoot, request.directory);
+  const folder = resolveSubfolder(root, request.subfolder);
+  await mkdir(folder, { recursive: true });
+  const files: string[] = [];
+  for (const asset of request.files || []) {
+    const target = resolveRelativeFile(folder, asset.name);
+    await mkdir(dirname(target.path), { recursive: true });
+    await writeFile(target.path, decodeAsset(asset));
+    files.push(target.name);
+  }
+  if (request.writeRecord) {
+    const key = safeFilename(request.key || "workflow-result");
+    const record: StoredRecord = {
+      key,
+      value: String(request.value ?? ""),
+      files,
+      savedAt: new Date().toISOString(),
+    };
+    await writeFile(resolve(folder, `${key}.json`), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  }
+  return { files, directory: root };
 }
 
 async function loadRecord(projectRoot: string, request: LocalDirectoryRequest) {
@@ -231,6 +273,7 @@ export async function handleLocalDirectoryRequest(projectRoot: string, request: 
   if (request.operation === "save-record") return saveRecord(projectRoot, request);
   if (request.operation === "load-record") return loadRecord(projectRoot, request);
   if (request.operation === "list-files") return listFiles(projectRoot, request);
+  if (request.operation === "materialize-load") return materializeLoad(projectRoot, request);
   throw new Error("Unknown local directory operation.");
 }
 

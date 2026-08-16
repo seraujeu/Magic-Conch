@@ -23,6 +23,7 @@ test("server-renders the Magic Conch workflow editor", async () => {
   assert.match(html, /<title>Magic Conch — AI Workflow Studio<\/title>/i);
   assert.match(html, />Magic Conch</);
   assert.match(html, />\s*Workflow</);
+  assert.match(html, />\s*Export with files\s*</);
   assert.match(html, /aria-label="Workflow connections"/);
   assert.doesNotMatch(html, /type-flow|edge-flow/);
 });
@@ -92,16 +93,23 @@ test("supports scalar and media data ports, connectable attributes, and director
   assert.match(workbench, /loadMode\?: "latest" \| "all" \| "exact" \| "folder"/);
   assert.match(workbench, /<option value="folder">All files in folder<\/option>/);
   assert.match(workbench, /node\.config\.loadMode === "folder"[\s\S]*?loadDirectoryFiles/);
-  assert.match(workbench, /rememberDirectoryHandle\(nodeId, handle\)/);
   assert.match(workbench, /restoreDirectoryHandles\(\)/);
-  assert.match(workbench, /rememberDirectoryHandle\(DATABASE_DIRECTORY_HANDLE_KEY, handle\)/);
   assert.match(workbench, /const DEFAULT_LOCAL_DIRECTORY = "user-data"/);
   assert.match(workbench, /operation: "save-record"/);
   assert.match(workbench, /operation: "load-record"/);
   assert.match(workbench, /operation: "list-files"/);
+  assert.match(workbench, /operation: "materialize-load"/);
+  assert.match(workbench, /materializedLoadDirectory\(workflow, node\)/);
+  assert.match(workbench, /directoryPath: directory/);
+  assert.match(workbench, /for \(const workflow of migrated\) materialized\.push\(await materializeWorkflowLoadFiles\(workflow\)\)/);
+  assert.match(workbench, /for \(const workflow of migrated\) imported\.push\(await materializeWorkflowLoadFiles\(workflow\)\)/);
   assert.match(workbench, /magic-conch-default-directory/);
-  assert.match(workbench, /Reconnect the “\$\{node\.config\.directoryName\}” Node directory/);
-  assert.match(workbench, /Absolute paths work only when they contain the selected directory/);
+  assert.match(workbench, /directoryPath\?: string/);
+  assert.match(workbench, /resolveNodeDirectory\(node\.config, configuredDefaultDirectory\(\), subfolder\)/);
+  assert.match(workbench, /directory: location\.directory/);
+  assert.match(workbench, /No browser permission is required/);
+  assert.doesNotMatch(workbench, /chooseFolder\("node"/);
+  assert.doesNotMatch(workbench, /ensureDirectoryPermission/);
   assert.match(workbench, /id: "system_prompt", label: "system prompt", type: "string"/);
   assert.match(workbench, /id: "start_message", label: "start message", type: "string"/);
   assert.match(workbench, /inputFor\("system_prompt", node\.config\.systemPrompt/);
@@ -110,10 +118,19 @@ test("supports scalar and media data ports, connectable attributes, and director
   assert.match(workbench, /node\.type === "load"[^\n]+\.\.\.mediaOutputs/);
   assert.match(workbench, /output\("image", mediaAssets\(loaded\.files, "image"\)\)/);
   assert.match(workbench, /output\("video", mediaAssets\(loaded\.files, "video"\)\)/);
-  assert.match(workbench, /assets: !folder && !localResult && node\.config\.saveFiles !== "data" \? files : undefined/);
+  assert.match(workbench, /assets: !localResult && node\.config\.saveFiles !== "data" \? files : undefined/);
   assert.match(workbench, /fileAssetsPromptSections\(fileInput\)/);
   assert.match(workbench, /collectFileAssets\(suppliedFiles, suppliedMedia, documentInput\)/);
   assert.match(workbench, /files: fileInput/);
+});
+
+test("stores large workflow and plug-in artifacts outside localStorage", async () => {
+  const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
+  assert.match(workbench, /readStoredArtifact<Workflow\[]>\("workflows"\)/);
+  assert.match(workbench, /writeStoredArtifact\("workflows", workflows\)/);
+  assert.match(workbench, /writeStoredArtifact\("plugins", plugins\)/);
+  assert.match(workbench, /artifactFallbackJson\(workflows\)/);
+  assert.doesNotMatch(workbench, /localStorage\.setItem\("magic-conch-workflows", JSON\.stringify\(workflows\)\)/);
 });
 
 test("renders chat messages as GitHub-flavored Markdown", async () => {
