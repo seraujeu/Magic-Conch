@@ -23,13 +23,14 @@ available.
 Clone or download the repository, then use the launcher for your system:
 
 - Windows: double-click `install.bat` once, then `Launch Magic Conch.bat`
-- macOS/Linux: run `sh "Launch Magic Conch.sh"`
+- macOS/Linux: run `sh install.sh` once, then `sh "Launch Magic Conch.sh"`
 - Any system: run `npm install`, followed by `npm run launch`
 
 On Windows, `install.bat` automatically downloads a verified, private Node.js
-runtime when a supported system installation is unavailable. It is stored in
-`.runtime/` beside the application and does not require administrator access or
-change the system-wide Node.js installation.
+runtime when a supported system installation is unavailable. On macOS and
+Linux, `sh install.sh` does the same. The runtime is stored in `.runtime/`
+beside the application and does not require administrator access or change the
+system-wide Node.js installation.
 
 The launcher installs dependencies when needed, uses the stable default port
 4173, starts Magic Conch, and opens it in the default browser. It stops with a
