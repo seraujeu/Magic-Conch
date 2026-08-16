@@ -92,8 +92,14 @@ test("supports scalar and media data ports, connectable attributes, and director
   assert.match(workbench, /loadMode\?: "latest" \| "all" \| "exact" \| "folder"/);
   assert.match(workbench, /<option value="folder">All files in folder<\/option>/);
   assert.match(workbench, /node\.config\.loadMode === "folder"[\s\S]*?loadDirectoryFiles/);
-  assert.match(workbench, /rememberNodeDirectoryHandle\(nodeId, handle\)/);
-  assert.match(workbench, /restoreNodeDirectoryHandles\(\)/);
+  assert.match(workbench, /rememberDirectoryHandle\(nodeId, handle\)/);
+  assert.match(workbench, /restoreDirectoryHandles\(\)/);
+  assert.match(workbench, /rememberDirectoryHandle\(DATABASE_DIRECTORY_HANDLE_KEY, handle\)/);
+  assert.match(workbench, /const DEFAULT_LOCAL_DIRECTORY = "user-data"/);
+  assert.match(workbench, /operation: "save-record"/);
+  assert.match(workbench, /operation: "load-record"/);
+  assert.match(workbench, /operation: "list-files"/);
+  assert.match(workbench, /magic-conch-default-directory/);
   assert.match(workbench, /Reconnect the “\$\{node\.config\.directoryName\}” Node directory/);
   assert.match(workbench, /Absolute paths work only when they contain the selected directory/);
   assert.match(workbench, /id: "system_prompt", label: "system prompt", type: "string"/);
@@ -104,7 +110,7 @@ test("supports scalar and media data ports, connectable attributes, and director
   assert.match(workbench, /node\.type === "load"[^\n]+\.\.\.mediaOutputs/);
   assert.match(workbench, /output\("image", mediaAssets\(loaded\.files, "image"\)\)/);
   assert.match(workbench, /output\("video", mediaAssets\(loaded\.files, "video"\)\)/);
-  assert.match(workbench, /assets: !folder && node\.config\.saveFiles !== "data" \? files : undefined/);
+  assert.match(workbench, /assets: !folder && !localResult && node\.config\.saveFiles !== "data" \? files : undefined/);
   assert.match(workbench, /fileAssetsPromptSections\(fileInput\)/);
   assert.match(workbench, /collectFileAssets\(suppliedFiles, suppliedMedia, documentInput\)/);
   assert.match(workbench, /files: fileInput/);

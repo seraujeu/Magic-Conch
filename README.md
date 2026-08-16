@@ -1,105 +1,98 @@
-# vinext-starter
+# Magic Conch
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+Magic Conch is a local-first visual AI workflow studio with a chat interface.
+It runs as a local web application and stores personal state on your device.
 
-## Prerequisites
+## Supported systems
 
-- Node.js `>=22.13.0`
+- Windows 10/11
+- macOS
+- Linux distributions that support Node.js 22
+- Node.js `>=22.13.0` and npm
+- A current Chromium browser is recommended
 
-## Quick Start
+The editor, chat, AI providers, workflow import/export, and browser-backed
+storage are portable across the supported operating systems. Direct folder
+access uses the File System Access API, which is fully available in Chrome and
+Edge. Browsers without that API can still use Magic Conch, but folder-connected
+Load/Save features are unavailable; workflow JSON import/export remains
+available.
+
+## Install and launch
+
+Clone or download the repository, then use the launcher for your system:
+
+- Windows: double-click `Launch Magic Conch.bat`
+- macOS/Linux: run `sh "Launch Magic Conch.sh"`
+- Any system: run `npm install`, followed by `npm run launch`
+
+The launcher installs dependencies when needed, uses the stable default port
+4173, starts Magic Conch, and opens it in the default browser. It stops with a
+clear message if that port is occupied so it does not silently switch to a
+different browser-data area. To deliberately use another port, pass it to the
+launcher, for example:
+
+```bash
+npm run launch -- 4173
+```
+
+Keep using the same URL (especially the same port) to see the same local data.
+Browser storage is isolated by URL, browser profile, and device.
+
+## Personal data and privacy
+
+Magic Conch keeps these items outside the source repository:
+
+- chat sessions and chat folders (IndexedDB)
+- workflows, provider settings/keys, and installed plug-ins (local storage)
+- remembered folder permissions (IndexedDB)
+- Save/Load node output (`user-data/` by default)
+
+When a Save, Load, or Load Directory node has no folder selected, it uses the
+`user-data/` folder beside the program files. Change this path under
+**Settings → General → Default folders**; relative paths start at the program
+folder, and absolute paths are supported by the locally launched app. A folder
+selected in Settings or on an individual node overrides this path.
+
+Updating source files does not clear those stores. Personal data is not moved
+to another computer automatically; workflow JSON can be exported and imported
+when a workflow needs to be transferred.
+
+Conventional local folders such as `chats/`, `workflows/`, `user-data/`,
+`backups/`, `exports/`, and local contents of `plugins/` are ignored by Git.
+Consequently, files inside `user-data/` are excluded from GitHub uploads and
+remain untouched by the GitHub updater.
+
+## Update safely from GitHub
+
+From a Git clone with an `origin` GitHub remote:
+
+- Windows: double-click `Update Magic Conch.bat`
+- macOS/Linux: run `sh update-magic-conch.sh`
+- Any system: run `npm run update`
+
+The updater only accepts a fast-forward update on a clean source tree. It then
+installs the exact locked dependencies and runs the test suite. It never reads,
+exports, deletes, or rewrites browser storage or ignored personal-data folders.
+
+Useful options:
+
+```bash
+npm run update -- --check
+npm run update -- --skip-tests
+```
+
+`--check` reports whether commits are available without changing files.
+
+## Development
 
 ```bash
 npm install
 npm run dev
-npm run build
+npm test
+npm run lint
 ```
 
-On Windows, `Launch Magic Conch.bat` starts the app on the first available port
-at or above 3000 and opens that address automatically. To prefer a particular
-port, pass it as an argument (for example, `Launch Magic Conch.bat 4173`) or set
-the `PORT` environment variable.
-
-This starter does not use `wrangler.jsonc`.
-
-## Included Shape
-
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
-
-## Workspace Auth Headers
-
-Signed-in visitors receive both `oai-authenticated-user-id` and `oai-authenticated-user-email`. Private Sites require every visitor to sign in; public Sites may also have anonymous visitors, for whom neither header is present.
-
-The user ID is stable for the same user on the same Site and different across Sites. Email and name are intended for display or contact purposes.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const userId = requestHeaders.get("oai-authenticated-user-id");
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
-```
-
-## Optional Dispatch-Owned ChatGPT Sign-In
-
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
-
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
-
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+The application uses vinext, React, Vite, and Cloudflare's local development
+runtime. `.openai/hosting.json` retains the optional Sites binding contract;
+D1 and R2 remain disabled for this local-first application.

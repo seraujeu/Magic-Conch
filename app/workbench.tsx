@@ -5,6 +5,7 @@ import {
   Braces,
   Bug,
   Box,
+  Calculator,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -18,6 +19,7 @@ import {
   Database,
   Download,
   FileJson,
+  FileType,
   FolderOpen,
   GitBranch,
   HardDrive,
@@ -42,6 +44,7 @@ import {
   Redo2,
   RotateCcw,
   Route,
+  Ruler,
   Search,
   Shuffle,
   Save,
@@ -81,7 +84,10 @@ import {
   requestAI,
 } from "../lib/ai-providers";
 import { collectFileAssets, fileAssetsPromptSections } from "../lib/file-content";
+import { fileNameFromAsset, firstFileAsset, getMediaDimensions } from "../lib/file-metadata";
+import { evaluateBooleanRule, parseAIBoolean } from "../lib/boolean-condition";
 import { directorySubfolderSegments } from "../lib/directory-path";
+import { ensureDirectoryPermission, rememberDirectoryPermission } from "../lib/directory-permission";
 import { chatSessionsFallbackJson, readStoredChatSessions, writeStoredChatSessions } from "../lib/chat-storage";
 import {
   BranchableMessage,
@@ -105,6 +111,14 @@ import {
   joinInputVariable,
 } from "../lib/join-aggregate";
 import {
+  createMathInput,
+  evaluateMathExpression,
+  growMathInputs,
+  MathInputDefinition,
+  mathInputVariable,
+  MathOutputType,
+} from "../lib/math-expression";
+import {
   expandWorkflowSyntax,
   expandWorkflowSyntaxInValue,
   WORKFLOW_SYNTAX,
@@ -113,7 +127,7 @@ import {
 import { isWorkflowNodeActive } from "../lib/workflow-scheduler";
 import { workflowExportFilename, workflowFileText } from "../lib/workflow-files";
 
-type BuiltinNodeType = "start" | "input" | "request" | "workflow" | "string" | "integer" | "float" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "router-condition" | "router-ai" | "router-rule" | "end";
+type BuiltinNodeType = "start" | "input" | "request" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
 type FileAsset = { name: string; type: string; data: string; size: number };
 type PortDataType = "prompt" | "files" | "document" | "text" | "number" | "boolean" | "string" | "integer" | "float" | "image" | "video" | "audio" | "any";
@@ -216,6 +230,10 @@ type FlowNode = {
     stringValue?: string;
     integerValue?: number;
     floatValue?: number;
+    mathExpression?: string;
+    mathInputs?: MathInputDefinition[];
+    mathOutputType?: MathOutputType;
+    includeExtension?: boolean;
     includeSubfolders?: boolean;
     calledWorkflowId?: string;
   };
@@ -315,6 +333,10 @@ type DirectoryHandle = {
 
 const DIRECTORY_HANDLE_DATABASE = "magic-conch-directory-handles";
 const DIRECTORY_HANDLE_STORE = "node-directories";
+const DATABASE_DIRECTORY_HANDLE_KEY = "global:database";
+const WORKFLOW_DIRECTORY_HANDLE_KEY = "global:workflow";
+const DEFAULT_LOCAL_DIRECTORY = "user-data";
+const LOCAL_DIRECTORY_ENDPOINT = "/_magic-conch/local-directory";
 
 function openDirectoryHandleDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {
@@ -329,19 +351,31 @@ function openDirectoryHandleDatabase() {
   });
 }
 
-async function rememberNodeDirectoryHandle(nodeId: string, handle: DirectoryHandle) {
+async function rememberDirectoryHandle(key: string, handle: DirectoryHandle) {
   if (typeof indexedDB === "undefined") return;
   const database = await openDirectoryHandleDatabase();
   await new Promise<void>((resolve, reject) => {
     const transaction = database.transaction(DIRECTORY_HANDLE_STORE, "readwrite");
-    transaction.objectStore(DIRECTORY_HANDLE_STORE).put(handle, nodeId);
+    transaction.objectStore(DIRECTORY_HANDLE_STORE).put(handle, key);
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(transaction.error);
   });
   database.close();
 }
 
-async function restoreNodeDirectoryHandles() {
+async function forgetDirectoryHandle(key: string) {
+  if (typeof indexedDB === "undefined") return;
+  const database = await openDirectoryHandleDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(DIRECTORY_HANDLE_STORE, "readwrite");
+    transaction.objectStore(DIRECTORY_HANDLE_STORE).delete(key);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+  database.close();
+}
+
+async function restoreDirectoryHandles() {
   if (typeof indexedDB === "undefined") return {} as Record<string, DirectoryHandle>;
   const database = await openDirectoryHandleDatabase();
   const handles = await new Promise<Record<string, DirectoryHandle>>((resolve, reject) => {
@@ -358,15 +392,6 @@ async function restoreNodeDirectoryHandles() {
   return handles;
 }
 
-async function ensureDirectoryPermission(handle: DirectoryHandle, mode: "read" | "readwrite") {
-  let permission = await handle.queryPermission?.({ mode });
-  if (permission === "granted" || permission === undefined) return;
-  permission = await handle.requestPermission?.({ mode });
-  if (permission !== "granted") {
-    throw new Error(`Allow ${mode === "readwrite" ? "read and write" : "read"} access to “${handle.name}”, or choose the directory again.`);
-  }
-}
-
 const NODE_META: Record<
   BuiltinNodeType,
   { label: string; subtitle: string; color: string; icon: typeof Play }
@@ -378,6 +403,9 @@ const NODE_META: Record<
   string: { label: "String", subtitle: "Provide a string value", color: "#3689b5", icon: Variable },
   integer: { label: "Integer", subtitle: "Provide a whole number", color: "#b49332", icon: Variable },
   float: { label: "Float", subtitle: "Provide a decimal number", color: "#d09032", icon: Variable },
+  math: { label: "Math", subtitle: "Calculate with named inputs", color: "#b66f36", icon: Calculator },
+  "media-size": { label: "Get Image / Video Size", subtitle: "Read media dimensions", color: "#4d8fa2", icon: Ruler },
+  "file-name": { label: "Get File Name", subtitle: "Read a file's name", color: "#6c8298", icon: FileType },
   "list-directory": { label: "Load Directory", subtitle: "Load the files in a directory", color: "#718e3c", icon: FolderOpen },
   save: { label: "Save", subtitle: "Write a file", color: "#3188c7", icon: Save },
   load: { label: "Load", subtitle: "Read a file", color: "#c59030", icon: Database },
@@ -390,6 +418,8 @@ const NODE_META: Record<
   parser: { label: "Parser", subtitle: "Parse structured documents", color: "#3d9991", icon: Braces },
   join: { label: "Join / Aggregate", subtitle: "Collect multiple outputs", color: "#8d6d44", icon: Combine },
   parallel: { label: "Parallel", subtitle: "Fan a value out to connected branches", color: "#3f86a8", icon: GitBranch },
+  "condition-ai": { label: "AI Condition", subtitle: "AI-powered true / false", color: "#b6539d", icon: BrainCircuit },
+  "condition-rule": { label: "Rule Condition", subtitle: "Rule-based true / false", color: "#3f806f", icon: GitBranch },
   "router-condition": { label: "Condition Router", subtitle: "Binary if / else routing", color: "#557f57", icon: Route },
   "router-ai": { label: "AI Router", subtitle: "Choose a path with AI", color: "#c05ca6", icon: BrainCircuit },
   "router-rule": { label: "Rule Router", subtitle: "Choose a path by rule", color: "#4d8f80", icon: Route },
@@ -399,11 +429,11 @@ const NODE_META: Record<
 const BUILTIN_NODE_GROUPS: { id: string; label: string; types: BuiltinNodeType[] }[] = [
   { id: "essentials", label: "Essentials", types: ["start", "input", "end"] },
   { id: "ai", label: "AI", types: ["request"] },
-  { id: "values", label: "Values", types: ["string", "integer", "float", "set-state"] },
-  { id: "files", label: "Files", types: ["list-directory", "load", "save"] },
+  { id: "values", label: "Values", types: ["string", "integer", "float", "math", "set-state"] },
+  { id: "files", label: "Files", types: ["list-directory", "load", "save", "media-size", "file-name"] },
   { id: "processing", label: "Processing", types: ["transform", "code", "parser", "join"] },
   { id: "flow-control", label: "Flow control", types: ["workflow", "loop", "retry", "wait", "parallel"] },
-  { id: "routing", label: "Routing", types: ["router-condition", "router-ai", "router-rule"] },
+  { id: "routing", label: "Routing", types: ["condition-ai", "condition-rule", "router-condition", "router-ai", "router-rule"] },
 ];
 
 function isBuiltinNodeType(type: string): type is BuiltinNodeType {
@@ -436,6 +466,10 @@ function getJoinInputs(node: FlowNode) {
   return node.config.joinInputs?.length ? node.config.joinInputs : [createJoinInput(1)];
 }
 
+function getMathInputs(node: FlowNode) {
+  return node.config.mathInputs?.length ? node.config.mathInputs : [createMathInput(1)];
+}
+
 function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema {
   const documentIn: PortSpec = { id: "document", label: "document", type: "document" };
   const documentOut: PortSpec = { id: "document", label: "document", type: "document" };
@@ -448,6 +482,22 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
   if (node.type === "string") return { inputs: [], outputs: [{ id: "value", label: "value", type: "string" }] };
   if (node.type === "integer") return { inputs: [], outputs: [{ id: "value", label: "value", type: "integer" }] };
   if (node.type === "float") return { inputs: [], outputs: [{ id: "value", label: "value", type: "float" }] };
+  if (node.type === "math") return {
+    inputs: getMathInputs(node).map((input, index) => ({
+      id: input.id,
+      label: `{{${mathInputVariable(input, index)}}}`,
+      type: "number",
+    })),
+    outputs: [{ id: "result", label: "result", type: node.config.mathOutputType || "float" }],
+  };
+  if (node.type === "media-size") return {
+    inputs: [{ id: "files", label: "file", type: "files" }, { id: "image", label: "image", type: "image" }, { id: "video", label: "video", type: "video" }],
+    outputs: [{ id: "width", label: "width", type: "integer" }, { id: "height", label: "height", type: "integer" }],
+  };
+  if (node.type === "file-name") return {
+    inputs: [{ id: "files", label: "file", type: "files" }, ...mediaInputs, documentIn],
+    outputs: [{ id: "name", label: "name", type: "string" }],
+  };
   if (node.type === "list-directory") return { inputs: [{ id: "trigger", label: "trigger", type: "any" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "recursive", label: "recursive", type: "boolean" }], outputs: [{ id: "files", label: "files", type: "files" }, { id: "image", label: "images", type: "image" }, { id: "video", label: "videos", type: "video" }, { id: "audio", label: "audio", type: "audio" }, { id: "names", label: "names", type: "any" }, { id: "count", label: "count", type: "integer" }] };
   if (node.type === "save") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "key", label: "file key", type: "string" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "files", label: "files", type: "files" }, ...mediaInputs], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs] };
   if (node.type === "load") return { inputs: [{ id: "trigger", label: "trigger", type: "any" }, { id: "key", label: "file key", type: "string" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "recursive", label: "recursive", type: "boolean" }], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
@@ -468,6 +518,12 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
   };
   if (node.type === "parallel") {
     return { inputs: [{ id: "value", label: "value", type: "any" }], outputs: [{ id: "value", label: "value", type: "any", multiple: true }] };
+  }
+  if (node.type === "condition-ai" || node.type === "condition-rule") {
+    return {
+      inputs: [{ id: "value", label: "value", type: "any" }, { id: "gate", label: "if / elif gate", type: "boolean" }, { id: "files", label: "files", type: "files" }, { id: "document", label: "document", type: "document" }],
+      outputs: [{ id: "true", label: "true / if", type: "boolean" }, { id: "false", label: "false / else", type: "boolean" }],
+    };
   }
   if (node.type === "router-condition") return { inputs: [{ id: "value", label: "value", type: "any" }, { id: "files", label: "files", type: "files" }, { id: "document", label: "document", type: "document" }], outputs: [{ id: "true", label: "true", type: "any" }, { id: "false", label: "false", type: "any" }, { id: "matched", label: "matched", type: "boolean" }] };
   if (node.type === "router-ai" || node.type === "router-rule") {
@@ -573,6 +629,19 @@ function migrateWorkflow(workflow: Workflow, plugins: MagicConchPlugin[]): Workf
   }
 
   const nodes = workflow.nodes.map((node) => {
+    if (node.type === "math") {
+      const inputs = node.config.mathInputs?.length ? [...node.config.mathInputs] : [];
+      const incomingIds = [...new Set(migrated
+        .filter((edge) => edge.to === node.id)
+        .map((edge) => edge.toPort)
+        .filter((id): id is string => Boolean(id)))];
+      if (!inputs.length) incomingIds.forEach((id, index) => inputs.push(createMathInput(index + 1, id)));
+      if (!inputs.length) inputs.push(createMathInput(1));
+      const connectedIds = new Set(incomingIds);
+      const lastInputId = inputs.at(-1)?.id;
+      if (lastInputId && connectedIds.has(lastInputId)) inputs.push(createMathInput(inputs.length + 1));
+      return { ...node, config: { ...node.config, mathInputs: inputs } };
+    }
     if (node.type !== "join") return node;
     const inputs = node.config.joinInputs?.length ? [...node.config.joinInputs] : [];
     const incoming = migrated.filter((edge) => edge.to === node.id);
@@ -600,30 +669,15 @@ function migrateWorkflow(workflow: Workflow, plugins: MagicConchPlugin[]): Workf
     return { ...node, config: { ...node.config, joinInputs: inputs } };
   });
 
-  return { ...workflow, version: Math.max(3, workflow.version || 1), nodes, edges: migrated };
+  return { ...workflow, version: Math.max(4, workflow.version || 1), nodes, edges: migrated };
 }
 
 function evaluateRouteRule(node: FlowNode, prompt: string, files: FileAsset[], optionValue?: string) {
-  const method = node.config.routeMethod || "contains";
-  const rawValue = optionValue ?? node.config.routeValue ?? "";
-  const source = node.config.caseSensitive ? prompt : prompt.toLowerCase();
-  const value = node.config.caseSensitive ? rawValue : rawValue.toLowerCase();
-  if (method === "contains") return source.includes(value);
-  if (method === "not_contains") return !source.includes(value);
-  if (method === "equals") return source === value;
-  if (method === "starts_with") return source.startsWith(value);
-  if (method === "ends_with") return source.endsWith(value);
-  if (method === "regex") {
-    try { return new RegExp(rawValue, node.config.caseSensitive ? "" : "i").test(prompt); } catch { return false; }
-  }
-  if (method === "length_gt") return prompt.length > Number(rawValue);
-  if (method === "length_lt") return prompt.length < Number(rawValue);
-  if (method === "is_empty") return prompt.trim().length === 0;
-  if (method === "file_type") return files.some((file) => file.type.includes(value) || file.name.toLowerCase().endsWith(value));
-  if (method === "file_count_gt") return files.length > Number(rawValue);
-  if (method === "number_gt") return Number(prompt) > Number(rawValue);
-  if (method === "number_lt") return Number(prompt) < Number(rawValue);
-  return false;
+  return evaluateBooleanRule(prompt, files, {
+    method: node.config.routeMethod,
+    expected: optionValue ?? node.config.routeValue,
+    caseSensitive: node.config.caseSensitive,
+  });
 }
 
 function valueAtPath(value: unknown, path = "") {
@@ -752,7 +806,7 @@ const initialWorkflow: Workflow = {
   id: "wf-research-assistant",
   name: "Research Assistant",
   description: "Clarifies the task, asks an AI model, and saves the final answer.",
-  version: 3,
+  version: 4,
   updatedAt: new Date().toISOString(),
   nodes: [
     {
@@ -1009,6 +1063,7 @@ export default function Workbench() {
   const [nodeSearch, setNodeSearch] = useState("");
   const [collapsedNodeGroups, setCollapsedNodeGroups] = useState<Record<string, boolean>>({});
   const [undoLimit, setUndoLimit] = useState(50);
+  const [defaultDirectoryPath, setDefaultDirectoryPath] = useState(DEFAULT_LOCAL_DIRECTORY);
   const [attachedFiles, setAttachedFiles] = useState<FileAsset[]>([]);
   const [workflowFolder, setWorkflowFolder] = useState<DirectoryHandle | null>(null);
   const [databaseFolder, setDatabaseFolder] = useState<DirectoryHandle | null>(null);
@@ -1051,8 +1106,16 @@ export default function Workbench() {
   );
   useEffect(() => {
     let active = true;
-    restoreNodeDirectoryHandles()
-      .then((handles) => { if (active) setNodeFolderHandles((current) => ({ ...handles, ...current })); })
+    restoreDirectoryHandles()
+      .then((handles) => {
+        if (!active) return;
+        setWorkflowFolder(handles[WORKFLOW_DIRECTORY_HANDLE_KEY] || null);
+        setDatabaseFolder(handles[DATABASE_DIRECTORY_HANDLE_KEY] || null);
+        const restoredNodeHandles = Object.fromEntries(
+          Object.entries(handles).filter(([key]) => !key.startsWith("global:")),
+        );
+        setNodeFolderHandles((current) => ({ ...restoredNodeHandles, ...current }));
+      })
       .catch(() => { /* Folder access can still be reconnected with Choose. */ });
     return () => { active = false; };
   }, []);
@@ -1176,6 +1239,7 @@ export default function Workbench() {
         const savedSettings = localStorage.getItem("magic-conch-provider-settings");
         const savedPlugins = localStorage.getItem("magic-conch-plugins");
         const savedUndoLimit = localStorage.getItem("magic-conch-undo-limit");
+        const savedDefaultDirectory = localStorage.getItem("magic-conch-default-directory");
         const savedSessionsJson = localStorage.getItem("magic-conch-chat-sessions");
         const indexedSessions = await readStoredChatSessions<Partial<ChatSession>[]>().catch(() => null);
         const savedSessions = indexedSessions ?? (savedSessionsJson ? JSON.parse(savedSessionsJson) as Partial<ChatSession>[] : null);
@@ -1211,6 +1275,7 @@ export default function Workbench() {
         if (savedSettings) setProviderSettings(JSON.parse(savedSettings));
         if (savedPlugins) setPlugins(restoredPlugins);
         if (savedUndoLimit) setUndoLimit(Math.max(1, Math.min(500, Number(savedUndoLimit))));
+        if (savedDefaultDirectory) setDefaultDirectoryPath(savedDefaultDirectory);
         if (savedChatFolders) {
           const restoredFolders = JSON.parse(savedChatFolders) as Partial<ChatFolder>[];
           setChatFolders(restoredFolders.filter((folder) => folder.id && folder.name).map((folder, index) => ({
@@ -1275,6 +1340,11 @@ export default function Workbench() {
       redoHistoryRef.current[id] = redoHistoryRef.current[id].slice(-undoLimit);
     }
   }, [undoLimit]);
+
+  useEffect(() => {
+    if (!storageRestoredRef.current) return;
+    localStorage.setItem("magic-conch-default-directory", defaultDirectoryPath.trim() || DEFAULT_LOCAL_DIRECTORY);
+  }, [defaultDirectoryPath]);
 
   useEffect(() => {
     if (!storageRestoredRef.current) return;
@@ -1696,6 +1766,10 @@ export default function Workbench() {
               ? { integerValue: 0 }
               : type === "float"
                 ? { floatValue: 0 }
+                : type === "math"
+                  ? { mathExpression: "{{input1}}", mathOutputType: "float", mathInputs: [createMathInput(1)] }
+                  : type === "file-name"
+                    ? { includeExtension: true }
                 : type === "list-directory"
                   ? { subfolder: "", includeSubfolders: false }
           : type === "input"
@@ -1704,6 +1778,10 @@ export default function Workbench() {
               ? { key: "record-name", collision: "increment", saveFiles: "both" }
               : type === "load"
                 ? { key: "record-name", loadMode: "latest" }
+                : type === "condition-ai"
+                  ? { provider: "openai", model: modelDefaults.openai, temperature: 0, routeCriteria: "Return true when the input satisfies this condition." }
+                  : type === "condition-rule"
+                    ? { routeMethod: "contains", routeValue: "urgent", caseSensitive: false }
                 : type === "router-ai"
                   ? { provider: "openai", model: modelDefaults.openai, temperature: 0, routeCriteria: "Choose the most suitable option for the input.", routeOptions: [{ id: "route-1", label: "Option 1", value: "" }] }
                   : type === "router-rule"
@@ -2037,6 +2115,11 @@ export default function Workbench() {
             const joinInputs = growJoinInputs(inputs, targetPort, uid("join-input"));
             if (joinInputs !== inputs) return { ...node, config: { ...node.config, joinInputs } };
           }
+          if (node.id === targetId && node.type === "math") {
+            const inputs = getMathInputs(node);
+            const mathInputs = growMathInputs(inputs, targetPort, uid("math-input"));
+            if (mathInputs !== inputs) return { ...node, config: { ...node.config, mathInputs } };
+          }
           if (node.id === source.nodeId && ["router-ai", "router-rule"].includes(node.type)) {
             const options = node.config.routeOptions?.length ? node.config.routeOptions : [{ id: source.portId, label: "Option 1", value: node.config.routeValue || "" }];
             if (options.at(-1)?.id === source.portId) {
@@ -2103,7 +2186,7 @@ export default function Workbench() {
       id,
       name: "Untitled workflow",
       description: "A new automation workflow.",
-      version: 3,
+      version: 4,
       updatedAt: new Date().toISOString(),
       nodes: [
         {
@@ -2225,20 +2308,72 @@ export default function Workbench() {
     return `magic-conch-record:${segments.length ? `${segments.join("/")}/` : ""}${safeKey}`;
   }
 
+  function configuredDefaultDirectory() {
+    return defaultDirectoryPath.trim() || DEFAULT_LOCAL_DIRECTORY;
+  }
+
+  async function localDirectoryRequest<T>(body: Record<string, unknown>): Promise<T | null> {
+    let response: Response;
+    try {
+      response = await fetch(LOCAL_DIRECTORY_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ directory: configuredDefaultDirectory(), ...body }),
+      });
+    } catch {
+      return null;
+    }
+    const isJson = response.headers.get("content-type")?.includes("application/json");
+    if (response.status === 404 || !isJson) return null;
+    const result = await response.json() as T & { error?: string };
+    if (!response.ok) throw new Error(result.error || "The default directory could not be accessed.");
+    return result;
+  }
+
+  async function resetDatabaseDirectoryToConfiguredPath() {
+    setDatabaseFolder(null);
+    await forgetDirectoryHandle(DATABASE_DIRECTORY_HANDLE_KEY).catch(() => { /* The in-memory selection is already cleared. */ });
+    showToast(`Using ${configuredDefaultDirectory()} by default`);
+  }
+
+  async function resetNodeDirectoryToDefault(nodeId: string) {
+    setNodeFolderHandles((current) => Object.fromEntries(
+      Object.entries(current).filter(([id]) => id !== nodeId),
+    ));
+    await forgetDirectoryHandle(nodeId).catch(() => { /* The in-memory selection is already cleared. */ });
+    if (nodeId === selectedNodeId) updateNode({ config: { directoryName: undefined } });
+    showToast(databaseFolder ? `Using ${databaseFolder.name}` : `Using ${configuredDefaultDirectory()}`);
+  }
+
   async function chooseFolder(kind: "workflow" | "database" | "node", nodeId?: string) {
-    const picker = (window as unknown as { showDirectoryPicker?: () => Promise<DirectoryHandle> })
+    const picker = (window as unknown as {
+      showDirectoryPicker?: (options?: { id?: string; mode?: "read" | "readwrite" }) => Promise<DirectoryHandle>;
+    })
       .showDirectoryPicker;
     if (!picker) {
       showToast("Folder access needs Chrome, Edge, or the desktop app");
       return;
     }
     try {
-      const handle = await picker();
-      if (kind === "workflow") setWorkflowFolder(handle);
-      else if (kind === "database") setDatabaseFolder(handle);
+      const selectedNode = nodeId
+        ? activeWorkflow.nodes.find((node) => node.id === nodeId)
+        : undefined;
+      const mode = kind === "node" && selectedNode?.type !== "save" ? "read" : "readwrite";
+      const handle = await picker({
+        id: kind === "workflow" ? "magic-conch-workflows" : "magic-conch-data",
+        mode,
+      });
+      rememberDirectoryPermission(handle, mode);
+      if (kind === "workflow") {
+        setWorkflowFolder(handle);
+        await rememberDirectoryHandle(WORKFLOW_DIRECTORY_HANDLE_KEY, handle).catch(() => { /* The handle remains usable for this session. */ });
+      } else if (kind === "database") {
+        setDatabaseFolder(handle);
+        await rememberDirectoryHandle(DATABASE_DIRECTORY_HANDLE_KEY, handle).catch(() => { /* The handle remains usable for this session. */ });
+      }
       else if (nodeId) {
         setNodeFolderHandles((current) => ({ ...current, [nodeId]: handle }));
-        await rememberNodeDirectoryHandle(nodeId, handle).catch(() => { /* The handle remains usable for this session. */ });
+        await rememberDirectoryHandle(nodeId, handle).catch(() => { /* The handle remains usable for this session. */ });
         if (nodeId === selectedNodeId) updateNode({ config: { directoryName: handle.name } });
       }
       showToast(`${handle.name} connected`);
@@ -2373,6 +2508,7 @@ export default function Workbench() {
     const key = node.config.key || "workflow-result";
     const safeKey = (key || "workflow-result").replace(/[^a-zA-Z0-9-_]/g, "-");
     const rootFolder = nodeFolderHandles[node.id] || databaseFolder;
+    const useLocalDirectory = !rootFolder && !node.config.directoryName;
     if (rootFolder) await ensureDirectoryPermission(rootFolder, "readwrite");
     const segments = directorySubfolderSegments(node.config.subfolder, rootFolder?.name);
     const folder = rootFolder ? await resolveSubfolder(rootFolder, segments, true) : null;
@@ -2384,13 +2520,22 @@ export default function Workbench() {
         savedFiles.push(filename);
       }
     }
+    const localResult = useLocalDirectory ? await localDirectoryRequest<{ record: { files: string[] } }>({
+      operation: "save-record",
+      subfolder: segments,
+      key: safeKey,
+      value,
+      files,
+      saveFiles: node.config.saveFiles || "both",
+      collision: node.config.collision || "increment",
+    }) : null;
     const record = {
       key: safeKey,
       value,
-      files: savedFiles,
+      files: localResult?.record.files || savedFiles,
       // Folder-backed records reference the written files. Browser-only records
       // retain the assets themselves so Load can restore media without a handle.
-      assets: !folder && node.config.saveFiles !== "data" ? files : undefined,
+      assets: !folder && !localResult && node.config.saveFiles !== "data" ? files : undefined,
       savedAt: new Date().toISOString(),
     };
     localStorage.setItem(localRecordKey(safeKey, segments), JSON.stringify(record));
@@ -2402,8 +2547,12 @@ export default function Workbench() {
 
   async function loadRecord(node: FlowNode) {
     const safeKey = (node.config.key || "workflow-result").replace(/[^a-zA-Z0-9-_]/g, "-");
-    const rootFolder = nodeFolderHandles[node.id] || databaseFolder;
-    if (rootFolder) await ensureDirectoryPermission(rootFolder, "read");
+    const nodeFolder = nodeFolderHandles[node.id];
+    const rootFolder = nodeFolder || databaseFolder;
+    const useLocalDirectory = !rootFolder && !node.config.directoryName;
+    // The shared database can serve both Load and Save nodes, so authorize it
+    // once for both operations instead of prompting again when a Save runs.
+    if (rootFolder) await ensureDirectoryPermission(rootFolder, nodeFolder ? "read" : "readwrite");
     const segments = directorySubfolderSegments(node.config.subfolder, rootFolder?.name);
     type StoredRecord = { value?: unknown; files?: string[]; assets?: FileAsset[] };
     const localRecord = () => {
@@ -2424,6 +2573,21 @@ export default function Workbench() {
       }
       return assets;
     };
+    if (useLocalDirectory) {
+      const result = await localDirectoryRequest<{
+        found: boolean;
+        reason?: "folder" | "record";
+        value?: string;
+        files?: FileAsset[];
+      }>({
+        operation: "load-record",
+        subfolder: segments,
+        key: safeKey,
+        loadMode: node.config.loadMode || "latest",
+      });
+      if (result?.found) return { value: result.value || "", files: result.files || [] };
+      if (result?.reason === "folder") return { value: "The configured subfolder was not found.", files: [] };
+    }
     if (!rootFolder) {
       const record = localRecord();
       return record
@@ -2468,20 +2632,29 @@ export default function Workbench() {
   }
 
   async function loadDirectoryFiles(node: FlowNode, subfolder: string, recursive: boolean) {
-    const rootFolder = nodeFolderHandles[node.id] || databaseFolder;
+    const nodeFolder = nodeFolderHandles[node.id];
+    const rootFolder = nodeFolder || databaseFolder;
     if (!rootFolder) {
+      if (!node.config.directoryName) {
+        const result = await localDirectoryRequest<{ files: FileAsset[] }>({
+          operation: "list-files",
+          subfolder: directorySubfolderSegments(subfolder),
+          recursive,
+        });
+        if (result) return result.files;
+      }
       throw new Error(node.config.directoryName
         ? `Reconnect the “${node.config.directoryName}” Node directory; its browser permission is no longer available.`
-        : `Choose a directory for this ${node.type === "load" ? "Load" : "Load Directory"} node first.`);
+        : `The default directory is unavailable. Choose a directory for this ${node.type === "load" ? "Load" : "Load Directory"} node.`);
     }
-    await ensureDirectoryPermission(rootFolder, "read");
+    await ensureDirectoryPermission(rootFolder, nodeFolder ? "read" : "readwrite");
     const folder = await resolveSubfolder(rootFolder, directorySubfolderSegments(subfolder, rootFolder.name), false);
     const assets: FileAsset[] = [];
     const visit = async (current: DirectoryHandle, prefix = "") => {
       for await (const entry of current.values()) {
         const relativeName = prefix ? `${prefix}/${entry.name}` : entry.name;
         if (entry.kind === "directory") {
-          if (recursive && entry.values) await visit(entry as DirectoryHandle, relativeName);
+          if (recursive && entry.values) await visit(entry as unknown as DirectoryHandle, relativeName);
           continue;
         }
         if (!entry.getFile) continue;
@@ -2651,13 +2824,16 @@ export default function Workbench() {
       if (node.type === "input" && node.config.prompt) {
         debugInputs.push({ port: "question", label: "question", type: "prompt", value: node.config.prompt });
       }
-      if (node.type === "router-ai" && node.config.routeCriteria) {
-        debugInputs.push({ port: "route-criteria", label: "routing criteria", type: "prompt", value: node.config.routeCriteria });
+      if ((node.type === "router-ai" || node.type === "condition-ai") && node.config.routeCriteria) {
+        debugInputs.push({ port: "route-criteria", label: node.type === "condition-ai" ? "boolean condition" : "routing criteria", type: "prompt", value: node.config.routeCriteria });
       }
       if (node.type === "router-rule" && node.config.routeMethod !== "is_empty") {
         (node.config.routeOptions || [{ id: "route-1", label: "Option 1", value: node.config.routeValue || "" }]).forEach((option) => {
           debugInputs.push({ port: `${option.id}-value`, label: `${option.label} match`, type: "text", value: option.value || "" });
         });
+      }
+      if (node.type === "condition-rule" && node.config.routeMethod !== "is_empty") {
+        debugInputs.push({ port: "expected", label: "expected value", type: "text", value: node.config.routeValue || "" });
       }
       const collectDebugOutputs = (): DebugDatum[] => nodeSchema.outputs
         .map((port) => ({ port: port.id, label: port.label, type: port.type, value: context.values[portValueKey(node.id, port.id)] }))
@@ -2685,6 +2861,53 @@ export default function Workbench() {
         output("value", value);
         context.lastOutput = String(value);
         debugDetail = `Provided float ${value}.`;
+      }
+
+      if (node.type === "math") {
+        const mathInputs = getMathInputs(node)
+          .map((input, index) => ({
+            ...input,
+            variable: mathInputVariable(input, index),
+            value: inputFor<unknown>(input.id, undefined),
+          }))
+          .filter((input) => input.value !== undefined);
+        const result = evaluateMathExpression(
+          node.config.mathExpression || "{{input1}}",
+          mathInputs,
+          node.config.mathOutputType || "float",
+        );
+        output("result", result);
+        context.lastOutput = String(result);
+        debugDetail = `Calculated ${node.config.mathExpression || "{{input1}}"} from ${mathInputs.length} input${mathInputs.length === 1 ? "" : "s"}.`;
+      }
+
+      if (node.type === "media-size") {
+        const asset = firstFileAsset(
+          inputFor<unknown>("image", undefined),
+          inputFor<unknown>("video", undefined),
+          inputFor<unknown>("files", undefined),
+        );
+        if (!asset) throw new Error("Connect an image or video file to read its dimensions.");
+        const dimensions = await getMediaDimensions(asset);
+        output("width", dimensions.width);
+        output("height", dimensions.height);
+        context.lastOutput = `${dimensions.width} × ${dimensions.height}`;
+        debugDetail = `Read ${asset.name} as ${dimensions.width} × ${dimensions.height}.`;
+      }
+
+      if (node.type === "file-name") {
+        const asset = firstFileAsset(
+          inputFor<unknown>("image", undefined),
+          inputFor<unknown>("video", undefined),
+          inputFor<unknown>("audio", undefined),
+          inputFor<unknown>("document", undefined),
+          inputFor<unknown>("files", undefined),
+        );
+        if (!asset) throw new Error("Connect a file to read its name.");
+        const name = fileNameFromAsset(asset, node.config.includeExtension !== false);
+        output("name", name);
+        context.lastOutput = name;
+        debugDetail = `Read the file name “${name}”.`;
       }
 
       if (node.type === "list-directory") {
@@ -2939,6 +3162,44 @@ export default function Workbench() {
         const value = inputFor<unknown>("value", promptInput);
         output("value", value);
         debugDetail = "Passed the value to every connected branch.";
+      }
+
+      if (node.type === "condition-rule") {
+        const value = inputFor<unknown>("value", promptInput);
+        const matched = evaluateBooleanRule(value, fileInput, {
+          method: node.config.routeMethod,
+          expected: node.config.routeValue,
+          caseSensitive: node.config.caseSensitive,
+        });
+        output(matched ? "true" : "false", matched);
+        context.lastOutput = String(matched);
+        debugStatus = "routed";
+        debugDetail = `Rule condition evaluated to ${matched}.`;
+      }
+
+      if (node.type === "condition-ai") {
+        const value = inputFor<unknown>("value", promptInput);
+        const provider = node.config.provider || "openai";
+        const decision = await requestAI(
+          {
+            provider,
+            model: node.config.model || modelDefaults[provider],
+            temperature: 0,
+            systemPrompt: "You are a boolean condition evaluator. Reply with only true or false. Do not explain your answer.",
+            prompt: `Condition:\n${node.config.routeCriteria || "Return true when the input satisfies the condition."}\n\nInput:\n${stringifyValue(value)}${fileInput.length ? `\n\nAttached files:\n${fileInput.map((file) => `- ${file.name} (${file.type || "unknown type"})`).join("\n")}` : ""}`,
+            files: fileInput,
+            openai: provider === "openai" ? openAIRequestSettings(node) : undefined,
+            gemini: provider === "gemini" ? geminiRequestSettings(node) : undefined,
+            claude: provider === "claude" ? claudeRequestSettings(node) : undefined,
+            ollama: provider === "ollama" ? ollamaRequestSettings(node) : undefined,
+          },
+          providerSettings,
+        );
+        const matched = parseAIBoolean(decision);
+        output(matched ? "true" : "false", matched);
+        context.lastOutput = String(matched);
+        debugStatus = "routed";
+        debugDetail = `AI condition evaluated to ${matched}.`;
       }
 
       if (node.type === "router-condition") {
@@ -3556,7 +3817,7 @@ export default function Workbench() {
                         <span className="node-icon"><Icon size={17} /></span>
                         <span className="node-text">
                           <strong>{node.name}</strong>
-                          <small>{node.type === "request" || node.type === "router-ai" ? `${node.config.provider || "openai"} · ${node.config.model || "model"}` : node.type === "workflow" ? workflows.find((workflow) => workflow.id === node.config.calledWorkflowId)?.name || "Select a workflow" : meta.subtitle}</small>
+                          <small>{node.type === "request" || node.type === "router-ai" || node.type === "condition-ai" ? `${node.config.provider || "openai"} · ${node.config.model || "model"}` : node.type === "workflow" ? workflows.find((workflow) => workflow.id === node.config.calledWorkflowId)?.name || "Select a workflow" : meta.subtitle}</small>
                         </span>
                       </div>
                       <div className="node-ports">
@@ -3603,6 +3864,15 @@ export default function Workbench() {
                   {selectedNode.type === "string" && <label className="field-label">String value<textarea rows={4} value={selectedNode.config.stringValue || ""} placeholder="Enter text…" onChange={(event) => updateNode({ config: { stringValue: event.target.value } })} /><small className="field-help">Connect the string output to any compatible data or attribute input.</small></label>}
                   {selectedNode.type === "integer" && <label className="field-label">Integer value<input type="number" step="1" value={selectedNode.config.integerValue ?? 0} onChange={(event) => updateNode({ config: { integerValue: Math.trunc(Number(event.target.value) || 0) } })} /><small className="field-help">Decimals are truncated to a whole number.</small></label>}
                   {selectedNode.type === "float" && <label className="field-label">Float value<input type="number" step="any" value={selectedNode.config.floatValue ?? 0} onChange={(event) => updateNode({ config: { floatValue: Number(event.target.value) || 0 } })} /></label>}
+                  {selectedNode.type === "math" && <>
+                    <label className="field-label">Output type<div className="select-wrap"><select value={selectedNode.config.mathOutputType || "float"} onChange={(event) => updateNode({ config: { mathOutputType: event.target.value as MathOutputType } })}><option value="string">String</option><option value="float">Float</option><option value="integer">Integer</option></select><ChevronDown size={14} /></div></label>
+                    <div className="join-inputs-editor">
+                      <span className="field-title-row"><b>Input variables</b><small>New inputs appear when the last port is linked.</small></span>
+                      {getMathInputs(selectedNode).map((input, index, inputs) => <label key={input.id}><span>{index + 1}</span><input aria-label={`Math input ${index + 1} variable`} value={input.variable} placeholder={`input${index + 1}`} onChange={(event) => { const variable = event.target.value.replace(/[^a-z0-9_]/gi, "").replace(/^[^a-z_]+/i, ""); updateNode({ config: { mathInputs: inputs.map((item) => item.id === input.id ? { ...item, variable } : item) } }); }} /><code>{`{{${mathInputVariable(input, index)}}}`}</code></label>)}
+                    </div>
+                    <label className="field-label">Expression<textarea rows={4} className="code-editor" spellCheck={false} value={selectedNode.config.mathExpression || ""} placeholder="{{input1}} + {{input2}}" onChange={(event) => updateNode({ config: { mathExpression: event.target.value } })} /><small className="field-help">Operators: +, −, × (*), ÷ (/), %, ^, **. Functions: abs, ceil, floor, max, min, pow, round, sign, sqrt. Constants: PI, E.</small></label>
+                  </>}
+                  {selectedNode.type === "file-name" && <label className="check-field"><input type="checkbox" checked={selectedNode.config.includeExtension !== false} onChange={(event) => updateNode({ config: { includeExtension: event.target.checked } })} /><span>Include file extension</span></label>}
                   {selectedNode.type === "start" && (
                     <>
                       <label className="field-label">Agent name<input value={selectedNode.config.agentName || ""} placeholder={DEFAULT_AGENT_NAME} onChange={(event) => updateNode({ config: { agentName: event.target.value } })} /><small className="field-help">Shown beside every message sent by this workflow.</small></label>
@@ -3645,7 +3915,7 @@ export default function Workbench() {
                     {selectedNode.config.aggregateOperation === "template" && <label className="field-label">Prompt template<textarea rows={6} value={selectedNode.config.aggregateTemplate || ""} placeholder={defaultJoinTemplate(getJoinInputs(selectedNode))} onChange={(event) => updateNode({ config: { aggregateTemplate: event.target.value } })} /><small className="field-help">Place the variables above anywhere in the prompt. Dot paths such as {`{{input2.name}}`} select nested values.</small></label>}
                   </>}
                   {selectedNode.type === "router-condition" && <><label className="field-label">Condition<div className="select-wrap"><select value={selectedNode.config.conditionKind || "truthy"} onChange={(event) => updateNode({ config: { conditionKind: event.target.value as FlowNode["config"]["conditionKind"] } })}><option value="truthy">Value is truthy</option><option value="equals">Value equals</option><option value="contains">Value contains</option><option value="input_type">Input type is</option><option value="file_extension">File extension is</option></select><ChevronDown size={14} /></div></label>{selectedNode.config.conditionKind !== "truthy" && <label className="field-label">Expected value<input value={selectedNode.config.conditionValue || ""} placeholder={selectedNode.config.conditionKind === "file_extension" ? "pdf" : selectedNode.config.conditionKind === "input_type" ? "document, boolean, array…" : "value"} onChange={(event) => updateNode({ config: { conditionValue: event.target.value } })} /></label>}</>}
-                  {(selectedNode.type === "request" || selectedNode.type === "router-ai") && (
+                  {(selectedNode.type === "request" || selectedNode.type === "router-ai" || selectedNode.type === "condition-ai") && (
                     <>
                       <label className="field-label">Provider
                         <div className="select-wrap"><select value={selectedNode.config.provider || "openai"} onChange={(event) => {
@@ -3662,7 +3932,7 @@ export default function Workbench() {
                         <label className="field-label">System prompt<textarea rows={5} value={selectedNode.config.systemPrompt || ""} placeholder="Describe how the model should behave…" onChange={(event) => updateNode({ config: { systemPrompt: event.target.value } })} /></label>
                         <label className="field-label">Create file from response<input value={selectedNode.config.outputFileName || ""} placeholder="Optional, e.g. report.md" onChange={(event) => updateNode({ config: { outputFileName: event.target.value } })} /><small className="field-help">When set, the response becomes a workflow file that Save nodes can write.</small></label>
                       </> : <>
-                        <label className="field-label">Routing criteria<textarea rows={4} value={selectedNode.config.routeCriteria || ""} placeholder="Describe when to choose path A or B…" onChange={(event) => updateNode({ config: { routeCriteria: event.target.value } })} /></label>
+                        <label className="field-label">{selectedNode.type === "condition-ai" ? "Boolean condition" : "Routing criteria"}<textarea rows={4} value={selectedNode.config.routeCriteria || ""} placeholder={selectedNode.type === "condition-ai" ? "For example: The request is about billing." : "Describe when to choose path A or B…"} onChange={(event) => updateNode({ config: { routeCriteria: event.target.value } })} /></label>
                       </>}
                       <label className="field-label range-label"><span>Temperature <b>{selectedNode.config.temperature ?? 0.7}</b></span><input type="range" min="0" max="2" step="0.1" value={selectedNode.config.temperature ?? 0.7} onChange={(event) => updateNode({ config: { temperature: Number(event.target.value) } })} /></label>
                       {(selectedNode.config.provider || "openai") === "openai" && (
@@ -3736,25 +4006,27 @@ export default function Workbench() {
                       )}
                     </>
                   )}
-                  {selectedNode.type === "router-rule" && (
+                  {(selectedNode.type === "router-rule" || selectedNode.type === "condition-rule") && (
                     <>
                       <label className="field-label">Rule method<div className="select-wrap"><select value={selectedNode.config.routeMethod || "contains"} onChange={(event) => updateNode({ config: { routeMethod: event.target.value as FlowNode["config"]["routeMethod"] } })}><option value="contains">Contains text</option><option value="not_contains">Does not contain text</option><option value="equals">Equals text</option><option value="starts_with">Starts with</option><option value="ends_with">Ends with</option><option value="regex">Regular expression</option><option value="length_gt">Text length greater than</option><option value="length_lt">Text length less than</option><option value="is_empty">Is empty</option><option value="file_type">Has file type</option><option value="file_count_gt">File count greater than</option><option value="number_gt">Number greater than</option><option value="number_lt">Number less than</option></select><ChevronDown size={14} /></div></label>
+                      {selectedNode.type === "condition-rule" && selectedNode.config.routeMethod !== "is_empty" && <label className="field-label">Expected value<input value={selectedNode.config.routeValue || ""} placeholder="Value to compare against" onChange={(event) => updateNode({ config: { routeValue: event.target.value } })} /></label>}
                       <label className="check-field"><input type="checkbox" checked={selectedNode.config.caseSensitive || false} onChange={(event) => updateNode({ config: { caseSensitive: event.target.checked } })} /><span>Case-sensitive text matching</span></label>
                     </>
                   )}
+                  {(selectedNode.type === "condition-ai" || selectedNode.type === "condition-rule") && <div className="inspector-note"><GitBranch size={14} /><span><b>if / elif / else</b><small>Use true as the if branch. Connect false to the gate of another condition for elif, or use the final false output as else.</small></span></div>}
                   {(selectedNode.type === "router-ai" || selectedNode.type === "router-rule") && <div className="route-options-editor"><span className="field-title-row"><b>Route outputs</b><button type="button" onClick={() => addRouteOption(selectedNode.id)}><Plus size={12} /> Add option</button></span>{(selectedNode.config.routeOptions || [{ id: "route-1", label: "Option 1", value: selectedNode.config.routeValue || "" }]).map((option, index, options) => <div className="route-option-row" key={option.id}><span>{index + 1}</span><div><input aria-label={`Option ${index + 1} label`} value={option.label} onChange={(event) => updateNode({ config: { routeOptions: options.map((item) => item.id === option.id ? { ...item, label: event.target.value } : item) } })} />{selectedNode.type === "router-rule" && selectedNode.config.routeMethod !== "is_empty" && <input aria-label={`${option.label} match value`} className="route-value-input" value={option.value || ""} placeholder="Match value" onChange={(event) => updateNode({ config: { routeOptions: options.map((item) => item.id === option.id ? { ...item, value: event.target.value } : item) } })} />}</div><button className="mini-icon route-option-delete" disabled={options.length <= 1} aria-label={options.length <= 1 ? "At least one route option is required" : `Remove ${option.label}`} title={options.length <= 1 ? "At least one output is required" : "Delete output"} onClick={() => removeRouteOption(selectedNode.id, option.id)}><Trash2 size={13} /></button></div>)}<small>Connecting the last output automatically creates the next one.</small></div>}
                   {selectedNode.type === "list-directory" && (
                     <>
                       <label className="field-label">Subfolder path<input value={selectedNode.config.subfolder || ""} placeholder="Optional relative subfolder" onChange={(event) => updateNode({ config: { subfolder: event.target.value } })} /><small className="field-help">May also be supplied through the string attribute port.</small></label>
                       <label className="check-field"><input type="checkbox" checked={selectedNode.config.includeSubfolders || false} onChange={(event) => updateNode({ config: { includeSubfolders: event.target.checked } })} /><span>Include files in subfolders</span></label>
-                      <div className="node-folder-picker"><span><FolderOpen size={15} /><span><strong>Directory to load</strong><small>{nodeFolderHandles[selectedNode.id]?.name || databaseFolder?.name || (selectedNode.config.directoryName ? `Reconnect “${selectedNode.config.directoryName}”` : "No directory selected")}</small></span></span><button className="secondary-button" onClick={() => chooseFolder("node", selectedNode.id)}>{nodeFolderHandles[selectedNode.id] ? "Change" : "Choose"}</button></div>
+                      <div className="node-folder-picker"><span><FolderOpen size={15} /><span><strong>Directory to load</strong><small>{nodeFolderHandles[selectedNode.id]?.name || (databaseFolder ? `${databaseFolder.name} (shared default)` : undefined) || (selectedNode.config.directoryName ? `Reconnect “${selectedNode.config.directoryName}”` : `${configuredDefaultDirectory()} (default)`)}</small></span></span><div className="node-folder-actions">{(nodeFolderHandles[selectedNode.id] || selectedNode.config.directoryName) && <button className="secondary-button" onClick={() => resetNodeDirectoryToDefault(selectedNode.id)}>Use default</button>}<button className="secondary-button" onClick={() => chooseFolder("node", selectedNode.id)}>{nodeFolderHandles[selectedNode.id] ? "Change" : "Override"}</button></div></div>
                     </>
                   )}
                   {(selectedNode.type === "save" || selectedNode.type === "load") && (
                     <>
                       {(selectedNode.type === "save" || selectedNode.config.loadMode !== "folder") && <label className="field-label">File key<input value={selectedNode.config.key || ""} placeholder="record-name" onChange={(event) => updateNode({ config: { key: event.target.value } })} /><small className="field-help">Versioned files with the same key can coexist.</small></label>}
                       <label className="field-label">Subfolder path<input value={selectedNode.config.subfolder || ""} placeholder="Optional, relative to the directory below" onChange={(event) => updateNode({ config: { subfolder: event.target.value } })} /><small className="field-help">Leave blank to use the selected directory itself. Absolute paths work only when they contain the selected directory.</small></label>
-                      <div className="node-folder-picker"><span><FolderOpen size={15} /><span><strong>Node directory</strong><small>{nodeFolderHandles[selectedNode.id]?.name || databaseFolder?.name || (selectedNode.config.directoryName ? `Reconnect “${selectedNode.config.directoryName}”` : "No directory selected")}</small></span></span><button className="secondary-button" onClick={() => chooseFolder("node", selectedNode.id)}>{nodeFolderHandles[selectedNode.id] ? "Change" : "Choose"}</button></div>
+                      <div className="node-folder-picker"><span><FolderOpen size={15} /><span><strong>Node directory</strong><small>{nodeFolderHandles[selectedNode.id]?.name || (databaseFolder ? `${databaseFolder.name} (shared default)` : undefined) || (selectedNode.config.directoryName ? `Reconnect “${selectedNode.config.directoryName}”` : `${configuredDefaultDirectory()} (default)`)}</small></span></span><div className="node-folder-actions">{(nodeFolderHandles[selectedNode.id] || selectedNode.config.directoryName) && <button className="secondary-button" onClick={() => resetNodeDirectoryToDefault(selectedNode.id)}>Use default</button>}<button className="secondary-button" onClick={() => chooseFolder("node", selectedNode.id)}>{nodeFolderHandles[selectedNode.id] ? "Change" : "Override"}</button></div></div>
                       {selectedNode.type === "save" ? (
                         <>
                           <label className="field-label">When a name already exists<div className="select-wrap"><select value={selectedNode.config.collision || "increment"} onChange={(event) => updateNode({ config: { collision: event.target.value as FlowNode["config"]["collision"] } })}><option value="increment">Add number (file-2)</option><option value="timestamp">Add timestamp</option><option value="overwrite">Overwrite</option></select><ChevronDown size={14} /></div></label>
@@ -3882,8 +4154,8 @@ export default function Workbench() {
             <div className="chat-sidebar-bottom">
               <div className="storage-card">
                 <span className="storage-icon"><HardDrive size={16} /></span>
-                <div><strong>Local database</strong><small>{databaseFolder ? databaseFolder.name : "Browser storage"}</small></div>
-                <span className={`status-dot ${databaseFolder ? "connected" : ""}`} />
+                <div><strong>Local database</strong><small>{databaseFolder?.name || configuredDefaultDirectory()}</small></div>
+                <span className="status-dot connected" />
               </div>
               <button onClick={() => setSettingsOpen(true)}><Settings size={16} /> Settings</button>
             </div>
@@ -3992,9 +4264,10 @@ export default function Workbench() {
                     <label className="field-label history-limit">Undo records<input type="number" min="1" max="500" value={undoLimit} onChange={(event) => setUndoLimit(Math.max(1, Math.min(500, Number(event.target.value) || 1)))} /><small className="field-help">Between 1 and 500 records per workflow.</small></label>
                   </div>
                   <div className="settings-section">
-                    <div className="section-title"><FolderOpen size={17} /><div><strong>Default folders</strong><small>Each Load or Save node can override the database folder in its Inspector.</small></div></div>
+                    <div className="section-title"><FolderOpen size={17} /><div><strong>Default folders</strong><small>Save and Load nodes use the default path unless a browser folder or node-specific folder overrides it.</small></div></div>
+                    <label className="field-label default-directory-field">Default Save/Load directory<input value={defaultDirectoryPath} placeholder={DEFAULT_LOCAL_DIRECTORY} onChange={(event) => setDefaultDirectoryPath(event.target.value)} onBlur={() => { if (!defaultDirectoryPath.trim()) setDefaultDirectoryPath(DEFAULT_LOCAL_DIRECTORY); }} /><small className="field-help">Relative paths start at the Magic Conch program folder. Absolute paths are also supported by the local app.</small></label>
                     <div className="folder-row"><span className="folder-icon"><FileJson size={18} /></span><div><strong>Workflow folder</strong><small>{workflowFolder ? workflowFolder.name : "Not connected — use Export to download files"}</small></div><button className="secondary-button" onClick={() => chooseFolder("workflow")}><FolderOpen size={14} /> Choose</button></div>
-                    <div className="folder-row"><span className="folder-icon"><Database size={18} /></span><div><strong>Database folder</strong><small>{databaseFolder ? databaseFolder.name : "Not connected — using browser storage"}</small></div><button className="secondary-button" onClick={() => chooseFolder("database")}><FolderOpen size={14} /> Choose</button></div>
+                    <div className="folder-row"><span className="folder-icon"><Database size={18} /></span><div><strong>Browser folder override</strong><small>{databaseFolder ? databaseFolder.name : `None — using ${configuredDefaultDirectory()}`}</small></div><div className="folder-actions">{databaseFolder && <button className="secondary-button" onClick={resetDatabaseDirectoryToConfiguredPath}>Use path</button>}<button className="secondary-button" onClick={() => chooseFolder("database")}><FolderOpen size={14} /> {databaseFolder ? "Change" : "Choose"}</button></div></div>
                   </div>
                   <div className="local-first-note"><HardDrive size={17} /><div><strong>Local-first by design</strong><span>Your workflows, keys, and saved records stay on this device unless you call an AI provider.</span></div></div>
                 </>

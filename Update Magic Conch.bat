@@ -1,16 +1,15 @@
 @echo off
 setlocal
-title Magic Conch
+title Update Magic Conch
 cd /d "%~dp0"
 
 where node.exe >nul 2>nul
 if errorlevel 1 (
   echo Magic Conch requires Node.js 22.13 or newer.
-  echo Download it from https://nodejs.org/ and run this file again.
   pause
   exit /b 1
 )
 
-node "%~dp0scripts\launch.mjs" %*
+node "%~dp0scripts\update-from-github.mjs" %*
 if errorlevel 1 pause
 endlocal

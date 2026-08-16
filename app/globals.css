@@ -208,6 +208,7 @@ button { color: inherit; }
 .node-folder-picker strong { font-size: 9px; color: #555d58; }
 .node-folder-picker small { color: #929995; font-size: 8px; white-space: nowrap; max-width: 125px; overflow: hidden; text-overflow: ellipsis; }
 .node-folder-picker .secondary-button { height: 27px; font-size: 8px; padding-inline: 8px; }
+.node-folder-picker > .node-folder-actions { display: flex; gap: 5px; flex: 0 0 auto; }
 .plugin-fields { border-top: 1px solid var(--line); padding-top: 14px; }
 .route-label-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .route-options-editor { border-top: 1px solid var(--line); padding-top: 13px; margin-bottom: 14px; }
@@ -470,6 +471,8 @@ button { color: inherit; }
 .folder-row strong { font-size: 10px; }
 .folder-row small { color: #969d98; font-size: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .folder-row .secondary-button { height: 30px; font-size: 9px; }
+.folder-row > .folder-actions { flex-direction: row; gap: 6px; }
+.default-directory-field { margin-bottom: 12px; }
 .local-first-note { margin-top: 16px; border: 1px solid #dfe8c7; background: #f5f8ec; color: #627044; border-radius: 10px; padding: 11px 12px; display: flex; gap: 9px; }
 .local-first-note > div { display: flex; flex-direction: column; gap: 3px; }
 .local-first-note strong { font-size: 10px; }.local-first-note span { font-size: 8px; line-height: 1.4; }
@@ -531,4 +534,5 @@ button { color: inherit; }
   .settings-grid { grid-template-columns: 1fr; }
   .folder-row { grid-template-columns: 32px 1fr; }
   .folder-row .secondary-button { grid-column: 2; justify-self: start; }
+  .folder-row > .folder-actions { grid-column: 2; justify-self: start; }
 }

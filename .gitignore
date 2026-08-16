@@ -27,9 +27,20 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+*.log
+*.tsbuildinfo
 
 # env files (can opt-in for committing if needed)
 .env*
+.npmrc
+.pypirc
+.netrc
+**/credentials.json
+**/service-account*.json
+**/secrets.*
+/.aws/
+/.azure/
+/.ssh/
 
 # vercel
 .vercel
@@ -38,3 +49,15 @@ yarn-error.log*
 /.wrangler/
 /outputs/
 /work/
+
+# Magic Conch device-local content. The application normally keeps these in
+# browser storage; conventional local export/backup folders stay untracked.
+/user-data/
+/chats/
+/workflows/
+/backups/
+/exports/
+
+# Keep the public plug-in documentation, not locally installed plug-in files.
+/plugins/*
+!/plugins/README.md
