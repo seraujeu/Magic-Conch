@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const isWindows = process.platform === "win32";
 const args = new Set(process.argv.slice(2));
+const repositoryUrl = process.env.MAGIC_CONCH_REPOSITORY || "https://github.com/seraujeu/Magic-Conch.git";
+const updateBranch = process.env.MAGIC_CONCH_BRANCH || "main";
 
 function run(command, commandArgs, options = {}) {
   const result = spawnSync(command, commandArgs, {
@@ -46,11 +48,13 @@ function main() {
 
   const branch = output("git", ["branch", "--show-current"]);
   if (!branch) throw new Error("Updates require a checked-out Git branch.");
-  run("git", ["remote", "get-url", "origin"], { capture: true });
+  if (branch !== updateBranch) {
+    throw new Error(`Updates must be run from the ${updateBranch} branch; the current branch is ${branch}.`);
+  }
 
-  console.log(`Checking GitHub for updates to ${branch}...`);
-  run("git", ["fetch", "--prune", "origin"]);
-  const remoteBranch = `origin/${branch}`;
+  console.log(`Checking ${repositoryUrl} for updates to ${updateBranch}...`);
+  run("git", ["fetch", "--no-tags", repositoryUrl, updateBranch]);
+  const remoteBranch = "FETCH_HEAD";
   run("git", ["rev-parse", "--verify", remoteBranch], { capture: true });
 
   const localRevision = output("git", ["rev-parse", "HEAD"]);

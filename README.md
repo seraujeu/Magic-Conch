@@ -65,10 +65,10 @@ remain untouched by the GitHub updater.
 
 ## Update safely from GitHub
 
-From a Git clone with an `origin` GitHub remote:
+From a Git clone:
 
 - Windows: double-click `Update Magic Conch.bat`
-- macOS/Linux: run `sh update-magic-conch.sh`
+- macOS/Linux: run `sh "Update Magic Conch.sh"`
 - Any system: run `npm run update`
 
 The updater only accepts a fast-forward update on a clean source tree. It then
