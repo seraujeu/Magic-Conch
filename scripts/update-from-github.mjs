@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { dirname } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -7,6 +8,33 @@ const isWindows = process.platform === "win32";
 const args = new Set(process.argv.slice(2));
 const repositoryUrl = process.env.MAGIC_CONCH_REPOSITORY || "https://github.com/seraujeu/Magic-Conch.git";
 const updateBranch = process.env.MAGIC_CONCH_BRANCH || "main";
+
+function findGit() {
+  const candidates = [process.env.MAGIC_CONCH_GIT, "git"];
+  if (isWindows) {
+    for (const directory of [process.env.ProgramW6432, process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA]) {
+      if (!directory) continue;
+      candidates.push(
+        directory === process.env.LOCALAPPDATA
+          ? join(directory, "Programs", "Git", "cmd", "git.exe")
+          : join(directory, "Git", "cmd", "git.exe"),
+      );
+    }
+  }
+
+  for (const candidate of [...new Set(candidates.filter(Boolean))]) {
+    if (candidate !== "git" && !existsSync(candidate)) continue;
+    const result = spawnSync(candidate, ["--version"], { cwd: projectRoot, encoding: "utf8", stdio: "pipe" });
+    if (!result.error && result.status === 0) return candidate;
+  }
+
+  throw new Error(
+    isWindows
+      ? "Git was not found. Install Git for Windows, then close and reopen this window. " +
+        "If Git is installed in a custom location, set MAGIC_CONCH_GIT to the full path to git.exe."
+      : "Git was not found. Install Git and run the updater again.",
+  );
+}
 
 function run(command, commandArgs, options = {}) {
   const result = spawnSync(command, commandArgs, {
@@ -40,31 +68,38 @@ function main() {
     return;
   }
 
-  run("git", ["--version"], { capture: true });
-  const dirty = output("git", ["status", "--porcelain", "--untracked-files=all"]);
+  if (!existsSync(join(projectRoot, ".git"))) {
+    throw new Error(
+      "This folder is not a Git clone, so it cannot update itself. " +
+      "Download a fresh copy or clone the repository with Git.",
+    );
+  }
+
+  const git = findGit();
+  const dirty = output(git, ["status", "--porcelain", "--untracked-files=all"]);
   if (dirty) {
     throw new Error("The program has local source changes. Commit or remove them before updating; no files were changed.");
   }
 
-  const branch = output("git", ["branch", "--show-current"]);
+  const branch = output(git, ["branch", "--show-current"]);
   if (!branch) throw new Error("Updates require a checked-out Git branch.");
   if (branch !== updateBranch) {
     throw new Error(`Updates must be run from the ${updateBranch} branch; the current branch is ${branch}.`);
   }
 
   console.log(`Checking ${repositoryUrl} for updates to ${updateBranch}...`);
-  run("git", ["fetch", "--no-tags", repositoryUrl, updateBranch]);
+  run(git, ["fetch", "--no-tags", repositoryUrl, updateBranch]);
   const remoteBranch = "FETCH_HEAD";
-  run("git", ["rev-parse", "--verify", remoteBranch], { capture: true });
+  run(git, ["rev-parse", "--verify", remoteBranch], { capture: true });
 
-  const localRevision = output("git", ["rev-parse", "HEAD"]);
-  const remoteRevision = output("git", ["rev-parse", remoteBranch]);
+  const localRevision = output(git, ["rev-parse", "HEAD"]);
+  const remoteRevision = output(git, ["rev-parse", remoteBranch]);
   if (localRevision === remoteRevision) {
     console.log("Magic Conch is already up to date.");
     return;
   }
 
-  const fastForward = run("git", ["merge-base", "--is-ancestor", "HEAD", remoteBranch], {
+  const fastForward = run(git, ["merge-base", "--is-ancestor", "HEAD", remoteBranch], {
     capture: true,
     allowFailure: true,
   });
@@ -73,12 +108,12 @@ function main() {
   }
 
   if (args.has("--check")) {
-    const count = output("git", ["rev-list", "--count", `HEAD..${remoteBranch}`]);
+    const count = output(git, ["rev-list", "--count", `HEAD..${remoteBranch}`]);
     console.log(`${count} update commit(s) are available. No files were changed.`);
     return;
   }
 
-  run("git", ["merge", "--ff-only", remoteBranch]);
+  run(git, ["merge", "--ff-only", remoteBranch]);
   console.log("Refreshing program dependencies...");
   runNpm(["ci"]);
 

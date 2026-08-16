@@ -422,9 +422,9 @@ button { color: inherit; }
 .debug-panel { border-left: 1px solid var(--line); background: #fafaf7; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
 .debug-panel-heading { height: 62px; flex: 0 0 auto; border-bottom: 1px solid var(--line); padding: 0 12px 0 16px; display: flex; align-items: center; justify-content: space-between; }
 .debug-panel-heading > div { display: flex; flex-direction: column; gap: 4px; min-width: 0; }.debug-panel-heading strong { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.debug-summary { min-height: 38px; flex: 0 0 auto; display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; padding: 0 14px; border-bottom: 1px solid var(--line); }
+.debug-summary { min-height: 38px; flex: 0 0 auto; display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; padding: 0 12px 0 14px; border-bottom: 1px solid var(--line); }
 .debug-summary > span { display: flex; align-items: center; gap: 5px; color: #747d77; font-size: 8px; text-transform: uppercase; letter-spacing: .4px; }.debug-summary > span i { width: 6px; height: 6px; background: #aab0ac; border-radius: 50%; }.debug-summary > span.live i { background: #7aa746; box-shadow: 0 0 0 3px rgba(122,167,70,.13); }
-.debug-summary small { font-size: 8px; color: #9aa19c; }.debug-summary button { border: 0; background: transparent; color: #7d857f; font-size: 8px; cursor: pointer; }.debug-summary button:disabled { opacity: .35; }
+.debug-summary small { font-size: 8px; color: #9aa19c; }.debug-summary-actions { display: flex; align-items: center; gap: 5px; }.debug-summary-actions button { min-height: 24px; border: 0; background: transparent; border-radius: 5px; color: #7d857f; font-size: 8px; cursor: pointer; display: flex; align-items: center; gap: 3px; }.debug-summary-actions button:hover:not(:disabled) { background: #eef1e9; color: #5d7134; }.debug-summary-actions button:disabled { opacity: .35; cursor: default; }
 .debug-events { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 12px; }
 .debug-event { min-height: 76px; display: grid; grid-template-columns: 12px 25px 1fr; gap: 7px; position: relative; }
 .debug-rail i { position: absolute; left: 5px; top: 28px; bottom: -5px; width: 1px; background: #dce0da; }

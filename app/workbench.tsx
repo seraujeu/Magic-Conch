@@ -130,6 +130,7 @@ import { migrateLegacyNodeDirectory, resolveNodeDirectory } from "../lib/node-di
 import { collectWorkflowBundleDependencies, portableDependencySegment, remapPackagedWorkflowIds, workflowRuntimeNodeIds } from "../lib/workflow-bundle";
 import { applyBundledLoadSnapshots, bundledLoadResult, BundledLoadSnapshot, materializedLoadDirectory, workflowInputFiles } from "../lib/workflow-load-bundle";
 import { workflowArchiveFilename, workflowExportFilename, workflowFileText } from "../lib/workflow-files";
+import { createDebugLog, debugLogFilename } from "../lib/debug-log";
 
 type BuiltinNodeType = "start" | "input" | "request" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
@@ -1159,6 +1160,10 @@ export default function Workbench() {
   const activeWorkflow = useMemo(
     () => workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0],
     [activeWorkflowId, workflows],
+  );
+  const activeChatSession = useMemo(
+    () => chatSessions.find((session) => session.id === activeSessionId) ?? initialChatSession,
+    [activeSessionId, chatSessions],
   );
   useEffect(() => {
     let active = true;
@@ -2518,6 +2523,39 @@ export default function Workbench() {
     link.click();
     URL.revokeObjectURL(url);
     showToast("Workflow exported");
+  }
+
+  function exportDebugLog() {
+    const exportedAt = new Date();
+    const debugLog = createDebugLog({
+      exportedAt: exportedAt.toISOString(),
+      chat: {
+        id: activeChatSession.id,
+        title: activeChatSession.title,
+        sessionNumber: activeChatSession.sessionNumber,
+        updatedAt: activeChatSession.updatedAt,
+        messages,
+      },
+      workflow: {
+        id: activeWorkflow.id,
+        name: activeWorkflow.name,
+        version: activeWorkflow.version,
+        updatedAt: activeWorkflow.updatedAt,
+      },
+      run: {
+        status: isRunning ? "running" : "idle",
+        stepCount: debugEvents.length,
+        events: debugEvents,
+      },
+    });
+    const blob = new Blob([JSON.stringify(debugLog, null, 2)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = debugLogFilename(activeChatSession.title, exportedAt);
+    link.click();
+    URL.revokeObjectURL(url);
+    showToast("Debug log exported");
   }
 
   async function captureWorkflowLoadFiles(workflow: Workflow) {
@@ -4270,7 +4308,7 @@ export default function Workbench() {
           </div>
           {debugOpen && <aside className="debug-panel">
             <div className="debug-panel-heading"><div><span className="eyebrow">Workflow debugger</span><strong>{activeWorkflow.name}</strong></div><button className="mini-icon" onClick={() => setDebugOpen(false)} aria-label="Close debugger"><PanelRightClose size={16} /></button></div>
-            <div className="debug-summary"><span className={isRunning ? "live" : ""}><i /> {isRunning ? "Running" : "Idle"}</span><small>{debugEvents.length} step{debugEvents.length === 1 ? "" : "s"}</small><button onClick={() => setDebugEvents([])} disabled={isRunning}>Clear</button></div>
+            <div className="debug-summary"><span className={isRunning ? "live" : ""}><i /> {isRunning ? "Running" : "Idle"}</span><small>{debugEvents.length} step{debugEvents.length === 1 ? "" : "s"}</small><div className="debug-summary-actions"><button onClick={exportDebugLog} disabled={!debugEvents.length} aria-label="Export debug log" title="Download this chat's debug log"><Download size={10} /> Export log</button><button onClick={() => setDebugEvents([])} disabled={isRunning}>Clear</button></div></div>
             <div className="debug-events">
               {debugEvents.length ? debugEvents.map((event, index) => <article className={`debug-event ${event.status}`} key={event.id}><span className="debug-rail">{index < debugEvents.length - 1 && <i />}</span><span className="debug-status-icon">{event.status === "running" ? <LoaderCircle size={14} className="spin" /> : event.status === "waiting" ? <MessageCircleQuestion size={14} /> : event.status === "routed" ? <Route size={14} /> : event.status === "error" ? <X size={14} /> : <Check size={14} />}</span><div><span><strong>{event.nodeName}</strong><small>{event.time}</small></span><b>{event.nodeType} · {event.status}</b><p>{event.detail}</p>{event.modelThinking && <details className="debug-thinking"><summary><BrainCircuit size={11} /> Model thinking</summary><pre>{event.modelThinking}</pre></details>}<DebugDataSection title="Inputs used" items={event.inputs} /><DebugDataSection title="Outputs produced" items={event.outputs} /></div></article>) : <div className="debug-empty"><Bug size={25} /><strong>No run recorded</strong><p>Send a message to see each workflow node execute here.</p></div>}
             </div>

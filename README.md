@@ -96,6 +96,12 @@ From a Git clone:
 - macOS/Linux: run `sh "Update Magic Conch.sh"`
 - Any system: run `npm run update`
 
+The updater requires the folder to be a Git clone and requires Git to be
+installed. A folder downloaded as a ZIP or copied without its hidden `.git/`
+directory can still launch normally, but it cannot update itself; download a
+fresh copy instead. On Windows, the updater also checks the standard Git for
+Windows install locations when Git is not on `PATH`.
+
 The updater only accepts a fast-forward update on a clean source tree. It then
 installs the exact locked dependencies and runs the test suite. It never reads,
 exports, deletes, or rewrites browser storage or ignored personal-data folders.
