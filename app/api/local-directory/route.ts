@@ -1,17 +1,13 @@
 import {
   handleLocalDirectoryRequest,
+  isLoopbackHostname,
   type LocalDirectoryRequest,
 } from "../../../build/local-directory-vite-plugin";
 
 export const dynamic = "force-dynamic";
 
-function isLoopbackRequest(request: Request) {
-  const hostname = new URL(request.url).hostname.toLowerCase();
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
-}
-
 export async function POST(request: Request) {
-  if (!isLoopbackRequest(request)) {
+  if (!isLoopbackHostname(new URL(request.url).hostname)) {
     return Response.json({ error: "Local directory access is available only from this device." }, { status: 404 });
   }
   try {

@@ -336,7 +336,7 @@ const DIRECTORY_HANDLE_STORE = "node-directories";
 const DATABASE_DIRECTORY_HANDLE_KEY = "global:database";
 const WORKFLOW_DIRECTORY_HANDLE_KEY = "global:workflow";
 const DEFAULT_LOCAL_DIRECTORY = "user-data";
-const LOCAL_DIRECTORY_ENDPOINT = "/_magic-conch/local-directory";
+const LOCAL_DIRECTORY_ENDPOINT = "/api/local-directory";
 
 function openDirectoryHandleDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {

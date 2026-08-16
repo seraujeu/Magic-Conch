@@ -7,12 +7,20 @@ import test from "node:test";
 import {
   DEFAULT_LOCAL_DIRECTORY,
   handleLocalDirectoryRequest,
+  isLoopbackHostname,
   resolveConfiguredDirectory,
 } from "../build/local-directory-vite-plugin.ts";
 
 test("keeps user-data out of Git uploads", async () => {
   const gitignore = await readFile(new URL("../.gitignore", import.meta.url), "utf8");
   assert.match(gitignore, /^\/user-data\/$/m);
+});
+
+test("limits the filesystem bridge to loopback hosts", () => {
+  assert.equal(isLoopbackHostname("localhost"), true);
+  assert.equal(isLoopbackHostname("127.0.0.1"), true);
+  assert.equal(isLoopbackHostname("::1"), true);
+  assert.equal(isLoopbackHostname("example.com"), false);
 });
 
 test("defaults local file operations to the project user-data directory", async (t) => {

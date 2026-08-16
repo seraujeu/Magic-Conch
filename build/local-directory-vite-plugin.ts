@@ -3,7 +3,7 @@ import { extname, isAbsolute, relative, resolve } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
-export const LOCAL_DIRECTORY_ENDPOINT = "/_magic-conch/local-directory";
+export const LOCAL_DIRECTORY_ENDPOINT = "/api/local-directory";
 export const DEFAULT_LOCAL_DIRECTORY = "user-data";
 
 type CollisionMode = "increment" | "timestamp" | "overwrite";
@@ -41,6 +41,11 @@ function cleanDirectorySetting(directory?: string) {
 export function resolveConfiguredDirectory(projectRoot: string, directory?: string) {
   const configured = cleanDirectorySetting(directory);
   return isAbsolute(configured) ? resolve(configured) : resolve(projectRoot, configured);
+}
+
+export function isLoopbackHostname(hostname: string) {
+  const normalized = hostname.toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "[::1]" || normalized === "::1";
 }
 
 function validateSubfolder(segments: unknown): string[] {
@@ -232,8 +237,12 @@ export async function handleLocalDirectoryRequest(projectRoot: string, request: 
 export function localDirectory(): Plugin {
   let projectRoot = process.cwd();
   const middleware = (request: IncomingMessage, response: ServerResponse, next: () => void) => {
-    const pathname = new URL(request.url || "/", "http://localhost").pathname;
-    if (pathname !== LOCAL_DIRECTORY_ENDPOINT) return next();
+    const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    if (url.pathname !== LOCAL_DIRECTORY_ENDPOINT) return next();
+    if (!isLoopbackHostname(url.hostname)) {
+      sendJson(response, 404, { error: "Local directory access is available only from this device." });
+      return;
+    }
     if (request.method !== "POST") {
       sendJson(response, 405, { error: "Method not allowed." });
       return;
