@@ -126,13 +126,15 @@ import {
   WorkflowSyntaxContext,
 } from "../lib/workflow-syntax";
 import { isWorkflowNodeActive } from "../lib/workflow-scheduler";
-import { migrateLegacyNodeDirectory, resolveNodeDirectory } from "../lib/node-directory";
+import { displayNodeDirectory, migrateLegacyNodeDirectory, resolveNodeDirectory } from "../lib/node-directory";
 import { collectWorkflowBundleDependencies, portableDependencySegment, remapPackagedWorkflowIds, workflowRuntimeNodeIds } from "../lib/workflow-bundle";
 import { applyBundledLoadSnapshots, bundledLoadResult, BundledLoadSnapshot, materializedLoadDirectory, workflowInputFiles } from "../lib/workflow-load-bundle";
 import { workflowArchiveFilename, workflowExportFilename, workflowFileText } from "../lib/workflow-files";
 import { createDebugLog, debugLogFilename } from "../lib/debug-log";
+import { buildAIWorkAssignerSystemPrompt, parseAIWorkAssignments } from "../lib/ai-work-assigner";
+import { composeStartInputs } from "../lib/start-inputs";
 
-type BuiltinNodeType = "start" | "input" | "request" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
+type BuiltinNodeType = "start" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
 type FileAsset = { name: string; type: string; data: string; size: number; bundleLoadNodeId?: string };
 type PortDataType = "prompt" | "files" | "document" | "text" | "number" | "boolean" | "string" | "integer" | "float" | "image" | "video" | "audio" | "any";
@@ -140,7 +142,7 @@ type PortSpec = { id: string; label: string; type: PortDataType; multiple?: bool
 type NodeSchema = { inputs: PortSpec[]; outputs: PortSpec[] };
 type Point = { x: number; y: number };
 type PortOffsets = Record<string, Point>;
-type RouteOption = { id: string; label: string; value?: string };
+type RouteOption = { id: string; label: string; value?: string; exportInstruction?: string };
 type WorkflowContext = {
   userMessage: string;
   additionalInput?: string;
@@ -161,6 +163,20 @@ type FlowNode = {
     prompt?: string;
     agentName?: string;
     startMessage?: string;
+    startIncludeCurrentMessage?: boolean;
+    startIncludePriorUserMessages?: boolean;
+    startIncludeAssistantMessages?: boolean;
+    startIncludeSystemMessages?: boolean;
+    startHistoryLimit?: number;
+    startIncludeMessageTimes?: boolean;
+    startIncludeCurrentFiles?: boolean;
+    startIncludePriorFiles?: boolean;
+    startIncludeWorkflowFiles?: boolean;
+    startIncludeSessionInfo?: boolean;
+    startIncludeWorkflowInfo?: boolean;
+    startIncludeStartSettings?: boolean;
+    startIncludeRunDateTime?: boolean;
+    startAdditionalContext?: string;
     provider?: AIProvider;
     model?: string;
     systemPrompt?: string;
@@ -309,6 +325,7 @@ type DebugEvent = {
   time: string;
   inputs: DebugDatum[];
   outputs: DebugDatum[];
+  fileSource?: string;
   modelThinking?: string;
 };
 
@@ -411,6 +428,7 @@ const NODE_META: Record<
   start: { label: "Start", subtitle: "Entry point", color: "#27a36a", icon: Play },
   input: { label: "Message", subtitle: "Prompt and file output", color: "#7c63e8", icon: MessageCircleQuestion },
   request: { label: "Request", subtitle: "Call an AI model", color: "#e17444", icon: Cloud },
+  "ai-assigner": { label: "AI Work Assigner", subtitle: "Assign work to selected outputs", color: "#b95aa2", icon: BrainCircuit },
   workflow: { label: "Use Workflow", subtitle: "Run another workflow", color: "#6c68c9", icon: WorkflowIcon },
   string: { label: "String", subtitle: "Provide a string value", color: "#3689b5", icon: Variable },
   integer: { label: "Integer", subtitle: "Provide a whole number", color: "#b49332", icon: Variable },
@@ -440,7 +458,7 @@ const NODE_META: Record<
 
 const BUILTIN_NODE_GROUPS: { id: string; label: string; types: BuiltinNodeType[] }[] = [
   { id: "essentials", label: "Essentials", types: ["start", "input", "end"] },
-  { id: "ai", label: "AI", types: ["request"] },
+  { id: "ai", label: "AI", types: ["request", "ai-assigner"] },
   { id: "values", label: "Values", types: ["string", "integer", "float", "math", "set-state"] },
   { id: "files", label: "Files", types: ["list-directory", "load", "save", "media-size", "file-name"] },
   { id: "processing", label: "Processing", types: ["transform", "code", "parser", "join"] },
@@ -490,6 +508,13 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
   if (node.type === "start") return { inputs: [{ id: "agent_name", label: "agent name", type: "string" }, { id: "start_message", label: "start message", type: "string" }], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
   if (node.type === "input") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "question", label: "question", type: "string" }, { id: "files", label: "files", type: "files" }, ...mediaInputs, documentIn], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
   if (node.type === "request") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "system_prompt", label: "system prompt", type: "string" }, { id: "model", label: "model", type: "string" }, { id: "temperature", label: "temperature", type: "float" }, { id: "output_file_name", label: "output file", type: "string" }, { id: "files", label: "files", type: "files" }, ...mediaInputs, documentIn], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
+  if (node.type === "ai-assigner") {
+    const outputs = node.config.routeOptions?.length ? node.config.routeOptions : [{ id: "output-1", label: "Output 1" }];
+    return {
+      inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "system_prompt", label: "system prompt", type: "string" }, { id: "model", label: "model", type: "string" }, { id: "temperature", label: "temperature", type: "float" }],
+      outputs: outputs.map((option) => ({ id: option.id, label: option.label, type: "prompt" as const })),
+    };
+  }
   if (node.type === "workflow") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaInputs, documentIn], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
   if (node.type === "string") return { inputs: [], outputs: [{ id: "value", label: "value", type: "string" }] };
   if (node.type === "integer") return { inputs: [], outputs: [{ id: "value", label: "value", type: "integer" }] };
@@ -597,7 +622,7 @@ function portPoint(
 
 function nodeCardHeight(node: FlowNode, plugins: MagicConchPlugin[]) {
   const schema = getNodeSchema(node, plugins);
-  return 86 + Math.max(schema.inputs.length, schema.outputs.length) * 25 + (["router-ai", "router-rule"].includes(node.type) ? 27 : 0);
+  return 86 + Math.max(schema.inputs.length, schema.outputs.length) * 25 + (["ai-assigner", "router-ai", "router-rule"].includes(node.type) ? 27 : 0);
 }
 
 function migrateWorkflow(workflow: Workflow, plugins: MagicConchPlugin[]): Workflow {
@@ -952,6 +977,31 @@ function createStarterMessages(workflow: Workflow, id = uid("message"), syntax?:
   return [{ id, role: "assistant", text: startMessage, time: "Now", meta: agentName }];
 }
 
+function startInputDetails(
+  start: FlowNode,
+  workflow: Workflow,
+  currentMessage: string,
+  currentFiles: FileAsset[],
+  priorMessages: Message[],
+  syntax: WorkflowSyntaxContext,
+) {
+  return composeStartInputs(start.config, {
+    currentMessage,
+    currentFiles,
+    priorMessages,
+    workflowFiles: workflowInputFiles(workflow),
+    session: {
+      id: syntax.chatSessionId,
+      number: syntax.chatSessionNumber,
+      title: syntax.chatSessionTitle,
+    },
+    workflow: { name: workflow.name, description: workflow.description },
+    start: getStartSettings(workflow, syntax),
+    now: syntax.now,
+    expand: (value) => expandWorkflowSyntax(value, syntax),
+  });
+}
+
 const starterMessages = createStarterMessages(initialWorkflow, "welcome");
 const initialChatSession: ChatSession = {
   id: "session-default",
@@ -963,6 +1013,24 @@ const initialChatSession: ChatSession = {
   updatedAt: new Date(0).toISOString(),
   sessionNumber: 1,
 };
+
+const LEGACY_AI_WORK_ASSIGNER_SYSTEM_PROMPT = "Assign the request only to the outputs that should work on it.";
+const DEFAULT_AI_WORK_ASSIGNER_SYSTEM_PROMPT = [
+  "You are a work coordinator. Analyze the incoming request and delegate it to the available outputs according to their names and intended roles.",
+  "",
+  "Selection rules:",
+  "- Activate every output whose role is genuinely useful for completing the request.",
+  "- Activate multiple outputs when the work benefits from parallel or complementary contributions.",
+  "- Leave an output inactive when it has no meaningful work to perform.",
+  "- Avoid assigning the same work to several outputs unless independent approaches are valuable.",
+  "",
+  "Prompt requirements for each activated output:",
+  "- Write a complete, standalone instruction that can be sent directly to another AI model.",
+  "- Include the relevant context from the incoming request; do not assume the downstream model can see the original message.",
+  "- State the specific task, expected deliverable, important constraints, and useful quality criteria.",
+  "- Keep the assignment focused on that output's role while preserving the user's intent.",
+  "- Do not ask one output to wait for or communicate with another output.",
+].join("\n");
 
 const modelDefaults: Record<AIProvider, string> = {
   openai: "gpt-4o-mini",
@@ -1313,16 +1381,24 @@ export default function Workbench() {
           if (parsed.length) {
             const migrated = parsed.map((workflow) => migrateWorkflow({
               ...workflow,
-              nodes: workflow.nodes.map((node) => (node.type === "router-ai" || node.type === "router-rule") && !node.config.routeOptions?.length ? {
-                ...node,
-                config: {
-                  ...node.config,
-                  routeOptions: [
-                    { id: "route-1", label: node.config.routeALabel || "Option 1", value: node.config.routeValue || "" },
-                    ...(node.config.routeBLabel ? [{ id: "route-2", label: node.config.routeBLabel, value: "" }] : []),
-                  ],
-                },
-              } : node),
+              nodes: workflow.nodes.map((node) => {
+                if (node.type === "ai-assigner" && node.config.systemPrompt === LEGACY_AI_WORK_ASSIGNER_SYSTEM_PROMPT) {
+                  return { ...node, config: { ...node.config, systemPrompt: DEFAULT_AI_WORK_ASSIGNER_SYSTEM_PROMPT } };
+                }
+                if ((node.type === "router-ai" || node.type === "router-rule") && !node.config.routeOptions?.length) {
+                  return {
+                    ...node,
+                    config: {
+                      ...node.config,
+                      routeOptions: [
+                        { id: "route-1", label: node.config.routeALabel || "Option 1", value: node.config.routeValue || "" },
+                        ...(node.config.routeBLabel ? [{ id: "route-2", label: node.config.routeBLabel, value: "" }] : []),
+                      ],
+                    },
+                  };
+                }
+                return node;
+              }),
               edges: workflow.edges.map((edge) => ({
                 ...edge,
                 fromPort: edge.fromPort === "route-a" ? "route-1" : edge.fromPort === "route-b" ? "route-2" : edge.fromPort || "flow",
@@ -1723,12 +1799,12 @@ export default function Workbench() {
     node: FlowNode,
     status: DebugEvent["status"],
     detail: string,
-    data: { inputs?: DebugDatum[]; outputs?: DebugDatum[] } = {},
+    data: { inputs?: DebugDatum[]; outputs?: DebugDatum[]; fileSource?: string } = {},
   ) {
     const id = uid("debug");
     setDebugEvents((current) => [
       ...current,
-      { id, nodeId: node.id, nodeName: node.name, nodeType: getNodeMeta(node.type, plugins).label, status, detail, time: timeNow(), inputs: data.inputs || [], outputs: data.outputs || [] },
+      { id, nodeId: node.id, nodeName: node.name, nodeType: getNodeMeta(node.type, plugins).label, status, detail, time: timeNow(), inputs: data.inputs || [], outputs: data.outputs || [], fileSource: data.fileSource },
     ]);
     return id;
   }
@@ -1737,7 +1813,7 @@ export default function Workbench() {
     id: string,
     status: DebugEvent["status"],
     detail: string,
-    data: { inputs?: DebugDatum[]; outputs?: DebugDatum[]; modelThinking?: string } = {},
+    data: { inputs?: DebugDatum[]; outputs?: DebugDatum[]; fileSource?: string; modelThinking?: string } = {},
   ) {
     setDebugEvents((current) =>
       current.map((event) => (event.id === id ? { ...event, status, detail, ...data } : event)),
@@ -1864,6 +1940,8 @@ export default function Workbench() {
       config:
         type === "request"
           ? { provider: "openai", model: modelDefaults.openai, temperature: 0.7 }
+          : type === "ai-assigner"
+            ? { provider: "openai", model: modelDefaults.openai, temperature: 0.2, systemPrompt: DEFAULT_AI_WORK_ASSIGNER_SYSTEM_PROMPT, routeOptions: [{ id: uid("output"), label: "Output 1" }] }
           : type === "workflow"
             ? { calledWorkflowId: workflows.find((workflow) => workflow.id !== activeWorkflow.id)?.id || "" }
           : type === "string"
@@ -2226,10 +2304,12 @@ export default function Workbench() {
             const mathInputs = growMathInputs(inputs, targetPort, uid("math-input"));
             if (mathInputs !== inputs) return { ...node, config: { ...node.config, mathInputs } };
           }
-          if (node.id === source.nodeId && ["router-ai", "router-rule"].includes(node.type)) {
-            const options = node.config.routeOptions?.length ? node.config.routeOptions : [{ id: source.portId, label: "Option 1", value: node.config.routeValue || "" }];
+          if (node.id === source.nodeId && ["ai-assigner", "router-ai", "router-rule"].includes(node.type)) {
+            const fallbackLabel = node.type === "ai-assigner" ? "Output 1" : "Option 1";
+            const options = node.config.routeOptions?.length ? node.config.routeOptions : [{ id: source.portId, label: fallbackLabel, value: node.config.routeValue || "" }];
             if (options.at(-1)?.id === source.portId) {
-              return { ...node, config: { ...node.config, routeOptions: [...options, { id: uid("route"), label: `Option ${options.length + 1}`, value: "" }] } };
+              const label = node.type === "ai-assigner" ? "Output" : "Option";
+              return { ...node, config: { ...node.config, routeOptions: [...options, { id: uid(node.type === "ai-assigner" ? "output" : "route"), label: `${label} ${options.length + 1}`, value: "" }] } };
             }
           }
           return node;
@@ -2262,7 +2342,8 @@ export default function Workbench() {
       nodes: workflow.nodes.map((node) => {
         if (node.id !== nodeId) return node;
         const options = node.config.routeOptions || [];
-        return { ...node, config: { ...node.config, routeOptions: [...options, { id: uid(node.type === "parallel" ? "branch" : "route"), label: `${node.type === "parallel" ? "Branch" : "Option"} ${options.length + 1}`, value: "" }] } };
+        const outputName = node.type === "parallel" ? "Branch" : node.type === "ai-assigner" ? "Output" : "Option";
+        return { ...node, config: { ...node.config, routeOptions: [...options, { id: uid(node.type === "parallel" ? "branch" : node.type === "ai-assigner" ? "output" : "route"), label: `${outputName} ${options.length + 1}`, value: "" }] } };
       }),
     }));
   }
@@ -2580,7 +2661,8 @@ export default function Workbench() {
       try {
         if (node.type === "list-directory" || node.config.loadMode === "folder") {
           const recursive = Boolean(connectedConfiguredValue(workflow, node.id, "recursive") ?? node.config.includeSubfolders ?? false);
-          const files = await loadDirectoryFiles(effectiveNode, effectiveNode.config.subfolder || "", recursive);
+          const loadedDirectory = await loadDirectoryFiles(effectiveNode, effectiveNode.config.subfolder || "", recursive);
+          const files = loadedDirectory.files;
           snapshots[node.id] = { value: files.map((file) => file.name).join("\n"), files };
         } else {
           snapshots[node.id] = await loadRecord(effectiveNode);
@@ -2735,6 +2817,7 @@ export default function Workbench() {
       reason?: "folder" | "record";
       value?: string;
       files?: FileAsset[];
+      directory?: string;
     }>({
       directory: location.directory,
       operation: "load-record",
@@ -2742,22 +2825,30 @@ export default function Workbench() {
       key: safeKey,
       loadMode: node.config.loadMode || "latest",
     });
-    if (result?.found) return { value: result.value || "", files: result.files || [] };
+    if (result?.found) return {
+      value: result.value || "",
+      files: result.files || [],
+      source: displayNodeDirectory(result.directory || location.directory, segments),
+    };
     const record = localRecord();
-    if (record) return { value: String(record.value ?? ""), files: record.assets || [] };
-    if (result?.reason === "folder") return { value: "The configured subfolder was not found.", files: [] };
-    return { value: "No saved record was found.", files: [] };
+    if (record) return { value: String(record.value ?? ""), files: record.assets || [], source: `Browser storage record “${safeKey}”` };
+    const source = displayNodeDirectory(result?.directory || location.directory, segments);
+    if (result?.reason === "folder") return { value: "The configured subfolder was not found.", files: [], source };
+    return { value: "No saved record was found.", files: [], source };
   }
 
   async function loadDirectoryFiles(node: FlowNode, subfolder: string, recursive: boolean) {
     const location = resolvedDirectoryForNode(node, subfolder);
-    const result = await localDirectoryRequest<{ files: FileAsset[] }>({
+    const result = await localDirectoryRequest<{ files: FileAsset[]; directory?: string }>({
       directory: location.directory,
       operation: "list-files",
       subfolder: location.subfolder,
       recursive,
     });
-    if (result) return result.files;
+    if (result) return {
+      files: result.files,
+      source: displayNodeDirectory(result.directory || location.directory, location.subfolder),
+    };
     throw new Error(`The local directory service is unavailable for this ${node.type === "load" ? "Load" : "Load Directory"} node.`);
   }
 
@@ -2785,15 +2876,17 @@ export default function Workbench() {
 
     const start = workflow.nodes.find((node) => node.type === "start");
     if (!start) throw new Error(`Called workflow “${workflow.name}” needs a Start node.`);
-    const files = [...workflowInputFiles(workflow), ...incomingFiles];
+    const syntax = syntaxContextFor(workflow);
+    const startInputs = startInputDetails(start, workflow, prompt, incomingFiles, [], syntax);
+    const files = startInputs.files;
     const context: WorkflowContext = {
-      userMessage: prompt,
+      userMessage: startInputs.prompt,
       files,
       values: {},
-      syntax: syntaxContextFor(workflow),
+      syntax,
       workflowStack: [...workflowStack, workflow.id],
     };
-    context.values[portValueKey(start.id, "prompt")] = prompt;
+    context.values[portValueKey(start.id, "prompt")] = startInputs.prompt;
     context.values[portValueKey(start.id, "files")] = files;
     context.values[portValueKey(start.id, "image")] = mediaAssets(files, "image");
     context.values[portValueKey(start.id, "video")] = mediaAssets(files, "video");
@@ -2912,8 +3005,14 @@ export default function Workbench() {
           type: port.type,
           value: port.type === "prompt" ? promptInput : port.type === "files" ? fileInput : port.type === "document" ? inputFor(port.id, fileInput) : inputFor(port.id, undefined),
         }));
-      if (node.type === "request" && (node.config.systemPrompt || inputFor("system_prompt", ""))) {
+      if ((node.type === "request" || node.type === "ai-assigner") && (node.config.systemPrompt || inputFor("system_prompt", ""))) {
         debugInputs.push({ port: "system_prompt", label: "system prompt", type: "string", value: inputFor("system_prompt", node.config.systemPrompt || "") });
+      }
+      if (node.type === "ai-assigner") {
+        (node.config.routeOptions || []).forEach((option) => {
+          if (option.value?.trim()) debugInputs.push({ port: `${option.id}-activation`, label: `${option.label} activation`, type: "text", value: option.value });
+          if (option.exportInstruction?.trim()) debugInputs.push({ port: `${option.id}-export`, label: `${option.label} export`, type: "text", value: option.exportInstruction });
+        });
       }
       if (node.type === "input" && node.config.prompt) {
         debugInputs.push({ port: "question", label: "question", type: "prompt", value: node.config.prompt });
@@ -2934,6 +3033,7 @@ export default function Workbench() {
         .filter((datum) => datum.value !== undefined);
       let debugStatus: DebugEvent["status"] = "completed";
       let debugDetail = `Received ${String(promptInput || "").length} prompt characters and ${fileInput.length} file${fileInput.length === 1 ? "" : "s"}.`;
+      let debugFileSource: string | undefined;
       const debugId = addDebugEvent(node, "running", "Processing node inputs…", { inputs: debugInputs });
 
       if (node.type === "string") {
@@ -3008,14 +3108,16 @@ export default function Workbench() {
         const subfolder = String(inputFor("subfolder", node.config.subfolder || ""));
         const recursive = Boolean(inputFor("recursive", node.config.includeSubfolders || false));
         const bundledDirectory = bundledLoadResult(workflow, node.id);
-        const files = bundledDirectory?.files ?? await loadDirectoryFiles(node, subfolder, recursive);
+        const loadedDirectory = bundledDirectory ? null : await loadDirectoryFiles(node, subfolder, recursive);
+        const files = bundledDirectory?.files ?? loadedDirectory!.files;
+        debugFileSource = bundledDirectory ? "Bundled export snapshot" : loadedDirectory!.source;
         output("files", files);
         output("image", mediaAssets(files, "image"));
         output("video", mediaAssets(files, "video"));
         output("audio", mediaAssets(files, "audio"));
         output("names", files.map((file) => file.name));
         output("count", files.length);
-        debugDetail = `Loaded ${files.length} file${files.length === 1 ? "" : "s"} from ${bundledDirectory ? "the bundled export snapshot" : resolvedDirectoryForNode(node, subfolder).directory}.`;
+        debugDetail = `Loaded ${files.length} file${files.length === 1 ? "" : "s"}.`;
       }
 
       if (node.type === "request") {
@@ -3085,6 +3187,43 @@ export default function Workbench() {
         debugDetail = `Generated ${context.lastOutput.length} prompt characters and passed ${fileInput.length} file${fileInput.length === 1 ? "" : "s"}.`;
       }
 
+      if (node.type === "ai-assigner") {
+        const options = node.config.routeOptions?.length ? node.config.routeOptions : [{ id: "output-1", label: "Output 1" }];
+        const provider = node.config.provider || "openai";
+        const response = await requestAI(
+          {
+            provider,
+            model: String(inputFor("model", node.config.model || modelDefaults[provider])),
+            temperature: Number(inputFor("temperature", node.config.temperature ?? 0.2)),
+            systemPrompt: buildAIWorkAssignerSystemPrompt(
+              String(inputFor("system_prompt", node.config.systemPrompt || "")),
+              options.map((option) => ({
+                id: option.id,
+                label: option.label,
+                activation: option.value,
+                exportInstruction: option.exportInstruction,
+              })),
+            ),
+            prompt: String(promptInput),
+            openai: provider === "openai" ? openAIRequestSettings(node) : undefined,
+            gemini: provider === "gemini" ? geminiRequestSettings(node) : undefined,
+            claude: provider === "claude" ? claudeRequestSettings(node) : undefined,
+            ollama: provider === "ollama" ? ollamaRequestSettings(node) : undefined,
+          },
+          providerSettings,
+        );
+        const assignments = parseAIWorkAssignments(response, options);
+        options.forEach((option) => {
+          if (assignments.has(option.id)) output(option.id, assignments.get(option.id) || "");
+        });
+        context.lastOutput = response;
+        const activated = options.filter((option) => assignments.has(option.id));
+        debugStatus = "routed";
+        debugDetail = activated.length
+          ? `Assigned work to ${activated.map((option) => option.label).join(", ")}.`
+          : "The AI response did not include any complete output sections, so no outputs were activated.";
+      }
+
       if (node.type === "workflow") {
         const calledWorkflowId = node.config.calledWorkflowId;
         const calledWorkflow = workflows.find((item) => item.id === calledWorkflowId);
@@ -3115,16 +3254,17 @@ export default function Workbench() {
       if (node.type === "load") {
         const effectiveNode = { ...node, config: { ...node.config, key: String(inputFor("key", node.config.key || "workflow-result")), subfolder: String(inputFor("subfolder", node.config.subfolder || "")) } };
         const bundledLoaded = bundledLoadResult(workflow, node.id);
-        const loaded = bundledLoaded || (node.config.loadMode === "folder"
+        const loaded = bundledLoaded ? { ...bundledLoaded, source: "Bundled export snapshot" } : (node.config.loadMode === "folder"
           ? await (async () => {
-              const files = await loadDirectoryFiles(
+              const loadedDirectory = await loadDirectoryFiles(
                 effectiveNode,
                 effectiveNode.config.subfolder || "",
                 Boolean(inputFor("recursive", node.config.includeSubfolders || false)),
               );
-              return { value: files.map((file) => file.name).join("\n"), files };
+              return { value: loadedDirectory.files.map((file) => file.name).join("\n"), ...loadedDirectory };
             })()
           : await loadRecord(effectiveNode));
+        debugFileSource = loaded.source;
         context.loadedData = loaded.value;
         context.lastOutput = loaded.value;
         output("prompt", loaded.value);
@@ -3134,8 +3274,8 @@ export default function Workbench() {
         output("audio", mediaAssets(loaded.files, "audio"));
         output("document", loaded.files.filter(isDocumentAsset));
         debugDetail = node.config.loadMode === "folder"
-          ? `Loaded all ${loaded.files.length} file${loaded.files.length === 1 ? "" : "s"} from ${bundledLoaded ? "the bundled export snapshot" : resolvedDirectoryForNode(effectiveNode).directory}.`
-          : `Loaded ${loaded.value.length} prompt characters and ${loaded.files.length} file${loaded.files.length === 1 ? "" : "s"} from ${bundledLoaded ? "the bundled export snapshot" : "storage"}.`;
+          ? `Loaded all ${loaded.files.length} file${loaded.files.length === 1 ? "" : "s"}.`
+          : `Loaded ${loaded.value.length} prompt characters and ${loaded.files.length} file${loaded.files.length === 1 ? "" : "s"}.`;
       }
 
       if (node.type === "set-state") {
@@ -3371,7 +3511,7 @@ export default function Workbench() {
         updateDebugEvent(debugId, "completed", `Returned ${finalPrompt.length} prompt characters and ${fileInput.length} file${fileInput.length === 1 ? "" : "s"}.`, { outputs: [] });
         return { emittedPortKeys: [], endResult: { text: finalPrompt, files: fileInput } };
       }
-      updateDebugEvent(debugId, debugStatus, debugDetail, { outputs: collectDebugOutputs() });
+      updateDebugEvent(debugId, debugStatus, debugDetail, { outputs: collectDebugOutputs(), fileSource: debugFileSource });
       return { emittedPortKeys: [...emittedPortKeys] };
   }
 
@@ -3489,13 +3629,15 @@ export default function Workbench() {
     setIsRunning(false);
   }
 
-  async function runNewWorkflowMessage(text: string, messageFiles: FileAsset[]) {
+  async function runNewWorkflowMessage(text: string, messageFiles: FileAsset[], priorMessages = messages) {
     setDebugEvents([]);
     const start = activeWorkflow.nodes.find((node) => node.type === "start");
     if (!start) throw new Error("This workflow needs a Start node.");
-    const files = [...workflowInputFiles(activeWorkflow), ...messageFiles];
-    const context: WorkflowContext = { userMessage: text, files, values: {}, syntax: syntaxContextFor(), workflowStack: [activeWorkflow.id] };
-    context.values[portValueKey(start.id, "prompt")] = text;
+    const syntax = syntaxContextFor();
+    const startInputs = startInputDetails(start, activeWorkflow, text, messageFiles, priorMessages, syntax);
+    const files = startInputs.files;
+    const context: WorkflowContext = { userMessage: startInputs.prompt, files, values: {}, syntax, workflowStack: [activeWorkflow.id] };
+    context.values[portValueKey(start.id, "prompt")] = startInputs.prompt;
     context.values[portValueKey(start.id, "files")] = files;
     context.values[portValueKey(start.id, "image")] = mediaAssets(files, "image");
     context.values[portValueKey(start.id, "video")] = mediaAssets(files, "video");
@@ -3504,9 +3646,9 @@ export default function Workbench() {
     addDebugEvent(
       start,
       "completed",
-      `Accepted ${text.length} prompt characters and ${files.length} file${files.length === 1 ? "" : "s"}.`,
+      `Included ${startInputs.includedHistoryCount} prior message${startInputs.includedHistoryCount === 1 ? "" : "s"}, ${startInputs.prompt.length} prompt characters, and ${files.length} file${files.length === 1 ? "" : "s"}.`,
       { outputs: [
-        { port: "prompt", label: "prompt", type: "prompt", value: text },
+        { port: "prompt", label: "prompt", type: "prompt", value: startInputs.prompt },
         { port: "files", label: "files", type: "files", value: files },
       ] },
     );
@@ -3550,7 +3692,8 @@ export default function Workbench() {
     ) as Message[]);
     setIsRunning(true);
     try {
-      await runNewWorkflowMessage(message.text, files);
+      const messageIndex = messages.findIndex((candidate) => candidate.id === message.id);
+      await runNewWorkflowMessage(message.text, files, messageIndex < 0 ? messages : messages.slice(0, messageIndex));
     } catch (error) {
       reportWorkflowRunError(error);
     }
@@ -3914,7 +4057,7 @@ export default function Workbench() {
                         <span className="node-icon"><Icon size={17} /></span>
                         <span className="node-text">
                           <strong>{node.name}</strong>
-                          <small>{node.type === "request" || node.type === "router-ai" || node.type === "condition-ai" ? `${node.config.provider || "openai"} · ${node.config.model || "model"}` : node.type === "workflow" ? workflows.find((workflow) => workflow.id === node.config.calledWorkflowId)?.name || "Select a workflow" : meta.subtitle}</small>
+                          <small>{node.type === "request" || node.type === "ai-assigner" || node.type === "router-ai" || node.type === "condition-ai" ? `${node.config.provider || "openai"} · ${node.config.model || "model"}` : node.type === "workflow" ? workflows.find((workflow) => workflow.id === node.config.calledWorkflowId)?.name || "Select a workflow" : meta.subtitle}</small>
                         </span>
                       </div>
                       <div className="node-ports">
@@ -3928,7 +4071,7 @@ export default function Workbench() {
                           {schema.outputs.map((port) => <div className="port-row" key={port.id}><span><b>{port.label}</b><small>{port.type}</small></span><button className={`typed-port output-port type-${port.type} ${connectionSource?.nodeId === node.id && connectionSource.portId === port.id ? "active" : ""}`} data-node-id={node.id} data-node-port-id={port.id} data-port-side="output" aria-label={`${port.label} ${port.type} output`} onPointerDown={(event) => beginConnection(event, node.id, port)} /></div>)}
                         </div>
                       </div>
-                      {(node.type === "router-ai" || node.type === "router-rule") && <button className="route-add-button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); addRouteOption(node.id); }}><Plus size={11} /> Add new route</button>}
+                      {(node.type === "ai-assigner" || node.type === "router-ai" || node.type === "router-rule") && <button className="route-add-button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); addRouteOption(node.id); }}><Plus size={11} /> Add new {node.type === "ai-assigner" ? "output" : "route"}</button>}
                     </article>
                   );
                 })}
@@ -3974,6 +4117,36 @@ export default function Workbench() {
                     <>
                       <label className="field-label">Agent name<input value={selectedNode.config.agentName || ""} placeholder={DEFAULT_AGENT_NAME} onChange={(event) => updateNode({ config: { agentName: event.target.value } })} /><small className="field-help">Shown beside every message sent by this workflow.</small></label>
                       <label className="field-label">Start message<textarea rows={4} value={selectedNode.config.startMessage || ""} placeholder={DEFAULT_START_MESSAGE} onChange={(event) => updateNode({ config: { startMessage: event.target.value } })} /><small className="field-help">Shown when a new chat starts or this workflow is opened for testing.</small></label>
+                      <div className="start-input-intro"><Info size={14} /><span><b>Start output composition</b><small>Choose exactly what the prompt and file outputs receive when a run begins.</small></span></div>
+                      <details className="start-input-group" open>
+                        <summary><MessageSquare size={14} /><span><b>Messages</b><small>Current message and optional chat history</small></span><ChevronDown size={14} /></summary>
+                        <div className="start-input-fields">
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludeCurrentMessage !== false} onChange={(event) => updateNode({ config: { startIncludeCurrentMessage: event.target.checked } })} /><span>Current user message</span></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludePriorUserMessages === true} onChange={(event) => updateNode({ config: { startIncludePriorUserMessages: event.target.checked } })} /><span>Previous user messages</span></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludeAssistantMessages === true} onChange={(event) => updateNode({ config: { startIncludeAssistantMessages: event.target.checked } })} /><span>Assistant messages</span></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludeSystemMessages === true} onChange={(event) => updateNode({ config: { startIncludeSystemMessages: event.target.checked } })} /><span>System messages</span></label>
+                          <label className="field-label compact-field">Maximum previous messages<input type="number" min="1" max="100" value={selectedNode.config.startHistoryLimit ?? 20} onChange={(event) => updateNode({ config: { startHistoryLimit: Math.max(1, Math.min(100, Number(event.target.value) || 1)) } })} /><small className="field-help">Applied after filtering by the roles above; the newest messages are kept.</small></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludeMessageTimes === true} onChange={(event) => updateNode({ config: { startIncludeMessageTimes: event.target.checked } })} /><span>Include displayed message times</span></label>
+                        </div>
+                      </details>
+                      <details className="start-input-group" open>
+                        <summary><Paperclip size={14} /><span><b>Files</b><small>Attachments exposed on file and media ports</small></span><ChevronDown size={14} /></summary>
+                        <div className="start-input-fields">
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludeCurrentFiles !== false} onChange={(event) => updateNode({ config: { startIncludeCurrentFiles: event.target.checked } })} /><span>Current message attachments</span></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludePriorFiles === true} onChange={(event) => updateNode({ config: { startIncludePriorFiles: event.target.checked } })} /><span>Attachments from earlier messages</span></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludeWorkflowFiles !== false} onChange={(event) => updateNode({ config: { startIncludeWorkflowFiles: event.target.checked } })} /><span>Files saved with the workflow</span></label>
+                        </div>
+                      </details>
+                      <details className="start-input-group">
+                        <summary><Settings size={14} /><span><b>Other context</b><small>Session, workflow, run, and Start settings</small></span><ChevronDown size={14} /></summary>
+                        <div className="start-input-fields">
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludeSessionInfo === true} onChange={(event) => updateNode({ config: { startIncludeSessionInfo: event.target.checked } })} /><span>Chat title, number, and session ID</span></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludeWorkflowInfo === true} onChange={(event) => updateNode({ config: { startIncludeWorkflowInfo: event.target.checked } })} /><span>Workflow name and description</span></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludeStartSettings === true} onChange={(event) => updateNode({ config: { startIncludeStartSettings: event.target.checked } })} /><span>Agent name and opening message</span></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludeRunDateTime === true} onChange={(event) => updateNode({ config: { startIncludeRunDateTime: event.target.checked } })} /><span>Run date and time</span></label>
+                          <label className="field-label compact-field">Additional context<textarea rows={4} value={selectedNode.config.startAdditionalContext || ""} placeholder="Instructions or context added to every run…" onChange={(event) => updateNode({ config: { startAdditionalContext: event.target.value } })} /><small className="field-help">Workflow syntax such as {`{{chat-session-title}}`} and {`{{date}}`} is supported. Provider keys and private connection settings are never included.</small></label>
+                        </div>
+                      </details>
                     </>
                   )}
                   {selectedNode.type === "input" && (
@@ -4012,7 +4185,7 @@ export default function Workbench() {
                     {selectedNode.config.aggregateOperation === "template" && <label className="field-label">Prompt template<textarea rows={6} value={selectedNode.config.aggregateTemplate || ""} placeholder={defaultJoinTemplate(getJoinInputs(selectedNode))} onChange={(event) => updateNode({ config: { aggregateTemplate: event.target.value } })} /><small className="field-help">Place the variables above anywhere in the prompt. Dot paths such as {`{{input2.name}}`} select nested values.</small></label>}
                   </>}
                   {selectedNode.type === "router-condition" && <><label className="field-label">Condition<div className="select-wrap"><select value={selectedNode.config.conditionKind || "truthy"} onChange={(event) => updateNode({ config: { conditionKind: event.target.value as FlowNode["config"]["conditionKind"] } })}><option value="truthy">Value is truthy</option><option value="equals">Value equals</option><option value="contains">Value contains</option><option value="input_type">Input type is</option><option value="file_extension">File extension is</option></select><ChevronDown size={14} /></div></label>{selectedNode.config.conditionKind !== "truthy" && <label className="field-label">Expected value<input value={selectedNode.config.conditionValue || ""} placeholder={selectedNode.config.conditionKind === "file_extension" ? "pdf" : selectedNode.config.conditionKind === "input_type" ? "document, boolean, array…" : "value"} onChange={(event) => updateNode({ config: { conditionValue: event.target.value } })} /></label>}</>}
-                  {(selectedNode.type === "request" || selectedNode.type === "router-ai" || selectedNode.type === "condition-ai") && (
+                  {(selectedNode.type === "request" || selectedNode.type === "ai-assigner" || selectedNode.type === "router-ai" || selectedNode.type === "condition-ai") && (
                     <>
                       <label className="field-label">Provider
                         <div className="select-wrap"><select value={selectedNode.config.provider || "openai"} onChange={(event) => {
@@ -4025,9 +4198,10 @@ export default function Workbench() {
                         <input list="available-ai-models" value={selectedNode.config.model || ""} onChange={(event) => updateNode({ config: { model: event.target.value } })} />
                         <datalist id="available-ai-models">{(availableModels[selectedNode.config.provider || "openai"] || []).map((model) => <option key={model} value={model} />)}</datalist>
                       </label>
-                      {selectedNode.type === "request" ? <>
-                        <label className="field-label">System prompt<textarea rows={5} value={selectedNode.config.systemPrompt || ""} placeholder="Describe how the model should behave…" onChange={(event) => updateNode({ config: { systemPrompt: event.target.value } })} /></label>
-                        <label className="field-label">Create file from response<input value={selectedNode.config.outputFileName || ""} placeholder="Optional, e.g. report.md" onChange={(event) => updateNode({ config: { outputFileName: event.target.value } })} /><small className="field-help">When set, the response becomes a workflow file that Save nodes can write.</small></label>
+                      {selectedNode.type === "request" || selectedNode.type === "ai-assigner" ? <>
+                        <label className="field-label">System prompt<textarea rows={selectedNode.type === "ai-assigner" ? 10 : 5} value={selectedNode.config.systemPrompt || ""} placeholder={selectedNode.type === "ai-assigner" ? "Describe in detail how to decide which workers are needed, their roles, constraints, priorities, and what each prompt should contain…" : "Describe how the model should behave…"} onChange={(event) => updateNode({ config: { systemPrompt: event.target.value } })} /></label>
+                        {selectedNode.type === "request" && <label className="field-label">Create file from response<input value={selectedNode.config.outputFileName || ""} placeholder="Optional, e.g. report.md" onChange={(event) => updateNode({ config: { outputFileName: event.target.value } })} /><small className="field-help">When set, the response becomes a workflow file that Save nodes can write.</small></label>}
+                        {selectedNode.type === "ai-assigner" && <small className="field-help">The named section format is added automatically. Each activated output exports its enclosed text as a prompt; connect it directly to an AI Request node&apos;s prompt input.</small>}
                       </> : <>
                         <label className="field-label">{selectedNode.type === "condition-ai" ? "Boolean condition" : "Routing criteria"}<textarea rows={4} value={selectedNode.config.routeCriteria || ""} placeholder={selectedNode.type === "condition-ai" ? "For example: The request is about billing." : "Describe when to choose path A or B…"} onChange={(event) => updateNode({ config: { routeCriteria: event.target.value } })} /></label>
                       </>}
@@ -4111,7 +4285,30 @@ export default function Workbench() {
                     </>
                   )}
                   {(selectedNode.type === "condition-ai" || selectedNode.type === "condition-rule") && <div className="inspector-note"><GitBranch size={14} /><span><b>if / elif / else</b><small>Use true as the if branch. Connect false to the gate of another condition for elif, or use the final false output as else.</small></span></div>}
-                  {(selectedNode.type === "router-ai" || selectedNode.type === "router-rule") && <div className="route-options-editor"><span className="field-title-row"><b>Route outputs</b><button type="button" onClick={() => addRouteOption(selectedNode.id)}><Plus size={12} /> Add option</button></span>{(selectedNode.config.routeOptions || [{ id: "route-1", label: "Option 1", value: selectedNode.config.routeValue || "" }]).map((option, index, options) => <div className="route-option-row" key={option.id}><span>{index + 1}</span><div><input aria-label={`Option ${index + 1} label`} value={option.label} onChange={(event) => updateNode({ config: { routeOptions: options.map((item) => item.id === option.id ? { ...item, label: event.target.value } : item) } })} />{selectedNode.type === "router-rule" && selectedNode.config.routeMethod !== "is_empty" && <input aria-label={`${option.label} match value`} className="route-value-input" value={option.value || ""} placeholder="Match value" onChange={(event) => updateNode({ config: { routeOptions: options.map((item) => item.id === option.id ? { ...item, value: event.target.value } : item) } })} />}</div><button className="mini-icon route-option-delete" disabled={options.length <= 1} aria-label={options.length <= 1 ? "At least one route option is required" : `Remove ${option.label}`} title={options.length <= 1 ? "At least one output is required" : "Delete output"} onClick={() => removeRouteOption(selectedNode.id, option.id)}><Trash2 size={13} /></button></div>)}<small>Connecting the last output automatically creates the next one.</small></div>}
+                  {(selectedNode.type === "ai-assigner" || selectedNode.type === "router-ai" || selectedNode.type === "router-rule") && (
+                    <div className="route-options-editor">
+                      <span className="field-title-row">
+                        <b>{selectedNode.type === "ai-assigner" ? "Assignment outputs" : "Route outputs"}</b>
+                        <button type="button" onClick={() => addRouteOption(selectedNode.id)}><Plus size={12} /> Add {selectedNode.type === "ai-assigner" ? "output" : "option"}</button>
+                      </span>
+                      {(selectedNode.config.routeOptions || [{ id: selectedNode.type === "ai-assigner" ? "output-1" : "route-1", label: selectedNode.type === "ai-assigner" ? "Output 1" : "Option 1", value: selectedNode.config.routeValue || "" }]).map((option, index, options) => (
+                        <div className="route-option-row" key={option.id}>
+                          <span>{index + 1}</span>
+                          <div>
+                            {selectedNode.type === "ai-assigner" && <small className="route-option-field-label">Output name</small>}
+                            <input aria-label={`${selectedNode.type === "ai-assigner" ? "Output" : "Option"} ${index + 1} label`} value={option.label} onChange={(event) => updateNode({ config: { routeOptions: options.map((item) => item.id === option.id ? { ...item, label: event.target.value } : item) } })} />
+                            {selectedNode.type === "ai-assigner" && <small className="route-option-field-label">When to activate</small>}
+                            {selectedNode.type === "ai-assigner" && <textarea aria-label={`${option.label} activation description`} className="route-activation-input" rows={3} value={option.value || ""} placeholder="Activate when…" onChange={(event) => updateNode({ config: { routeOptions: options.map((item) => item.id === option.id ? { ...item, value: event.target.value } : item) } })} />}
+                            {selectedNode.type === "ai-assigner" && <small className="route-option-field-label">What to export</small>}
+                            {selectedNode.type === "ai-assigner" && <textarea aria-label={`${option.label} export instruction`} className="route-export-input" rows={3} value={option.exportInstruction || ""} placeholder="Describe the standalone prompt this output should receive…" onChange={(event) => updateNode({ config: { routeOptions: options.map((item) => item.id === option.id ? { ...item, exportInstruction: event.target.value } : item) } })} />}
+                            {selectedNode.type === "router-rule" && selectedNode.config.routeMethod !== "is_empty" && <input aria-label={`${option.label} match value`} className="route-value-input" value={option.value || ""} placeholder="Match value" onChange={(event) => updateNode({ config: { routeOptions: options.map((item) => item.id === option.id ? { ...item, value: event.target.value } : item) } })} />}
+                          </div>
+                          <button className="mini-icon route-option-delete" disabled={options.length <= 1} aria-label={options.length <= 1 ? "At least one output is required" : `Remove ${option.label}`} title={options.length <= 1 ? "At least one output is required" : "Delete output"} onClick={() => removeRouteOption(selectedNode.id, option.id)}><Trash2 size={13} /></button>
+                        </div>
+                      ))}
+                      <small>{selectedNode.type === "ai-assigner" ? "Set when each output activates and what standalone prompt it should export. Multiple outputs can activate together; omitted outputs stay inactive." : "Connecting the last output automatically creates the next one."}</small>
+                    </div>
+                  )}
                   {selectedNode.type === "list-directory" && (
                     <>
                       <label className="field-label">Subfolder path<input value={selectedNode.config.subfolder || ""} placeholder="Optional relative subfolder" onChange={(event) => updateNode({ config: { subfolder: event.target.value } })} /><small className="field-help">May also be supplied through the string attribute port.</small></label>
@@ -4310,7 +4507,7 @@ export default function Workbench() {
             <div className="debug-panel-heading"><div><span className="eyebrow">Workflow debugger</span><strong>{activeWorkflow.name}</strong></div><button className="mini-icon" onClick={() => setDebugOpen(false)} aria-label="Close debugger"><PanelRightClose size={16} /></button></div>
             <div className="debug-summary"><span className={isRunning ? "live" : ""}><i /> {isRunning ? "Running" : "Idle"}</span><small>{debugEvents.length} step{debugEvents.length === 1 ? "" : "s"}</small><div className="debug-summary-actions"><button onClick={exportDebugLog} disabled={!debugEvents.length} aria-label="Export debug log" title="Download this chat's debug log"><Download size={10} /> Export log</button><button onClick={() => setDebugEvents([])} disabled={isRunning}>Clear</button></div></div>
             <div className="debug-events">
-              {debugEvents.length ? debugEvents.map((event, index) => <article className={`debug-event ${event.status}`} key={event.id}><span className="debug-rail">{index < debugEvents.length - 1 && <i />}</span><span className="debug-status-icon">{event.status === "running" ? <LoaderCircle size={14} className="spin" /> : event.status === "waiting" ? <MessageCircleQuestion size={14} /> : event.status === "routed" ? <Route size={14} /> : event.status === "error" ? <X size={14} /> : <Check size={14} />}</span><div><span><strong>{event.nodeName}</strong><small>{event.time}</small></span><b>{event.nodeType} · {event.status}</b><p>{event.detail}</p>{event.modelThinking && <details className="debug-thinking"><summary><BrainCircuit size={11} /> Model thinking</summary><pre>{event.modelThinking}</pre></details>}<DebugDataSection title="Inputs used" items={event.inputs} /><DebugDataSection title="Outputs produced" items={event.outputs} /></div></article>) : <div className="debug-empty"><Bug size={25} /><strong>No run recorded</strong><p>Send a message to see each workflow node execute here.</p></div>}
+              {debugEvents.length ? debugEvents.map((event, index) => <article className={`debug-event ${event.status}`} key={event.id}><span className="debug-rail">{index < debugEvents.length - 1 && <i />}</span><span className="debug-status-icon">{event.status === "running" ? <LoaderCircle size={14} className="spin" /> : event.status === "waiting" ? <MessageCircleQuestion size={14} /> : event.status === "routed" ? <Route size={14} /> : event.status === "error" ? <X size={14} /> : <Check size={14} />}</span><div><span><strong>{event.nodeName}</strong><small>{event.time}</small></span><b>{event.nodeType} · {event.status}</b><p>{event.detail}</p>{event.fileSource && <div className="debug-file-source"><FolderOpen size={12} /><span><small>Files loaded from</small><code title={event.fileSource}>{event.fileSource}</code></span></div>}{event.modelThinking && <details className="debug-thinking"><summary><BrainCircuit size={11} /> Model thinking</summary><pre>{event.modelThinking}</pre></details>}<DebugDataSection title="Inputs used" items={event.inputs} /><DebugDataSection title="Outputs produced" items={event.outputs} /></div></article>) : <div className="debug-empty"><Bug size={25} /><strong>No run recorded</strong><p>Send a message to see each workflow node execute here.</p></div>}
             </div>
             <button className="edit-flow-button" onClick={() => setTab("workflow")}><WorkflowIcon size={15} /> Open workflow editor</button>
           </aside>}

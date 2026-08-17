@@ -28,6 +28,13 @@ export function resolveNodeDirectory(
   return { directory: configuredNodeDirectory(config, defaultDirectory), subfolder: segments };
 }
 
+/** Formats a resolved directory and its validated subfolder as a readable source path. */
+export function displayNodeDirectory(directory: string, subfolder: string[] = []) {
+  if (!subfolder.length) return directory;
+  const separator = directory.includes("\\") ? "\\" : "/";
+  return `${directory.replace(/[\\/]+$/g, "")}${separator}${subfolder.join(separator)}`;
+}
+
 export function migrateLegacyNodeDirectory<T extends NodeDirectoryConfig>(config: T): T {
   if (!isAbsoluteDirectoryPath(config.subfolder)) return config;
   return {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { configuredNodeDirectory, migrateLegacyNodeDirectory, resolveNodeDirectory } from "../lib/node-directory.ts";
+import { configuredNodeDirectory, displayNodeDirectory, migrateLegacyNodeDirectory, resolveNodeDirectory } from "../lib/node-directory.ts";
 
 test("uses persistent node paths without a browser folder handle", () => {
   assert.equal(configuredNodeDirectory({ directoryPath: "D:\\work\\records" }, "user-data"), "D:\\work\\records");
@@ -32,4 +32,10 @@ test("keeps relative subfolders beneath the persistent directory", () => {
     () => resolveNodeDirectory({ directoryPath: "D:\\records", subfolder: "../outside" }, "user-data"),
     /unsupported segment/,
   );
+});
+
+test("shows the full resolved source path in the debugger", () => {
+  assert.equal(displayNodeDirectory("D:\\records", ["reports", "2026"]), "D:\\records\\reports\\2026");
+  assert.equal(displayNodeDirectory("user-data", ["reports", "2026"]), "user-data/reports/2026");
+  assert.equal(displayNodeDirectory("/srv/data/", ["reports"]), "/srv/data/reports");
 });

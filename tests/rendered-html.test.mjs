@@ -65,6 +65,29 @@ test("uses Start node settings for the chat agent and opening message", async ()
   assert.match(workbench, /meta: getStartSettings\(activeWorkflow, context\.syntax\)\.agentName/);
 });
 
+test("lets Start nodes select detailed chat, file, and session inputs", async () => {
+  const [workbench, startInputs] = await Promise.all([
+    readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/start-inputs.ts", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(workbench, />Current user message</);
+  assert.match(workbench, />Previous user messages</);
+  assert.match(workbench, />Assistant messages</);
+  assert.match(workbench, />System messages</);
+  assert.match(workbench, />Current message attachments</);
+  assert.match(workbench, />Attachments from earlier messages</);
+  assert.match(workbench, />Files saved with the workflow</);
+  assert.match(workbench, />Chat title, number, and session ID</);
+  assert.match(workbench, />Workflow name and description</);
+  assert.match(workbench, />Run date and time</);
+  assert.match(workbench, /Provider keys and private connection settings are never included/);
+  assert.match(workbench, /composeStartInputs/);
+  assert.match(startInputs, /Conversation history:/);
+  assert.match(startInputs, /startHistoryLimit \?\? 20/);
+  assert.match(startInputs, /startIncludeWorkflowFiles, true/);
+});
+
 test("runs one workflow from another through the Use Workflow node", async () => {
   const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
 

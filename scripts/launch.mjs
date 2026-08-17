@@ -4,6 +4,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 
+import { registerRunningApp } from "./operation-lock.mjs";
+
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const isWindows = process.platform === "win32";
 
@@ -96,24 +98,30 @@ async function openWhenReady(url, processState) {
 
 async function main() {
   ensureSupportedNode();
-  installDependenciesIfNeeded();
+  const registration = registerRunningApp(projectRoot);
+  try {
+    installDependenciesIfNeeded();
 
-  const port = await availablePort(requestedPort());
-  const url = `http://localhost:${port}/`;
-  console.log(`Starting Magic Conch at ${url}`);
-  console.log("Keep this window open; press Ctrl+C to stop.");
+    const port = await availablePort(requestedPort());
+    const url = `http://localhost:${port}/`;
+    console.log(`Starting Magic Conch at ${url}`);
+    console.log("Keep this window open; press Ctrl+C to stop.");
 
-  const npm = npmCommand(["run", "dev", "--", "--port", String(port), "--strictPort"]);
-  const child = spawn(npm.command, npm.args, { cwd: projectRoot, stdio: "inherit" });
-  const processState = { running: true };
-  void openWhenReady(url, processState);
+    const npm = npmCommand(["run", "dev", "--", "--port", String(port), "--strictPort"]);
+    const child = spawn(npm.command, npm.args, { cwd: projectRoot, stdio: "inherit" });
+    registration.addPid(child.pid);
+    const processState = { running: true };
+    void openWhenReady(url, processState);
 
-  const exitCode = await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code) => resolve(code ?? 1));
-  });
-  processState.running = false;
-  process.exitCode = exitCode;
+    const exitCode = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code) => resolve(code ?? 1));
+    });
+    processState.running = false;
+    process.exitCode = exitCode;
+  } finally {
+    registration.release();
+  }
 }
 
 main().catch((error) => {
