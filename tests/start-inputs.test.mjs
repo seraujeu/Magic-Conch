@@ -9,7 +9,6 @@ function details(overrides = {}) {
     currentMessage: "Latest request",
     currentFiles: [file("current.txt")],
     priorMessages: [],
-    workflowFiles: [file("workflow.txt")],
     session: { id: "session-7", number: 7, title: "Planning" },
     workflow: { name: "Planner", description: "Makes a plan" },
     start: { agentName: "Planning agent", startMessage: "What shall we plan?" },
@@ -19,11 +18,11 @@ function details(overrides = {}) {
   };
 }
 
-test("Start input defaults preserve the existing current-message and file behavior", () => {
+test("Start input defaults include current-message files", () => {
   const result = composeStartInputs({}, details());
 
   assert.equal(result.prompt, "Latest request");
-  assert.deepEqual(result.files.map((item) => item.name), ["workflow.txt", "current.txt"]);
+  assert.deepEqual(result.files.map((item) => item.name), ["current.txt"]);
   assert.equal(result.includedHistoryCount, 0);
   assert.equal(result.includedCurrentMessage, true);
 });
@@ -59,7 +58,7 @@ test("Start input selection filters history and adds requested session context",
   assert.match(result.prompt, /Start settings:[\s\S]*Planning agent[\s\S]*What shall we plan/);
   assert.match(result.prompt, /Run date and time:\n2026-08-17T02:03:04.000Z/);
   assert.match(result.prompt, /Additional context:\nPrepared on 2026-08-17/);
-  assert.deepEqual(result.files.map((item) => item.name), ["workflow.txt", "system.txt", "shared.txt", "answer.txt"]);
+  assert.deepEqual(result.files.map((item) => item.name), ["system.txt", "shared.txt", "answer.txt"]);
   assert.equal(result.includedHistoryCount, 2);
 });
 
@@ -67,7 +66,6 @@ test("Start input selection can omit chat text and every file source", () => {
   const result = composeStartInputs({
     startIncludeCurrentMessage: false,
     startIncludeCurrentFiles: false,
-    startIncludeWorkflowFiles: false,
   }, details());
 
   assert.equal(result.prompt, "");

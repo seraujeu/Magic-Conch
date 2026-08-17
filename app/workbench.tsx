@@ -129,7 +129,7 @@ import {
 import { isWorkflowNodeActive } from "../lib/workflow-scheduler";
 import { displayNodeDirectory, migrateLegacyNodeDirectory, resolveNodeDirectory } from "../lib/node-directory";
 import { collectWorkflowBundleDependencies, portableDependencySegment, remapPackagedWorkflowIds, workflowRuntimeNodeIds } from "../lib/workflow-bundle";
-import { applyBundledLoadSnapshots, bundledLoadResult, BundledLoadSnapshot, materializedLoadDirectory, workflowInputFiles } from "../lib/workflow-load-bundle";
+import { applyBundledLoadSnapshots, bundledLoadResult, BundledLoadSnapshot, materializedLoadDirectory } from "../lib/workflow-load-bundle";
 import { workflowArchiveFilename, workflowExportFilename, workflowFileText } from "../lib/workflow-files";
 import { createDebugLog, debugLogFilename } from "../lib/debug-log";
 import { buildAIWorkAssignerSystemPrompt, parseAIWorkAssignments } from "../lib/ai-work-assigner";
@@ -180,7 +180,6 @@ type FlowNode = {
     startIncludeMessageTimes?: boolean;
     startIncludeCurrentFiles?: boolean;
     startIncludePriorFiles?: boolean;
-    startIncludeWorkflowFiles?: boolean;
     startIncludeSessionInfo?: boolean;
     startIncludeWorkflowInfo?: boolean;
     startIncludeStartSettings?: boolean;
@@ -698,7 +697,9 @@ function migrateWorkflow(workflow: Workflow, plugins: MagicConchPlugin[]): Workf
   }
 
   const nodes = workflow.nodes.map((originalNode) => {
-    const node = { ...originalNode, config: migrateLegacyNodeDirectory(originalNode.config) };
+    const config = { ...migrateLegacyNodeDirectory(originalNode.config) } as FlowNode["config"] & { startIncludeWorkflowFiles?: boolean };
+    delete config.startIncludeWorkflowFiles;
+    const node = { ...originalNode, config };
     if (node.type === "math") {
       const inputs = node.config.mathInputs?.length ? [...node.config.mathInputs] : [];
       const incomingIds = [...new Set(migrated
@@ -739,7 +740,15 @@ function migrateWorkflow(workflow: Workflow, plugins: MagicConchPlugin[]): Workf
     return { ...node, config: { ...node.config, joinInputs: inputs } };
   });
 
-  return { ...workflow, version: Math.max(4, workflow.version || 1), nodes, edges: migrated };
+  const bundledNodeIds = new Set(Object.keys(workflow.bundledLoads || {}));
+  const files = (workflow.files || []).filter((file) => file.bundleLoadNodeId && bundledNodeIds.has(file.bundleLoadNodeId));
+  return {
+    ...workflow,
+    version: Math.max(4, workflow.version || 1),
+    nodes,
+    edges: migrated,
+    files: files.length ? files : undefined,
+  };
 }
 
 async function materializeWorkflowLoadFiles(workflow: Workflow) {
@@ -785,6 +794,13 @@ async function materializeWorkflowLoadFiles(workflow: Workflow) {
     files,
     bundledLoads: Object.keys(remainingLoads).length ? remainingLoads : undefined,
   };
+}
+
+function workflowJsonManifest(workflow: Workflow): Workflow {
+  const manifest = { ...workflow };
+  delete manifest.files;
+  delete manifest.bundledLoads;
+  return manifest;
 }
 
 function evaluateRouteRule(node: FlowNode, prompt: string, files: FileAsset[], optionValue?: string) {
@@ -1021,7 +1037,6 @@ function startInputDetails(
     currentMessage,
     currentFiles,
     priorMessages,
-    workflowFiles: workflowInputFiles(workflow),
     session: {
       id: syntax.chatSessionId,
       number: syntax.chatSessionNumber,
@@ -1232,7 +1247,6 @@ export default function Workbench() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pluginInputRef = useRef<HTMLInputElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
-  const workflowAssetInputRef = useRef<HTMLInputElement>(null);
   const chatSessionTitleInputRef = useRef<HTMLInputElement>(null);
   const chatFolderNameInputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -2482,41 +2496,6 @@ export default function Workbench() {
     await writable.close();
   }
 
-  async function fileExists(folder: DirectoryHandle, filename: string) {
-    try {
-      await folder.getFileHandle(filename);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  async function collisionSafeName(
-    folder: DirectoryHandle,
-    filename: string,
-    collision: FlowNode["config"]["collision"] = "increment",
-  ) {
-    if (collision === "overwrite" || !(await fileExists(folder, filename))) return filename;
-    const dot = filename.lastIndexOf(".");
-    const stem = dot > 0 ? filename.slice(0, dot) : filename;
-    const extension = dot > 0 ? filename.slice(dot) : "";
-    if (collision === "timestamp") {
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-      return `${stem}-${stamp}${extension}`;
-    }
-    let index = 2;
-    while (await fileExists(folder, `${stem}-${index}${extension}`)) index += 1;
-    return `${stem}-${index}${extension}`;
-  }
-
-  async function writeAssetToFolder(folder: DirectoryHandle, asset: FileAsset, filename: string) {
-    const file = await folder.getFileHandle(filename, { create: true });
-    const writable = await file.createWritable();
-    const response = await fetch(asset.data);
-    await writable.write(await response.blob());
-    await writable.close();
-  }
-
   function localRecordKey(safeKey: string, segments: string[]) {
     return `magic-conch-record:${segments.length ? `${segments.join("/")}/` : ""}${safeKey}`;
   }
@@ -2566,15 +2545,6 @@ export default function Workbench() {
     });
   }
 
-  async function addWorkflowFiles(event: ChangeEvent<HTMLInputElement>) {
-    const assets = await Promise.all(Array.from(event.target.files || []).map(readFileAsset));
-    if (assets.length) {
-      updateWorkflow((workflow) => ({ ...workflow, files: [...(workflow.files || []), ...assets] }));
-      showToast(`${assets.length} workflow file${assets.length === 1 ? "" : "s"} added`);
-    }
-    event.target.value = "";
-  }
-
   async function addMessageFiles(event: ChangeEvent<HTMLInputElement>) {
     const assets = await Promise.all(Array.from(event.target.files || []).map(readFileAsset));
     setAttachedFiles((current) => [...current, ...assets]);
@@ -2615,11 +2585,7 @@ export default function Workbench() {
     if (!activeWorkflow) return;
     if (workflowFolder) {
       const filename = workflowExportFilename(activeWorkflow.name);
-      await writeJsonToFolder(workflowFolder, filename, activeWorkflow);
-      for (const asset of activeWorkflow.files || []) {
-        const assetName = await collisionSafeName(workflowFolder, asset.name, "increment");
-        await writeAssetToFolder(workflowFolder, asset, assetName);
-      }
+      await writeJsonToFolder(workflowFolder, filename, workflowJsonManifest(activeWorkflow));
       showToast(`Saved to ${workflowFolder.name}`);
     } else {
       showToast("Saved in this browser");
@@ -2627,7 +2593,7 @@ export default function Workbench() {
   }
 
   function exportWorkflow() {
-    const json = JSON.stringify(activeWorkflow, null, 2);
+    const json = JSON.stringify(workflowJsonManifest(activeWorkflow), null, 2);
     const blob = new Blob([new TextEncoder().encode(json)], {
       type: "application/json;charset=utf-8",
     });
@@ -4043,11 +4009,9 @@ export default function Workbench() {
               <div className="workflow-toolbar-actions">
                 <button className="icon-button" onClick={undoWorkflow} aria-label="Undo last workflow change" title="Undo (Ctrl+Z)"><Undo2 size={16} /></button>
                 <button className="icon-button" onClick={redoWorkflow} aria-label="Redo workflow change" title="Redo (Ctrl+Shift+Z)"><Redo2 size={16} /></button>
-                <button className="secondary-button" onClick={() => workflowAssetInputRef.current?.click()}><Paperclip size={15} /> Files {workflowInputFiles(activeWorkflow).length ? `(${workflowInputFiles(activeWorkflow).length})` : ""}</button>
                 <button className="secondary-button" onClick={saveWorkflow}><Save size={15} /> Save</button>
                 <button className="primary-button" onClick={openWorkflowChat}><Play size={15} fill="currentColor" /> Test workflow</button>
                 <button className="icon-button hide-mobile" aria-label="More options"><MoreHorizontal size={18} /></button>
-                <input ref={workflowAssetInputRef} type="file" multiple hidden onChange={addWorkflowFiles} />
               </div>
             </div>
 
@@ -4218,7 +4182,6 @@ export default function Workbench() {
                         <div className="start-input-fields">
                           <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludeCurrentFiles !== false} onChange={(event) => updateNode({ config: { startIncludeCurrentFiles: event.target.checked } })} /><span>Current message attachments</span></label>
                           <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludePriorFiles === true} onChange={(event) => updateNode({ config: { startIncludePriorFiles: event.target.checked } })} /><span>Attachments from earlier messages</span></label>
-                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.startIncludeWorkflowFiles !== false} onChange={(event) => updateNode({ config: { startIncludeWorkflowFiles: event.target.checked } })} /><span>Files saved with the workflow</span></label>
                         </div>
                       </details>
                       <details className="start-input-group">

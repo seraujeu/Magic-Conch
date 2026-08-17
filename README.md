@@ -13,8 +13,8 @@ It runs as a local web application and stores personal state on your device.
 
 The editor, chat, AI providers, workflow import/export, and browser-backed
 storage are portable across the supported operating systems. Workflows can be
-transferred as JSON, or as ZIP bundles containing `workflow.json` and their
-attached files. Save, Load, and Load Directory nodes use the local application
+transferred as JSON, or as ZIP bundles containing `workflow.json`, dependencies,
+and snapshots of files read by Load nodes. Save, Load, and Load Directory nodes use the local application
 service with persistent relative or absolute paths; they do not require browser
 folder permission. The optional workflow-folder picker uses the File System
 Access API in Chrome and Edge. Workflow JSON and ZIP import/export remain
@@ -52,7 +52,7 @@ Browser storage is isolated by URL, browser profile, and device.
 
 Magic Conch keeps these items outside the source repository:
 
-- chat sessions, workflows, installed plug-ins, and their bundled files (IndexedDB)
+- chat sessions, workflows, installed plug-ins, and imported ZIP snapshots (IndexedDB)
 - chat folders and provider settings/keys (local storage)
 - an optional remembered workflow-folder handle (IndexedDB)
 - Save/Load node output (`user-data/` by default)
@@ -66,9 +66,8 @@ can provide its own persistent path without a browser picker or permission promp
 Updating source files does not clear those stores. Personal data is not moved
 to another computer automatically. Use **Export JSON** for a single manifest,
 or **Export with files** for a self-contained ZIP. The ZIP includes separate
-copies of every workflow attachment, every transitively called workflow and its
-attachments, and the installed plug-ins used by those workflows together with
-their bundled files. It also reads the current results of Load and Load
+copies of every transitively called workflow and the installed plug-ins used by
+those workflows together with their bundled files. It also reads the current results of Load and Load
 Directory nodes—including folder-mode Load nodes—and packages their values and
 files as runtime snapshots. Files captured by different Load nodes are kept in
 separate ZIP directories, and recursive folder loads retain their relative

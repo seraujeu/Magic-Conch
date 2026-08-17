@@ -77,7 +77,7 @@ test("lets Start nodes select detailed chat, file, and session inputs", async ()
   assert.match(workbench, />System messages</);
   assert.match(workbench, />Current message attachments</);
   assert.match(workbench, />Attachments from earlier messages</);
-  assert.match(workbench, />Files saved with the workflow</);
+  assert.doesNotMatch(workbench, />Files saved with the workflow</);
   assert.match(workbench, />Chat title, number, and session ID</);
   assert.match(workbench, />Workflow name and description</);
   assert.match(workbench, />Run date and time</);
@@ -85,7 +85,21 @@ test("lets Start nodes select detailed chat, file, and session inputs", async ()
   assert.match(workbench, /composeStartInputs/);
   assert.match(startInputs, /Conversation history:/);
   assert.match(startInputs, /startHistoryLimit \?\? 20/);
-  assert.match(startInputs, /startIncludeWorkflowFiles, true/);
+  assert.doesNotMatch(startInputs, /startIncludeWorkflowFiles/);
+});
+
+test("removes workflow attachments while keeping ZIP Load snapshots", async () => {
+  const [workbench, loadBundle] = await Promise.all([
+    readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/workflow-load-bundle.ts", import.meta.url), "utf8"),
+  ]);
+
+  assert.doesNotMatch(workbench, /workflowAssetInputRef|addWorkflowFiles|workflowInputFiles/);
+  assert.match(workbench, /function workflowJsonManifest/);
+  assert.match(workbench, /delete manifest\.files/);
+  assert.match(workbench, /captureWorkflowLoadFiles/);
+  assert.match(workbench, /Export with files/);
+  assert.match(loadBundle, /snapshot\.files\.map\(\(file\) => \(\{ \.\.\.file, bundleLoadNodeId: nodeId \}\)\)/);
 });
 
 test("provides a Chat Session source node with typed history and metadata outputs", async () => {

@@ -21,7 +21,6 @@ export type StartInputConfig = {
   startIncludeMessageTimes?: boolean;
   startIncludeCurrentFiles?: boolean;
   startIncludePriorFiles?: boolean;
-  startIncludeWorkflowFiles?: boolean;
   startIncludeSessionInfo?: boolean;
   startIncludeWorkflowInfo?: boolean;
   startIncludeStartSettings?: boolean;
@@ -33,7 +32,6 @@ export type StartInputDetails<F extends StartInputFile = StartInputFile> = {
   currentMessage: string;
   currentFiles: F[];
   priorMessages: StartInputMessage<F>[];
-  workflowFiles: F[];
   session: { id: string; number: number; title: string };
   workflow: { name: string; description: string };
   start: { agentName: string; startMessage: string };
@@ -123,7 +121,6 @@ export function composeStartInputs<F extends StartInputFile>(
     : sections.join("\n\n");
 
   const files = distinctFiles([
-    ...(enabled(config.startIncludeWorkflowFiles, true) ? details.workflowFiles : []),
     ...(enabled(config.startIncludePriorFiles, false) ? details.priorMessages.flatMap((message) => message.files || []) : []),
     ...(enabled(config.startIncludeCurrentFiles, true) ? details.currentFiles : []),
   ]);

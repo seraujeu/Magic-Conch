@@ -16,10 +16,6 @@ export type WorkflowWithBundledLoads<F extends BundledLoadFileAsset = BundledLoa
   bundledLoads?: Record<string, { value: string }>;
 };
 
-export function workflowInputFiles<F extends BundledLoadFileAsset>(workflow: WorkflowWithBundledLoads<F>) {
-  return (workflow.files || []).filter((file) => !file.bundleLoadNodeId);
-}
-
 export function bundledLoadResult<F extends BundledLoadFileAsset>(
   workflow: WorkflowWithBundledLoads<F>,
   nodeId: string,
@@ -40,14 +36,13 @@ export function applyBundledLoadSnapshots<
   F extends BundledLoadFileAsset,
   W extends WorkflowWithBundledLoads<F>,
 >(workflow: W, snapshots: Record<string, BundledLoadSnapshot<F>>): W {
-  const regularFiles = workflowInputFiles(workflow);
   const bundledLoads = Object.fromEntries(
     Object.entries(snapshots).map(([nodeId, snapshot]) => [nodeId, { value: snapshot.value }]),
   );
   const loadFiles = Object.entries(snapshots).flatMap(([nodeId, snapshot]) =>
     snapshot.files.map((file) => ({ ...file, bundleLoadNodeId: nodeId })),
   );
-  return { ...workflow, files: [...regularFiles, ...loadFiles], bundledLoads } as W;
+  return { ...workflow, files: loadFiles, bundledLoads } as W;
 }
 
 function materializedPathSegment(value: string, fallback: string) {

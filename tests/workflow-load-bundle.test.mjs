@@ -1,17 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyBundledLoadSnapshots, bundledLoadResult, materializedLoadDirectory, workflowInputFiles } from "../lib/workflow-load-bundle.ts";
+import { applyBundledLoadSnapshots, bundledLoadResult, materializedLoadDirectory } from "../lib/workflow-load-bundle.ts";
 
 const regular = { name: "prompt.txt", type: "text/plain", size: 6, data: "data:text/plain;base64,cHJvbXB0" };
 const loaded = { name: "input.txt", type: "text/plain", size: 5, data: "data:text/plain;base64,aW5wdXQ=" };
 
-test("keeps runtime Load files separate from ordinary workflow inputs", () => {
+test("packages only runtime Load files and discards legacy workflow attachments", () => {
   const workflow = applyBundledLoadSnapshots({ files: [regular] }, {
     "load-1": { value: "loaded value", files: [loaded] },
   });
 
-  assert.deepEqual(workflowInputFiles(workflow), [regular]);
-  assert.equal(workflow.files?.[1].bundleLoadNodeId, "load-1");
+  assert.deepEqual(workflow.files, [{ ...loaded, bundleLoadNodeId: "load-1" }]);
   assert.deepEqual(bundledLoadResult(workflow, "load-1"), {
     value: "loaded value",
     files: [loaded],
@@ -29,7 +28,7 @@ test("replacing snapshots removes stale packaged Load files", () => {
 
   assert.equal(bundledLoadResult(replaced, "load-1"), null);
   assert.equal(bundledLoadResult(replaced, "load-2")?.files[0].name, "new.txt");
-  assert.deepEqual(workflowInputFiles(replaced), [regular]);
+  assert.deepEqual(replaced.files, [{ ...loaded, name: "new.txt", bundleLoadNodeId: "load-2" }]);
 });
 
 test("creates corresponding user-data locations for imported Load nodes", () => {
