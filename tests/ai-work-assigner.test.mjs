@@ -67,3 +67,13 @@ test("new assigner nodes include a detailed editable reference system prompt", a
   assert.match(workbench, /Write a complete, standalone instruction that can be sent directly to another AI model/);
   assert.match(workbench, /systemPrompt: DEFAULT_AI_WORK_ASSIGNER_SYSTEM_PROMPT/);
 });
+
+test("AI-powered routing nodes accept every file input and send attachments to the model", async () => {
+  const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
+  assert.match(workbench, /const fileInputs: PortSpec\[\] = \[\{ id: "files"[\s\S]*\.\.\.mediaInputs, documentIn\];/);
+  assert.match(workbench, /if \(node\.type === "ai-assigner"\)[\s\S]*?inputs: \[[^\n]+\.\.\.fileInputs\]/);
+  assert.match(workbench, /if \(node\.type === "router-ai" \|\| node\.type === "router-rule"\)[\s\S]*?inputs: \[[^\n]+\.\.\.fileInputs\]/);
+  assert.match(workbench, /if \(node\.type === "condition-ai" \|\| node\.type === "condition-rule"\)[\s\S]*?inputs: \[[^\n]+\.\.\.fileInputs\]/);
+  assert.match(workbench, /if \(node\.type === "ai-assigner"\)[\s\S]*?fileAssetsPromptSections\(fileInput\)[\s\S]*?files: fileInput/);
+  assert.match(workbench, /if \(node\.type === "router-ai"\)[\s\S]*?fileAssetsPromptSections\(fileInput\)[\s\S]*?files: fileInput/);
+});

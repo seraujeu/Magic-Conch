@@ -520,6 +520,7 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
   const documentOut: PortSpec = { id: "document", label: "document", type: "document" };
   const mediaInputs: PortSpec[] = [{ id: "image", label: "image", type: "image" }, { id: "video", label: "video", type: "video" }, { id: "audio", label: "audio", type: "audio" }];
   const mediaOutputs: PortSpec[] = [{ id: "image", label: "image", type: "image" }, { id: "video", label: "video", type: "video" }, { id: "audio", label: "audio", type: "audio" }];
+  const fileInputs: PortSpec[] = [{ id: "files", label: "files", type: "files" }, ...mediaInputs, documentIn];
   if (node.type === "start") return { inputs: [{ id: "agent_name", label: "agent name", type: "string" }, { id: "start_message", label: "start message", type: "string" }], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
   if (node.type === "chat-session") return {
     inputs: [],
@@ -542,7 +543,7 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
   if (node.type === "ai-assigner") {
     const outputs = node.config.routeOptions?.length ? node.config.routeOptions : [{ id: "output-1", label: "Output 1" }];
     return {
-      inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "system_prompt", label: "system prompt", type: "string" }, { id: "model", label: "model", type: "string" }, { id: "temperature", label: "temperature", type: "float" }],
+      inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "system_prompt", label: "system prompt", type: "string" }, { id: "model", label: "model", type: "string" }, { id: "temperature", label: "temperature", type: "float" }, ...fileInputs],
       outputs: outputs.map((option) => ({ id: option.id, label: option.label, type: "prompt" as const })),
     };
   }
@@ -589,7 +590,7 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
   }
   if (node.type === "condition-ai" || node.type === "condition-rule") {
     return {
-      inputs: [{ id: "value", label: "value", type: "any" }, { id: "gate", label: "if / elif gate", type: "boolean" }, { id: "files", label: "files", type: "files" }, { id: "document", label: "document", type: "document" }],
+      inputs: [{ id: "value", label: "value", type: "any" }, { id: "gate", label: "if / elif gate", type: "boolean" }, ...fileInputs],
       outputs: [{ id: "true", label: "true / if", type: "boolean" }, { id: "false", label: "false / else", type: "boolean" }],
     };
   }
@@ -602,7 +603,7 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
           ...(node.config.routeBLabel ? [{ id: "route-2", label: node.config.routeBLabel, value: "" }] : []),
         ];
     return {
-      inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }],
+      inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, ...fileInputs],
       outputs: routeOptions.map((option) => ({ id: option.id, label: option.label, type: "prompt" as const })),
     };
   }
@@ -3224,7 +3225,8 @@ export default function Workbench() {
                 exportInstruction: option.exportInstruction,
               })),
             ),
-            prompt: String(promptInput),
+            prompt: [String(promptInput), ...fileAssetsPromptSections(fileInput)].filter(Boolean).join("\n\n"),
+            files: fileInput,
             openai: provider === "openai" ? openAIRequestSettings(node) : undefined,
             gemini: provider === "gemini" ? geminiRequestSettings(node) : undefined,
             claude: provider === "claude" ? claudeRequestSettings(node) : undefined,
@@ -3442,7 +3444,10 @@ export default function Workbench() {
             model: node.config.model || modelDefaults[provider],
             temperature: 0,
             systemPrompt: "You are a boolean condition evaluator. Reply with only true or false. Do not explain your answer.",
-            prompt: `Condition:\n${node.config.routeCriteria || "Return true when the input satisfies the condition."}\n\nInput:\n${stringifyValue(value)}${fileInput.length ? `\n\nAttached files:\n${fileInput.map((file) => `- ${file.name} (${file.type || "unknown type"})`).join("\n")}` : ""}`,
+            prompt: [
+              `Condition:\n${node.config.routeCriteria || "Return true when the input satisfies the condition."}\n\nInput:\n${stringifyValue(value)}`,
+              ...fileAssetsPromptSections(fileInput),
+            ].filter(Boolean).join("\n\n"),
             files: fileInput,
             openai: provider === "openai" ? openAIRequestSettings(node) : undefined,
             gemini: provider === "gemini" ? geminiRequestSettings(node) : undefined,
@@ -3484,7 +3489,11 @@ export default function Workbench() {
             model: node.config.model || modelDefaults[provider],
             temperature: 0,
             systemPrompt: `You are a routing classifier. Reply with only the option number from 1 to ${options.length}.`,
-            prompt: `${node.config.routeCriteria || "Choose the best path."}\n\n${options.map((option, index) => `${index + 1}. ${option.label}`).join("\n")}\n\nInput:\n${String(promptInput)}`,
+            prompt: [
+              `${node.config.routeCriteria || "Choose the best path."}\n\n${options.map((option, index) => `${index + 1}. ${option.label}`).join("\n")}\n\nInput:\n${String(promptInput)}`,
+              ...fileAssetsPromptSections(fileInput),
+            ].filter(Boolean).join("\n\n"),
+            files: fileInput,
             openai: provider === "openai" ? openAIRequestSettings(node) : undefined,
             gemini: provider === "gemini" ? geminiRequestSettings(node) : undefined,
             claude: provider === "claude" ? claudeRequestSettings(node) : undefined,
