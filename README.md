@@ -97,12 +97,20 @@ From a Git clone:
 - macOS/Linux: run `sh "Update Magic Conch.sh"`
 - Any system: run `npm run update`
 
-The updater requires the folder to be a usable Git clone and requires Git to be
-installed. A folder downloaded as a ZIP, copied without its complete hidden
-`.git/` directory, or copied from a linked Git worktree can still launch
-normally, but it cannot update itself; download a fresh copy or make a new
-clone instead. On Windows, the updater also checks the standard Git for Windows
-install locations when Git is not on `PATH`.
+The updater requires Git to be installed. On Windows, it also checks the
+standard Git for Windows install locations when Git is not on `PATH`. A folder
+downloaded as a ZIP, copied without its complete hidden `.git/` directory, or
+copied from a linked Git worktree is migrated automatically on its first
+update. The updater prepares and verifies a fresh clone, installs its ordinary
+`.git/` metadata, and uses the normal fast-forward update path afterward.
+
+During that first ZIP migration, ignored personal data and configuration remain
+in place. Official program files are replaced by the verified clone. Previous
+versions of replaced files and non-ignored files that the new repository does
+not recognize are retained under `.runtime/zip-install-backup-<id>/`; delete
+that backup only after confirming the migrated installation works. Because a
+ZIP has no revision history, `--check` can report the latest available revision
+but cannot determine how many updates separate it from the installed copy.
 
 Close every running Magic Conch launcher before updating. The updater uses an
 exclusive lock, fetches the requested branch into a private Git ref, and only

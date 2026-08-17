@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rename,
   rm,
   writeFile,
@@ -86,6 +87,7 @@ async function createUpdaterFixture(t) {
   const remote = join(root, "remote.git");
   const seed = join(root, "seed");
   const active = join(root, "active");
+  const zipActive = join(root, "zip-active");
   const fakeBin = join(root, "fake-bin");
   const npmLog = join(root, "npm.log");
 
@@ -100,7 +102,7 @@ async function createUpdaterFixture(t) {
   }
   await writeFile(join(seed, ".gitignore"), [
     "/.runtime/", "/node_modules/", "/user-data/", "/chats/", "/workflows/",
-    "/backups/", "/exports/", "/plugins/*", "!/plugins/README.md", "",
+    "/backups/", "/exports/", "/plugins/*", "!/plugins/README.md", ".env*", ".npmrc", "",
   ].join("\n"), "utf8");
   await writeFile(join(seed, "plugins", "README.md"), "# Plug-ins\n", "utf8");
   await writeFile(join(seed, "package.json"), "{\"private\":true}\n", "utf8");
@@ -111,9 +113,13 @@ async function createUpdaterFixture(t) {
   git(seed, ["remote", "add", "origin", remote]);
   git(seed, ["push", "-u", "origin", "main"]);
   git(root, ["clone", remote, active]);
+  git(root, ["clone", remote, zipActive]);
+  await rm(join(zipActive, ".git"), { recursive: true, force: true });
 
   await mkdir(join(active, "node_modules"));
   await writeFile(join(active, "node_modules", "old.txt"), "old dependencies\n", "utf8");
+  await mkdir(join(zipActive, "node_modules"));
+  await writeFile(join(zipActive, "node_modules", "old.txt"), "old ZIP dependencies\n", "utf8");
   await createFakeNpm(fakeBin);
   const environment = {
     ...process.env,
@@ -125,13 +131,19 @@ async function createUpdaterFixture(t) {
     FAKE_NPM_FAIL_TEST: "0",
   };
   const updater = join(active, "scripts", "update-from-github.mjs");
+  const zipUpdater = join(zipActive, "scripts", "update-from-github.mjs");
   const runUpdater = (args, overrides = {}) => command(process.execPath, [updater, ...args], {
     cwd: active,
     env: { ...environment, ...overrides },
     allowFailure: true,
   });
+  const runZipUpdater = (args, overrides = {}) => command(process.execPath, [zipUpdater, ...args], {
+    cwd: zipActive,
+    env: { ...environment, ...overrides },
+    allowFailure: true,
+  });
 
-  return { active, environment, npmLog, remote, runUpdater, seed };
+  return { active, environment, npmLog, remote, runUpdater, runZipUpdater, seed, zipActive };
 }
 
 test("rejects unknown update options before doing work", () => {
@@ -207,4 +219,66 @@ test("prepares updates before merging and recovers interrupted dependency swaps"
   assert.equal(protectedUpdate.status, 1);
   assert.match(protectedUpdate.stderr, /protected local-data paths/);
   assert.equal((await readFile(join(fixture.active, "version.txt"), "utf8")).trim(), "2");
+});
+
+test("migrates a ZIP installation without replacing ignored personal data", async (t) => {
+  const fixture = await createUpdaterFixture(t);
+  await mkdir(join(fixture.zipActive, "user-data"));
+  await writeFile(join(fixture.zipActive, "user-data", "state.json"), "{\"saved\":true}\n", "utf8");
+  await writeFile(join(fixture.zipActive, "plugins", "local-plugin.js"), "// local plug-in\n", "utf8");
+  await writeFile(join(fixture.zipActive, ".env.local"), "LOCAL_SECRET=preserved\n", "utf8");
+  await writeFile(join(fixture.zipActive, "retired-source.txt"), "keep this backup\n", "utf8");
+
+  const recoveryToken = randomUUID();
+  const recoveryRuntime = join(fixture.zipActive, ".runtime");
+  const recoveryBackup = join(recoveryRuntime, `zip-install-backup-${recoveryToken}`, "replaced");
+  await mkdir(recoveryBackup, { recursive: true });
+  await rename(join(fixture.zipActive, "version.txt"), join(recoveryBackup, "version.txt"));
+  await writeFile(join(fixture.zipActive, "version.txt"), "partial migration\n", "utf8");
+  await writeFile(join(recoveryRuntime, "update-transaction.json"), `${JSON.stringify({
+    version: 1,
+    mode: "bootstrap",
+    token: recoveryToken,
+    phase: "deploying",
+    candidateRevision: git(fixture.seed, ["rev-parse", "HEAD"]).stdout.trim(),
+    appliedPaths: ["version.txt"],
+    movedUntrackedPaths: [],
+    pendingPath: null,
+    pendingUntrackedPath: null,
+  })}\n`, "utf8");
+  const recoveredCheck = fixture.runZipUpdater(["--check"]);
+  assert.equal(recoveredCheck.status, 0, `${recoveredCheck.stdout}\n${recoveredCheck.stderr}`);
+  assert.match(recoveredCheck.stdout, /rolled back safely/);
+  assert.equal((await readFile(join(fixture.zipActive, "version.txt"), "utf8")).trim(), "1");
+
+  await commitVersion(fixture.seed, 2);
+
+  const failed = fixture.runZipUpdater(["--skip-tests"], { FAKE_NPM_FAIL_CI: "1" });
+  assert.equal(failed.status, 1);
+  assert.equal((await readFile(join(fixture.zipActive, "version.txt"), "utf8")).trim(), "1");
+  assert.equal(await readFile(join(fixture.zipActive, "node_modules", "old.txt"), "utf8"), "old ZIP dependencies\n");
+  assert.equal(git(fixture.zipActive, ["rev-parse", "--is-inside-work-tree"], { allowFailure: true }).status, 128);
+
+  const migrated = fixture.runZipUpdater([]);
+  assert.equal(migrated.status, 0, `${migrated.stdout}\n${migrated.stderr}`);
+  assert.match(migrated.stdout, /migrated to a Git-managed installation/);
+  assert.equal((await readFile(join(fixture.zipActive, "version.txt"), "utf8")).trim(), "2");
+  assert.equal((await readFile(join(fixture.zipActive, "node_modules", "prepared.txt"), "utf8")).trim(), "prepared");
+  assert.equal(await readFile(join(fixture.zipActive, "user-data", "state.json"), "utf8"), "{\"saved\":true}\n");
+  assert.equal(await readFile(join(fixture.zipActive, "plugins", "local-plugin.js"), "utf8"), "// local plug-in\n");
+  assert.equal(await readFile(join(fixture.zipActive, ".env.local"), "utf8"), "LOCAL_SECRET=preserved\n");
+  assert.equal(git(fixture.zipActive, ["status", "--porcelain"]).stdout, "");
+
+  const runtimeEntries = await readdir(join(fixture.zipActive, ".runtime"));
+  const backupName = runtimeEntries.find((entry) => entry.startsWith("zip-install-backup-"));
+  assert.ok(backupName);
+  assert.equal(
+    await readFile(join(fixture.zipActive, ".runtime", backupName, "untracked", "retired-source.txt"), "utf8"),
+    "keep this backup\n",
+  );
+
+  await commitVersion(fixture.seed, 3);
+  const subsequentUpdate = fixture.runZipUpdater(["--skip-tests"]);
+  assert.equal(subsequentUpdate.status, 0, `${subsequentUpdate.stdout}\n${subsequentUpdate.stderr}`);
+  assert.equal((await readFile(join(fixture.zipActive, "version.txt"), "utf8")).trim(), "3");
 });
