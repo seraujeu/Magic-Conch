@@ -120,11 +120,11 @@ export async function performOcr(
         continue;
       }
 
-      const pdfjs = await import("pdfjs-dist");
-      pdfjs.GlobalWorkerOptions.workerSrc = new URL(
-        "../node_modules/pdfjs-dist/build/pdf.worker.min.mjs",
-        import.meta.url,
-      ).toString();
+      const [pdfjs, pdfWorker] = await Promise.all([
+        import("pdfjs-dist"),
+        import("pdfjs-dist/build/pdf.worker.min.mjs?url"),
+      ]);
+      pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker.default;
       const loadingTask = pdfjs.getDocument({ data: dataUrlBytes(file.data), useWasm: false });
       const pdf = await loadingTask.promise;
       const pageTexts: string[] = [];
