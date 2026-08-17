@@ -88,6 +88,22 @@ test("lets Start nodes select detailed chat, file, and session inputs", async ()
   assert.match(startInputs, /startIncludeWorkflowFiles, true/);
 });
 
+test("provides a Chat Session source node with typed history and metadata outputs", async () => {
+  const [workbench, loader] = await Promise.all([
+    readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/chat-session-node.ts", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(workbench, /"chat-session": \{ label: "Chat Session"/);
+  assert.match(workbench, /id: "history", label: "history", type: "prompt"/);
+  assert.match(workbench, /id: "messages", label: "messages", type: "any"/);
+  assert.match(workbench, /id: "session_id", label: "session ID", type: "string"/);
+  assert.match(workbench, /id: "message_count", label: "message count", type: "integer"/);
+  assert.match(workbench, />Expose attachments from selected messages</);
+  assert.match(workbench, /loadChatSession\(node\.config, context\.chatSession\)/);
+  assert.match(loader, /totalPreviousMessageCount/);
+});
+
 test("runs one workflow from another through the Use Workflow node", async () => {
   const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
 

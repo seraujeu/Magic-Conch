@@ -23,6 +23,7 @@ import {
   FolderOpen,
   GitBranch,
   HardDrive,
+  History,
   Info,
   KeyRound,
   LoaderCircle,
@@ -133,8 +134,9 @@ import { workflowArchiveFilename, workflowExportFilename, workflowFileText } fro
 import { createDebugLog, debugLogFilename } from "../lib/debug-log";
 import { buildAIWorkAssignerSystemPrompt, parseAIWorkAssignments } from "../lib/ai-work-assigner";
 import { composeStartInputs } from "../lib/start-inputs";
+import { loadChatSession } from "../lib/chat-session-node";
 
-type BuiltinNodeType = "start" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
+type BuiltinNodeType = "start" | "chat-session" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
 type FileAsset = { name: string; type: string; data: string; size: number; bundleLoadNodeId?: string };
 type PortDataType = "prompt" | "files" | "document" | "text" | "number" | "boolean" | "string" | "integer" | "float" | "image" | "video" | "audio" | "any";
@@ -151,6 +153,13 @@ type WorkflowContext = {
   files: FileAsset[];
   values: Record<string, unknown>;
   syntax: WorkflowSyntaxContext;
+  chatSession: {
+    id: string;
+    number: number;
+    title: string;
+    updatedAt: string;
+    messages: Message[];
+  };
   workflowStack?: string[];
 };
 type FlowNode = {
@@ -177,6 +186,12 @@ type FlowNode = {
     startIncludeStartSettings?: boolean;
     startIncludeRunDateTime?: boolean;
     startAdditionalContext?: string;
+    sessionIncludeUserMessages?: boolean;
+    sessionIncludeAssistantMessages?: boolean;
+    sessionIncludeSystemMessages?: boolean;
+    sessionHistoryLimit?: number;
+    sessionIncludeMessageTimes?: boolean;
+    sessionIncludeAttachments?: boolean;
     provider?: AIProvider;
     model?: string;
     systemPrompt?: string;
@@ -426,6 +441,7 @@ const NODE_META: Record<
   { label: string; subtitle: string; color: string; icon: typeof Play }
 > = {
   start: { label: "Start", subtitle: "Entry point", color: "#27a36a", icon: Play },
+  "chat-session": { label: "Chat Session", subtitle: "Load messages and session details", color: "#5279bd", icon: History },
   input: { label: "Message", subtitle: "Prompt and file output", color: "#7c63e8", icon: MessageCircleQuestion },
   request: { label: "Request", subtitle: "Call an AI model", color: "#e17444", icon: Cloud },
   "ai-assigner": { label: "AI Work Assigner", subtitle: "Assign work to selected outputs", color: "#b95aa2", icon: BrainCircuit },
@@ -457,7 +473,7 @@ const NODE_META: Record<
 };
 
 const BUILTIN_NODE_GROUPS: { id: string; label: string; types: BuiltinNodeType[] }[] = [
-  { id: "essentials", label: "Essentials", types: ["start", "input", "end"] },
+  { id: "essentials", label: "Essentials", types: ["start", "chat-session", "input", "end"] },
   { id: "ai", label: "AI", types: ["request", "ai-assigner"] },
   { id: "values", label: "Values", types: ["string", "integer", "float", "math", "set-state"] },
   { id: "files", label: "Files", types: ["list-directory", "load", "save", "media-size", "file-name"] },
@@ -506,6 +522,22 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
   const mediaInputs: PortSpec[] = [{ id: "image", label: "image", type: "image" }, { id: "video", label: "video", type: "video" }, { id: "audio", label: "audio", type: "audio" }];
   const mediaOutputs: PortSpec[] = [{ id: "image", label: "image", type: "image" }, { id: "video", label: "video", type: "video" }, { id: "audio", label: "audio", type: "audio" }];
   if (node.type === "start") return { inputs: [{ id: "agent_name", label: "agent name", type: "string" }, { id: "start_message", label: "start message", type: "string" }], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
+  if (node.type === "chat-session") return {
+    inputs: [],
+    outputs: [
+      { id: "history", label: "history", type: "prompt" },
+      { id: "messages", label: "messages", type: "any" },
+      { id: "session", label: "session", type: "any" },
+      { id: "files", label: "files", type: "files" },
+      ...mediaOutputs,
+      documentOut,
+      { id: "title", label: "title", type: "string" },
+      { id: "session_id", label: "session ID", type: "string" },
+      { id: "session_number", label: "session number", type: "integer" },
+      { id: "message_count", label: "message count", type: "integer" },
+      { id: "updated_at", label: "updated at", type: "string" },
+    ],
+  };
   if (node.type === "input") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "question", label: "question", type: "string" }, { id: "files", label: "files", type: "files" }, ...mediaInputs, documentIn], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
   if (node.type === "request") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "system_prompt", label: "system prompt", type: "string" }, { id: "model", label: "model", type: "string" }, { id: "temperature", label: "temperature", type: "float" }, { id: "output_file_name", label: "output file", type: "string" }, { id: "files", label: "files", type: "files" }, ...mediaInputs, documentIn], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
   if (node.type === "ai-assigner") {
@@ -1940,6 +1972,8 @@ export default function Workbench() {
       config:
         type === "request"
           ? { provider: "openai", model: modelDefaults.openai, temperature: 0.7 }
+          : type === "chat-session"
+            ? { sessionIncludeUserMessages: true, sessionIncludeAssistantMessages: true, sessionIncludeSystemMessages: false, sessionHistoryLimit: 20, sessionIncludeMessageTimes: false, sessionIncludeAttachments: true }
           : type === "ai-assigner"
             ? { provider: "openai", model: modelDefaults.openai, temperature: 0.2, systemPrompt: DEFAULT_AI_WORK_ASSIGNER_SYSTEM_PROMPT, routeOptions: [{ id: uid("output"), label: "Output 1" }] }
           : type === "workflow"
@@ -2884,6 +2918,7 @@ export default function Workbench() {
       files,
       values: {},
       syntax,
+      chatSession: parentContext.chatSession,
       workflowStack: [...workflowStack, workflow.id],
     };
     context.values[portValueKey(start.id, "prompt")] = startInputs.prompt;
@@ -3041,6 +3076,25 @@ export default function Workbench() {
         output("value", value);
         context.lastOutput = value;
         debugDetail = `Provided a ${value.length}-character string.`;
+      }
+
+      if (node.type === "chat-session") {
+        const loaded = loadChatSession(node.config, context.chatSession);
+        output("history", loaded.history);
+        output("messages", loaded.messages);
+        output("session", loaded.session);
+        output("files", loaded.files);
+        output("image", mediaAssets(loaded.files, "image"));
+        output("video", mediaAssets(loaded.files, "video"));
+        output("audio", mediaAssets(loaded.files, "audio"));
+        output("document", loaded.files.filter(isDocumentAsset));
+        output("title", loaded.session.title);
+        output("session_id", loaded.session.id);
+        output("session_number", loaded.session.number);
+        output("message_count", loaded.session.previousMessageCount);
+        output("updated_at", loaded.session.updatedAt);
+        context.lastOutput = loaded.history || JSON.stringify(loaded.session, null, 2);
+        debugDetail = `Loaded ${loaded.messages.length} previous message${loaded.messages.length === 1 ? "" : "s"} and ${loaded.files.length} attachment${loaded.files.length === 1 ? "" : "s"} from this chat session.`;
       }
 
       if (node.type === "integer") {
@@ -3636,7 +3690,20 @@ export default function Workbench() {
     const syntax = syntaxContextFor();
     const startInputs = startInputDetails(start, activeWorkflow, text, messageFiles, priorMessages, syntax);
     const files = startInputs.files;
-    const context: WorkflowContext = { userMessage: startInputs.prompt, files, values: {}, syntax, workflowStack: [activeWorkflow.id] };
+    const context: WorkflowContext = {
+      userMessage: startInputs.prompt,
+      files,
+      values: {},
+      syntax,
+      chatSession: {
+        id: activeChatSession.id,
+        number: activeChatSession.sessionNumber,
+        title: activeChatSession.title,
+        updatedAt: activeChatSession.updatedAt,
+        messages: structuredClone(priorMessages),
+      },
+      workflowStack: [activeWorkflow.id],
+    };
     context.values[portValueKey(start.id, "prompt")] = startInputs.prompt;
     context.values[portValueKey(start.id, "files")] = files;
     context.values[portValueKey(start.id, "image")] = mediaAssets(files, "image");
@@ -4113,6 +4180,23 @@ export default function Workbench() {
                     <label className="field-label">Expression<textarea rows={4} className="code-editor" spellCheck={false} value={selectedNode.config.mathExpression || ""} placeholder="{{input1}} + {{input2}}" onChange={(event) => updateNode({ config: { mathExpression: event.target.value } })} /><small className="field-help">Operators: +, −, × (*), ÷ (/), %, ^, **. Functions: abs, ceil, floor, max, min, pow, round, sign, sqrt. Constants: PI, E.</small></label>
                   </>}
                   {selectedNode.type === "file-name" && <label className="check-field"><input type="checkbox" checked={selectedNode.config.includeExtension !== false} onChange={(event) => updateNode({ config: { includeExtension: event.target.checked } })} /><span>Include file extension</span></label>}
+                  {selectedNode.type === "chat-session" && (
+                    <>
+                      <div className="start-input-intro"><History size={14} /><span><b>Previous session context</b><small>Loads messages that existed before the current workflow run.</small></span></div>
+                      <details className="start-input-group" open>
+                        <summary><MessageSquare size={14} /><span><b>Messages</b><small>Select roles and the amount of recent history</small></span><ChevronDown size={14} /></summary>
+                        <div className="start-input-fields">
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.sessionIncludeUserMessages !== false} onChange={(event) => updateNode({ config: { sessionIncludeUserMessages: event.target.checked } })} /><span>User messages</span></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.sessionIncludeAssistantMessages !== false} onChange={(event) => updateNode({ config: { sessionIncludeAssistantMessages: event.target.checked } })} /><span>Assistant messages</span></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.sessionIncludeSystemMessages === true} onChange={(event) => updateNode({ config: { sessionIncludeSystemMessages: event.target.checked } })} /><span>System messages</span></label>
+                          <label className="field-label compact-field">Maximum previous messages<input type="number" min="1" max="100" value={selectedNode.config.sessionHistoryLimit ?? 20} onChange={(event) => updateNode({ config: { sessionHistoryLimit: Math.max(1, Math.min(100, Number(event.target.value) || 1)) } })} /><small className="field-help">The newest matching messages are exposed through the history and messages outputs.</small></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.sessionIncludeMessageTimes === true} onChange={(event) => updateNode({ config: { sessionIncludeMessageTimes: event.target.checked } })} /><span>Include times in formatted history</span></label>
+                          <label className="check-field"><input type="checkbox" checked={selectedNode.config.sessionIncludeAttachments !== false} onChange={(event) => updateNode({ config: { sessionIncludeAttachments: event.target.checked } })} /><span>Expose attachments from selected messages</span></label>
+                        </div>
+                      </details>
+                      <div className="local-first-note"><Info size={14} /><div><strong>Session metadata is always available</strong><span>Use the session, title, session ID, session number, message count, and updated-at outputs independently of message filters.</span></div></div>
+                    </>
+                  )}
                   {selectedNode.type === "start" && (
                     <>
                       <label className="field-label">Agent name<input value={selectedNode.config.agentName || ""} placeholder={DEFAULT_AGENT_NAME} onChange={(event) => updateNode({ config: { agentName: event.target.value } })} /><small className="field-help">Shown beside every message sent by this workflow.</small></label>
