@@ -136,7 +136,17 @@ import { createDebugLog, debugLogFilename } from "../lib/debug-log";
 import { buildAIWorkAssignerSystemPrompt, parseAIWorkAssignments } from "../lib/ai-work-assigner";
 import { composeStartInputs } from "../lib/start-inputs";
 import { loadChatSession } from "../lib/chat-session-node";
-import { combineOcrResults, performOcr } from "../lib/ocr";
+import {
+  combineOcrResults,
+  configuredOcrLanguages,
+  OCR_LANGUAGE_OPTIONS,
+  OcrEngine,
+  OcrResult,
+  ocrOutputFileNames,
+  performOcr,
+  prepareVisionOcrInputs,
+  visionOcrPrompt,
+} from "../lib/ocr";
 
 type BuiltinNodeType = "start" | "chat-session" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "ocr" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
@@ -272,7 +282,11 @@ type FlowNode = {
     mathInputs?: MathInputDefinition[];
     mathOutputType?: MathOutputType;
     includeExtension?: boolean;
+    ocrEngine?: OcrEngine;
     ocrLanguages?: string;
+    ocrPrimaryLanguage?: string;
+    ocrAdditionalLanguages?: string;
+    ocrModel?: string;
     ocrPdfScale?: number;
     includeSubfolders?: boolean;
     calledWorkflowId?: string;
@@ -2018,7 +2032,7 @@ export default function Workbench() {
                   : type === "file-name"
                     ? { includeExtension: true }
                     : type === "ocr"
-                      ? { ocrLanguages: "eng", ocrPdfScale: 2 }
+                      ? { ocrEngine: "tesseract", ocrLanguages: "eng", ocrPrimaryLanguage: "eng", ocrAdditionalLanguages: "", ocrPdfScale: 2 }
                 : type === "list-directory"
                   ? { subfolder: "", includeSubfolders: false }
           : type === "input"
@@ -3143,17 +3157,63 @@ export default function Workbench() {
 
       if (node.type === "ocr") {
         if (!fileInput.length) throw new Error("Connect at least one image or PDF document to the OCR node.");
-        const results = await performOcr(fileInput, {
-          languages: node.config.ocrLanguages,
-          pdfScale: node.config.ocrPdfScale,
-        }, (progress) => {
-          const percent = Math.round(progress.progress * 100);
-          updateDebugEvent(
-            debugId,
-            "running",
-            `OCR ${progress.fileIndex + 1}/${progress.fileCount}: ${progress.fileName}, page ${progress.page}/${progress.pageCount} — ${progress.status} ${percent}%`,
-          );
-        });
+        const engine = node.config.ocrEngine || "tesseract";
+        const languages = configuredOcrLanguages(node.config);
+        let results: OcrResult[];
+        if (engine === "tesseract") {
+          if (languages === "auto") throw new Error("Choose a specific language when using Tesseract.js OCR.");
+          results = await performOcr(fileInput, {
+            languages,
+            pdfScale: node.config.ocrPdfScale,
+          }, (progress) => {
+            const percent = Math.round(progress.progress * 100);
+            updateDebugEvent(
+              debugId,
+              "running",
+              `OCR ${progress.fileIndex + 1}/${progress.fileCount}: ${progress.fileName}, page ${progress.page}/${progress.pageCount} — ${progress.status} ${percent}%`,
+            );
+          });
+        } else {
+          const outputNames = ocrOutputFileNames(fileInput.map((file) => file.name));
+          results = [];
+          for (let fileIndex = 0; fileIndex < fileInput.length; fileIndex += 1) {
+            const file = fileInput[fileIndex];
+            updateDebugEvent(debugId, "running", `Preparing ${file.name} for ${engine} OCR (${fileIndex + 1}/${fileInput.length})…`);
+            const prepared = await prepareVisionOcrInputs(
+              file,
+              node.config.ocrPdfScale || 2,
+              (page, pageCount) => updateDebugEvent(debugId, "running", `Rendering ${file.name}, page ${page}/${pageCount} for ${engine} OCR…`),
+            );
+            const pageTexts: string[] = [];
+            for (let pageIndex = 0; pageIndex < prepared.files.length; pageIndex += 1) {
+              const pageFile = prepared.files[pageIndex];
+              updateDebugEvent(debugId, "running", `${engine} is recognizing ${file.name}, page ${pageIndex + 1}/${prepared.pageCount} (${fileIndex + 1}/${fileInput.length})…`);
+              const pageText = await requestAI({
+                provider: engine,
+                model: node.config.ocrModel || modelDefaults[engine],
+                systemPrompt: "You are a precise OCR engine. Follow the requested transcription format exactly.",
+                prompt: visionOcrPrompt(prepared.pageCount > 1 ? `${file.name}, page ${pageIndex + 1}` : file.name, languages),
+                temperature: 0,
+                files: [pageFile],
+                openai: engine === "openai" ? { reasoningEffort: "none", maxCompletionTokens: 16384 } : undefined,
+                gemini: engine === "gemini" ? { maxOutputTokens: 16384 } : undefined,
+                claude: engine === "claude" ? { thinking: "disabled", maxTokens: 16384 } : undefined,
+                ollama: engine === "ollama" ? { think: false, numPredict: 16384 } : undefined,
+              }, providerSettings);
+              pageTexts.push(pageText.trim());
+            }
+            const text = prepared.pageCount > 1
+              ? pageTexts.map((pageText, pageIndex) => `--- Page ${pageIndex + 1} ---\n\n${pageText}`).join("\n\n")
+              : pageTexts[0] || "";
+            results.push({
+              sourceName: file.name,
+              outputName: outputNames[fileIndex],
+              text,
+              pageCount: prepared.pageCount,
+              confidence: null,
+            });
+          }
+        }
         const text = combineOcrResults(results);
         const exportedFiles = await Promise.all(results.map((result) => readFileAsset(
           new File([result.text], result.outputName, { type: "text/plain" }),
@@ -3164,7 +3224,7 @@ export default function Workbench() {
         output("count", results.length);
         context.lastOutput = text;
         const pageCount = results.reduce((sum, result) => sum + result.pageCount, 0);
-        debugDetail = `OCR processed ${results.length} input${results.length === 1 ? "" : "s"} across ${pageCount} page${pageCount === 1 ? "" : "s"} and exported ${exportedFiles.length} text file${exportedFiles.length === 1 ? "" : "s"}.`;
+        debugDetail = `${engine === "tesseract" ? "Tesseract.js" : engine} OCR processed ${results.length} input${results.length === 1 ? "" : "s"} across ${pageCount} page${pageCount === 1 ? "" : "s"} and exported ${exportedFiles.length} text file${exportedFiles.length === 1 ? "" : "s"}.`;
       }
 
       if (node.type === "list-directory") {
@@ -4195,10 +4255,28 @@ export default function Workbench() {
                     <label className="field-label">Expression<textarea rows={4} className="code-editor" spellCheck={false} value={selectedNode.config.mathExpression || ""} placeholder="{{input1}} + {{input2}}" onChange={(event) => updateNode({ config: { mathExpression: event.target.value } })} /><small className="field-help">Operators: +, −, × (*), ÷ (/), %, ^, **. Functions: abs, ceil, floor, max, min, pow, round, sign, sqrt. Constants: PI, E.</small></label>
                   </>}
                   {selectedNode.type === "file-name" && <label className="check-field"><input type="checkbox" checked={selectedNode.config.includeExtension !== false} onChange={(event) => updateNode({ config: { includeExtension: event.target.checked } })} /><span>Include file extension</span></label>}
-                  {selectedNode.type === "ocr" && <>
-                    <label className="field-label">OCR languages<input value={selectedNode.config.ocrLanguages || "eng"} placeholder="eng or eng+kor" onChange={(event) => updateNode({ config: { ocrLanguages: event.target.value } })} /><small className="field-help">Use Tesseract language codes joined with +. Language data downloads once and is cached by the browser.</small></label>
-                    <label className="field-label">PDF render quality<div className="select-wrap"><select value={selectedNode.config.ocrPdfScale || 2} onChange={(event) => updateNode({ config: { ocrPdfScale: Number(event.target.value) } })}><option value="1">Standard (1×)</option><option value="2">High (2×)</option><option value="3">Very high (3×)</option><option value="4">Maximum (4×)</option></select><ChevronDown size={14} /></div><small className="field-help">Higher quality can improve scanned PDFs but uses more memory and takes longer.</small></label>
-                  </>}
+                  {selectedNode.type === "ocr" && (() => {
+                    const engine = selectedNode.config.ocrEngine || "tesseract";
+                    const legacyLanguages = (selectedNode.config.ocrLanguages || "eng").split(/[+,\s]+/).filter(Boolean);
+                    const primaryLanguage = selectedNode.config.ocrPrimaryLanguage || legacyLanguages[0] || "eng";
+                    const additionalLanguages = selectedNode.config.ocrAdditionalLanguages ?? legacyLanguages.slice(1).join("+");
+                    const knownPrimary = OCR_LANGUAGE_OPTIONS.some((language) => language.code === primaryLanguage);
+                    const provider = engine === "tesseract" ? null : engine;
+                    return <>
+                      <label className="field-label">OCR engine<div className="select-wrap"><select value={engine} onChange={(event) => {
+                        const nextEngine = event.target.value as OcrEngine;
+                        updateNode({ config: {
+                          ocrEngine: nextEngine,
+                          ocrPrimaryLanguage: nextEngine === "tesseract" && primaryLanguage === "auto" ? "eng" : primaryLanguage,
+                          ocrModel: nextEngine === "tesseract" ? selectedNode.config.ocrModel : modelDefaults[nextEngine],
+                        } });
+                      }}><option value="tesseract">Tesseract.js — on device</option><option value="openai">OpenAI vision</option><option value="gemini">Google Gemini vision</option><option value="claude">Anthropic Claude vision</option><option value="ollama">Ollama vision — local model</option></select><ChevronDown size={14} /></div><small className="field-help">Tesseract processes files in the browser. Cloud AI engines send each page to the selected provider; Ollama stays on your local server.</small></label>
+                      {provider && <label className="field-label"><span className="field-title-row">Vision model <button type="button" onClick={() => refreshAvailableModels(provider)} disabled={modelsLoading[provider]}><RefreshCw size={12} className={modelsLoading[provider] ? "spin" : ""} /> Refresh available</button></span><input list="available-ocr-models" value={selectedNode.config.ocrModel || modelDefaults[provider]} onChange={(event) => updateNode({ config: { ocrModel: event.target.value } })} /><datalist id="available-ocr-models">{(availableModels[provider] || []).map((model) => <option key={model} value={model} />)}</datalist><small className="field-help">Choose a model that accepts image input.</small></label>}
+                      <label className="field-label">Primary language<div className="select-wrap"><select value={primaryLanguage} onChange={(event) => updateNode({ config: { ocrPrimaryLanguage: event.target.value } })}>{engine !== "tesseract" && <option value="auto">Auto detect</option>}{!knownPrimary && primaryLanguage !== "auto" && <option value={primaryLanguage}>Custom ({primaryLanguage})</option>}{OCR_LANGUAGE_OPTIONS.map((language) => <option key={language.code} value={language.code}>{language.label}</option>)}</select><ChevronDown size={14} /></div></label>
+                      <label className="field-label">Additional languages<input value={additionalLanguages} disabled={primaryLanguage === "auto"} placeholder="Optional, e.g. eng+kor" onChange={(event) => updateNode({ config: { ocrAdditionalLanguages: event.target.value } })} /><small className="field-help">Optional Tesseract codes separated by +, commas, or spaces. Leave empty for one language.</small></label>
+                      <label className="field-label">PDF render quality<div className="select-wrap"><select value={selectedNode.config.ocrPdfScale || 2} onChange={(event) => updateNode({ config: { ocrPdfScale: Number(event.target.value) } })}><option value="1">Standard (1×)</option><option value="2">High (2×)</option><option value="3">Very high (3×)</option><option value="4">Maximum (4×)</option></select><ChevronDown size={14} /></div><small className="field-help">Higher quality can improve scanned PDFs but uses more memory and takes longer.</small></label>
+                    </>;
+                  })()}
                   {selectedNode.type === "chat-session" && (
                     <>
                       <div className="start-input-intro"><History size={14} /><span><b>Previous session context</b><small>Loads messages that existed before the current workflow run.</small></span></div>

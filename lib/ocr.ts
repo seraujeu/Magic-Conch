@@ -5,12 +5,41 @@ export type OcrInputAsset = {
   size: number;
 };
 
+export type OcrEngine = "tesseract" | "openai" | "gemini" | "claude" | "ollama";
+
+export const OCR_LANGUAGE_OPTIONS = [
+  { code: "eng", label: "English" },
+  { code: "kor", label: "Korean" },
+  { code: "jpn", label: "Japanese" },
+  { code: "chi_sim", label: "Chinese (Simplified)" },
+  { code: "chi_tra", label: "Chinese (Traditional)" },
+  { code: "spa", label: "Spanish" },
+  { code: "fra", label: "French" },
+  { code: "deu", label: "German" },
+  { code: "ita", label: "Italian" },
+  { code: "por", label: "Portuguese" },
+  { code: "nld", label: "Dutch" },
+  { code: "pol", label: "Polish" },
+  { code: "rus", label: "Russian" },
+  { code: "ukr", label: "Ukrainian" },
+  { code: "tur", label: "Turkish" },
+  { code: "ara", label: "Arabic" },
+  { code: "hin", label: "Hindi" },
+  { code: "tha", label: "Thai" },
+  { code: "vie", label: "Vietnamese" },
+  { code: "ind", label: "Indonesian" },
+] as const;
+
+const OCR_LANGUAGE_LABELS = new Map<string, string>(
+  OCR_LANGUAGE_OPTIONS.map((language) => [language.code, language.label]),
+);
+
 export type OcrResult = {
   sourceName: string;
   outputName: string;
   text: string;
   pageCount: number;
-  confidence: number;
+  confidence: number | null;
 };
 
 export type OcrProgress = {
@@ -44,6 +73,40 @@ export function normalizeOcrLanguages(value?: string) {
   return [...new Set(languages)];
 }
 
+export function configuredOcrLanguages(config: {
+  ocrLanguages?: string;
+  ocrPrimaryLanguage?: string;
+  ocrAdditionalLanguages?: string;
+}) {
+  const legacy = normalizeOcrLanguages(config.ocrLanguages);
+  const primary = config.ocrPrimaryLanguage || legacy[0] || "eng";
+  if (primary === "auto") return "auto";
+  const additional = config.ocrAdditionalLanguages === undefined
+    ? legacy.slice(1)
+    : config.ocrAdditionalLanguages.trim()
+      ? normalizeOcrLanguages(config.ocrAdditionalLanguages)
+      : [];
+  return [...new Set([primary, ...additional])].join("+");
+}
+
+export function ocrLanguageDescription(value?: string) {
+  if (value === "auto") return "automatically detect every language present";
+  return normalizeOcrLanguages(value)
+    .map((code) => OCR_LANGUAGE_LABELS.get(code) || code)
+    .join(" and ");
+}
+
+export function visionOcrPrompt(fileName: string, languages?: string) {
+  return [
+    `Perform OCR on ${fileName}.`,
+    `Recognition language: ${ocrLanguageDescription(languages)}.`,
+    "Return only the extracted text, with no commentary or code fences.",
+    "Preserve reading order, meaningful line breaks, headings, and table structure as plain text.",
+    "For a multi-page document, separate pages with headings in the exact form: --- Page N ---",
+    "Do not summarize, translate, correct, or invent text. Mark unreadable fragments as [unclear].",
+  ].join("\n");
+}
+
 export function ocrOutputFileNames(sourceNames: string[]) {
   const used = new Map<string, number>();
   return sourceNames.map((sourceName) => {
@@ -74,8 +137,52 @@ function dataUrlBytes(dataUrl: string) {
   return bytes;
 }
 
-function isPdfAsset(file: OcrInputAsset) {
+export function isPdfAsset(file: OcrInputAsset) {
   return file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+}
+
+async function openPdf(file: OcrInputAsset) {
+  const [pdfjs, pdfWorker] = await Promise.all([
+    import("pdfjs-dist"),
+    import("pdfjs-dist/build/pdf.worker.min.mjs?url"),
+  ]);
+  pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker.default;
+  const loadingTask = pdfjs.getDocument({ data: dataUrlBytes(file.data), useWasm: false });
+  return { loadingTask, pdf: await loadingTask.promise };
+}
+
+export async function prepareVisionOcrInputs(
+  file: OcrInputAsset,
+  pdfScale = 2,
+  onPage?: (page: number, pageCount: number) => void,
+) {
+  if (!isPdfAsset(file)) return { files: [file], pageCount: 1 };
+  const { loadingTask, pdf } = await openPdf(file);
+  const files: OcrInputAsset[] = [];
+  const baseName = file.name.replace(/\.pdf$/i, "") || "document";
+  const pageCount = pdf.numPages;
+  try {
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      onPage?.(pageNumber, pdf.numPages);
+      const page = await pdf.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: Math.max(1, Math.min(4, pdfScale)) });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
+      await page.render({ canvas, viewport }).promise;
+      const data = canvas.toDataURL("image/png");
+      files.push({
+        name: `${baseName}-page-${pageNumber}.png`,
+        type: "image/png",
+        data,
+        size: Math.floor((data.length - data.indexOf(",") - 1) * 0.75),
+      });
+      page.cleanup();
+    }
+  } finally {
+    await loadingTask.destroy();
+  }
+  return { files, pageCount };
 }
 
 export async function performOcr(
@@ -120,13 +227,7 @@ export async function performOcr(
         continue;
       }
 
-      const [pdfjs, pdfWorker] = await Promise.all([
-        import("pdfjs-dist"),
-        import("pdfjs-dist/build/pdf.worker.min.mjs?url"),
-      ]);
-      pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker.default;
-      const loadingTask = pdfjs.getDocument({ data: dataUrlBytes(file.data), useWasm: false });
-      const pdf = await loadingTask.promise;
+      const { loadingTask, pdf } = await openPdf(file);
       const pageTexts: string[] = [];
       const confidences: number[] = [];
       try {

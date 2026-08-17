@@ -118,6 +118,25 @@ test("provides a Chat Session source node with typed history and metadata output
   assert.match(loader, /totalPreviousMessageCount/);
 });
 
+test("offers guided OCR languages and selectable local or AI vision engines", async () => {
+  const [workbench, ocr] = await Promise.all([
+    readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/ocr.ts", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(workbench, />OCR engine</);
+  assert.match(workbench, />Tesseract\.js — on device</);
+  assert.match(workbench, />OpenAI vision</);
+  assert.match(workbench, />Google Gemini vision</);
+  assert.match(workbench, />Anthropic Claude vision</);
+  assert.match(workbench, />Ollama vision — local model</);
+  assert.match(workbench, />Primary language</);
+  assert.match(workbench, />Additional languages</);
+  assert.match(workbench, /prepareVisionOcrInputs/);
+  assert.match(ocr, /OCR_LANGUAGE_OPTIONS/);
+  assert.match(ocr, /visionOcrPrompt/);
+});
+
 test("runs one workflow from another through the Use Workflow node", async () => {
   const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
 
