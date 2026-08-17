@@ -37,6 +37,12 @@ export function isWorkflowNodeActive({
     return inputPorts.length === 0 || PULL_SOURCE_NODE_TYPES.has(nodeType);
   }
 
+  // Join/Aggregate is an optional-input barrier. Once all of its upstream
+  // nodes have settled, it must run even when a routed branch emitted no
+  // value. The executor will aggregate only the values that did arrive (or
+  // produce the operation's empty result when none did).
+  if (nodeType === "join") return true;
+
   const activeIncoming = incoming.filter((edge) =>
     emittedPortKeys.has(portValueKey(edge.from, edge.fromPort || "")),
   );

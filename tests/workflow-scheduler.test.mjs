@@ -113,3 +113,30 @@ test("does not auto-run arbitrary disconnected processing nodes", () => {
     emittedPortKeys: new Set(),
   }), false);
 });
+
+test("activates Join when some connected inputs are empty", () => {
+  const incoming = [
+    edge("assigner", "output-1", "input1"),
+    edge("assigner", "output-2", "input2"),
+    edge("assigner", "output-3", "input3"),
+  ];
+
+  assert.equal(isWorkflowNodeActive({
+    nodeType: "join",
+    inputPorts: [{ id: "input1" }, { id: "input2" }, { id: "input3" }],
+    incoming,
+    emittedPortKeys: new Set(["assigner:output-2"]),
+  }), true);
+});
+
+test("activates Join with an empty result when no connected input emitted", () => {
+  assert.equal(isWorkflowNodeActive({
+    nodeType: "join",
+    inputPorts: [{ id: "input1" }, { id: "input2" }],
+    incoming: [
+      edge("router", "route-1", "input1"),
+      edge("router", "route-2", "input2"),
+    ],
+    emittedPortKeys: new Set(),
+  }), true);
+});
