@@ -49,6 +49,7 @@ import {
   Search,
   Shuffle,
   Save,
+  ScanText,
   Send,
   Settings,
   Sparkles,
@@ -135,8 +136,9 @@ import { createDebugLog, debugLogFilename } from "../lib/debug-log";
 import { buildAIWorkAssignerSystemPrompt, parseAIWorkAssignments } from "../lib/ai-work-assigner";
 import { composeStartInputs } from "../lib/start-inputs";
 import { loadChatSession } from "../lib/chat-session-node";
+import { combineOcrResults, performOcr } from "../lib/ocr";
 
-type BuiltinNodeType = "start" | "chat-session" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
+type BuiltinNodeType = "start" | "chat-session" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "ocr" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
 type FileAsset = { name: string; type: string; data: string; size: number; bundleLoadNodeId?: string };
 type PortDataType = "prompt" | "files" | "document" | "text" | "number" | "boolean" | "string" | "integer" | "float" | "image" | "video" | "audio" | "any";
@@ -270,6 +272,8 @@ type FlowNode = {
     mathInputs?: MathInputDefinition[];
     mathOutputType?: MathOutputType;
     includeExtension?: boolean;
+    ocrLanguages?: string;
+    ocrPdfScale?: number;
     includeSubfolders?: boolean;
     calledWorkflowId?: string;
   };
@@ -451,6 +455,7 @@ const NODE_META: Record<
   math: { label: "Math", subtitle: "Calculate with named inputs", color: "#b66f36", icon: Calculator },
   "media-size": { label: "Get Image / Video Size", subtitle: "Read media dimensions", color: "#4d8fa2", icon: Ruler },
   "file-name": { label: "Get File Name", subtitle: "Read a file's name", color: "#6c8298", icon: FileType },
+  ocr: { label: "OCR", subtitle: "Extract text from images and PDFs", color: "#287f8f", icon: ScanText },
   "list-directory": { label: "Load Directory", subtitle: "Load the files in a directory", color: "#718e3c", icon: FolderOpen },
   save: { label: "Save", subtitle: "Write a file", color: "#3188c7", icon: Save },
   load: { label: "Load", subtitle: "Read a file", color: "#c59030", icon: Database },
@@ -475,7 +480,7 @@ const BUILTIN_NODE_GROUPS: { id: string; label: string; types: BuiltinNodeType[]
   { id: "essentials", label: "Essentials", types: ["start", "chat-session", "input", "end"] },
   { id: "ai", label: "AI", types: ["request", "ai-assigner"] },
   { id: "values", label: "Values", types: ["string", "integer", "float", "math", "set-state"] },
-  { id: "files", label: "Files", types: ["list-directory", "load", "save", "media-size", "file-name"] },
+  { id: "files", label: "Files", types: ["list-directory", "load", "save", "media-size", "file-name", "ocr"] },
   { id: "processing", label: "Processing", types: ["transform", "code", "parser", "join"] },
   { id: "flow-control", label: "Flow control", types: ["workflow", "loop", "retry", "wait", "parallel"] },
   { id: "routing", label: "Routing", types: ["condition-ai", "condition-rule", "router-condition", "router-ai", "router-rule"] },
@@ -566,6 +571,15 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
   if (node.type === "file-name") return {
     inputs: [{ id: "files", label: "file", type: "files" }, ...mediaInputs, documentIn],
     outputs: [{ id: "name", label: "name", type: "string" }],
+  };
+  if (node.type === "ocr") return {
+    inputs: [{ id: "files", label: "files", type: "files" }, { id: "image", label: "images", type: "image" }, documentIn],
+    outputs: [
+      { id: "text", label: "text", type: "text" },
+      { id: "results", label: "results", type: "any" },
+      { id: "files", label: "OCR files", type: "files" },
+      { id: "count", label: "count", type: "integer" },
+    ],
   };
   if (node.type === "list-directory") return { inputs: [{ id: "trigger", label: "trigger", type: "any" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "recursive", label: "recursive", type: "boolean" }], outputs: [{ id: "files", label: "files", type: "files" }, { id: "image", label: "images", type: "image" }, { id: "video", label: "videos", type: "video" }, { id: "audio", label: "audio", type: "audio" }, { id: "names", label: "names", type: "any" }, { id: "count", label: "count", type: "integer" }] };
   if (node.type === "save") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "key", label: "file key", type: "string" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "files", label: "files", type: "files" }, ...mediaInputs], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs] };
@@ -2003,6 +2017,8 @@ export default function Workbench() {
                   ? { mathExpression: "{{input1}}", mathOutputType: "float", mathInputs: [createMathInput(1)] }
                   : type === "file-name"
                     ? { includeExtension: true }
+                    : type === "ocr"
+                      ? { ocrLanguages: "eng", ocrPdfScale: 2 }
                 : type === "list-directory"
                   ? { subfolder: "", includeSubfolders: false }
           : type === "input"
@@ -3125,6 +3141,32 @@ export default function Workbench() {
         debugDetail = `Read the file name “${name}”.`;
       }
 
+      if (node.type === "ocr") {
+        if (!fileInput.length) throw new Error("Connect at least one image or PDF document to the OCR node.");
+        const results = await performOcr(fileInput, {
+          languages: node.config.ocrLanguages,
+          pdfScale: node.config.ocrPdfScale,
+        }, (progress) => {
+          const percent = Math.round(progress.progress * 100);
+          updateDebugEvent(
+            debugId,
+            "running",
+            `OCR ${progress.fileIndex + 1}/${progress.fileCount}: ${progress.fileName}, page ${progress.page}/${progress.pageCount} — ${progress.status} ${percent}%`,
+          );
+        });
+        const text = combineOcrResults(results);
+        const exportedFiles = await Promise.all(results.map((result) => readFileAsset(
+          new File([result.text], result.outputName, { type: "text/plain" }),
+        )));
+        output("text", text);
+        output("results", results);
+        output("files", exportedFiles);
+        output("count", results.length);
+        context.lastOutput = text;
+        const pageCount = results.reduce((sum, result) => sum + result.pageCount, 0);
+        debugDetail = `OCR processed ${results.length} input${results.length === 1 ? "" : "s"} across ${pageCount} page${pageCount === 1 ? "" : "s"} and exported ${exportedFiles.length} text file${exportedFiles.length === 1 ? "" : "s"}.`;
+      }
+
       if (node.type === "list-directory") {
         const subfolder = String(inputFor("subfolder", node.config.subfolder || ""));
         const recursive = Boolean(inputFor("recursive", node.config.includeSubfolders || false));
@@ -4153,6 +4195,10 @@ export default function Workbench() {
                     <label className="field-label">Expression<textarea rows={4} className="code-editor" spellCheck={false} value={selectedNode.config.mathExpression || ""} placeholder="{{input1}} + {{input2}}" onChange={(event) => updateNode({ config: { mathExpression: event.target.value } })} /><small className="field-help">Operators: +, −, × (*), ÷ (/), %, ^, **. Functions: abs, ceil, floor, max, min, pow, round, sign, sqrt. Constants: PI, E.</small></label>
                   </>}
                   {selectedNode.type === "file-name" && <label className="check-field"><input type="checkbox" checked={selectedNode.config.includeExtension !== false} onChange={(event) => updateNode({ config: { includeExtension: event.target.checked } })} /><span>Include file extension</span></label>}
+                  {selectedNode.type === "ocr" && <>
+                    <label className="field-label">OCR languages<input value={selectedNode.config.ocrLanguages || "eng"} placeholder="eng or eng+kor" onChange={(event) => updateNode({ config: { ocrLanguages: event.target.value } })} /><small className="field-help">Use Tesseract language codes joined with +. Language data downloads once and is cached by the browser.</small></label>
+                    <label className="field-label">PDF render quality<div className="select-wrap"><select value={selectedNode.config.ocrPdfScale || 2} onChange={(event) => updateNode({ config: { ocrPdfScale: Number(event.target.value) } })}><option value="1">Standard (1×)</option><option value="2">High (2×)</option><option value="3">Very high (3×)</option><option value="4">Maximum (4×)</option></select><ChevronDown size={14} /></div><small className="field-help">Higher quality can improve scanned PDFs but uses more memory and takes longer.</small></label>
+                  </>}
                   {selectedNode.type === "chat-session" && (
                     <>
                       <div className="start-input-intro"><History size={14} /><span><b>Previous session context</b><small>Loads messages that existed before the current workflow run.</small></span></div>
