@@ -14,7 +14,7 @@ export function createJoinInput(index: number, id = `join-input-${index}`): Join
 }
 
 export function joinInputVariable(input: JoinInputDefinition, index: number) {
-  return input.variable.trim() || `input${index + 1}`;
+  return (typeof input.variable === "string" ? input.variable.trim() : "") || `input${index + 1}`;
 }
 
 export function growJoinInputs(

@@ -137,14 +137,16 @@ import {
   normalizeWorkflowParallelism,
   WorkflowTaskLimiter,
 } from "../lib/workflow-scheduler";
+import { recommendWorkflowParallelism, SystemPressureLevel } from "../lib/system-pressure";
 import { displayNodeDirectory, migrateLegacyNodeDirectory, resolveNodeDirectory } from "../lib/node-directory";
-import { collectWorkflowBundleDependencies, portableDependencySegment, remapPackagedWorkflowIds, workflowRuntimeNodeIds } from "../lib/workflow-bundle";
+import { collectWorkflowBundleDependencies, createWorkflowJsonBundle, portableDependencySegment, remapPackagedWorkflowIds, unpackWorkflowJsonBundle, workflowRuntimeNodeIds } from "../lib/workflow-bundle";
 import { applyBundledLoadSnapshots, bundledLoadResult, BundledLoadSnapshot, materializedLoadDirectory } from "../lib/workflow-load-bundle";
 import { workflowArchiveFilename, workflowExportFilename, workflowFileText } from "../lib/workflow-files";
 import { createDebugLog, debugLogFilename } from "../lib/debug-log";
 import { buildAIWorkAssignerSystemPrompt, parseAIWorkAssignments } from "../lib/ai-work-assigner";
 import { composeStartInputs } from "../lib/start-inputs";
 import { loadChatSession } from "../lib/chat-session-node";
+import { bypassLegacyParallelNodes } from "../lib/workflow-migration";
 import {
   applyUserMemoryOperation,
   formatUserMemory,
@@ -162,7 +164,7 @@ import {
 } from "../lib/ocr";
 import type { OcrEngine, OcrResult } from "../lib/ocr";
 
-type BuiltinNodeType = "start" | "chat-session" | "load-settings" | "update-memory" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "ocr" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
+type BuiltinNodeType = "start" | "chat-session" | "load-settings" | "update-memory" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "ocr" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
 type FileAsset = { name: string; type: string; data: string; size: number; bundleLoadNodeId?: string };
 type PortDataType = "prompt" | "files" | "document" | "text" | "number" | "boolean" | "string" | "integer" | "float" | "image" | "video" | "audio" | "any";
@@ -503,7 +505,6 @@ const NODE_META: Record<
   code: { label: "Code", subtitle: "Run JavaScript or Python", color: "#404c59", icon: Code2 },
   parser: { label: "Parser", subtitle: "Parse structured documents", color: "#3d9991", icon: Braces },
   join: { label: "Join / Aggregate", subtitle: "Collect multiple outputs", color: "#8d6d44", icon: Combine },
-  parallel: { label: "Parallel", subtitle: "Fan a value out to connected branches", color: "#3f86a8", icon: GitBranch },
   "condition-ai": { label: "AI Condition", subtitle: "AI-powered true / false", color: "#b6539d", icon: BrainCircuit },
   "condition-rule": { label: "Rule Condition", subtitle: "Rule-based true / false", color: "#3f806f", icon: GitBranch },
   "router-condition": { label: "Condition Router", subtitle: "Binary if / else routing", color: "#557f57", icon: Route },
@@ -519,7 +520,7 @@ const BUILTIN_NODE_GROUPS: { id: string; label: string; types: BuiltinNodeType[]
   { id: "values", label: "Values", types: ["string", "integer", "float", "math", "set-state"] },
   { id: "files", label: "Files", types: ["list-directory", "load", "save", "media-size", "file-name", "ocr"] },
   { id: "processing", label: "Processing", types: ["transform", "code", "parser", "join"] },
-  { id: "flow-control", label: "Flow control", types: ["workflow", "loop", "retry", "wait", "parallel"] },
+  { id: "flow-control", label: "Flow control", types: ["workflow", "loop", "retry", "wait"] },
   { id: "routing", label: "Routing", types: ["condition-ai", "condition-rule", "router-condition", "router-ai", "router-rule"] },
 ];
 
@@ -659,9 +660,6 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
     })),
     outputs: [{ id: "result", label: "result", type: "any" }],
   };
-  if (node.type === "parallel") {
-    return { inputs: [{ id: "value", label: "value", type: "any" }], outputs: [{ id: "value", label: "value", type: "any", multiple: true }] };
-  }
   if (node.type === "condition-ai" || node.type === "condition-rule") {
     return {
       inputs: [{ id: "value", label: "value", type: "any" }, { id: "gate", label: "if / elif gate", type: "boolean" }, ...fileInputs],
@@ -732,6 +730,7 @@ function nodeCardHeight(node: FlowNode, plugins: MagicConchPlugin[]) {
 }
 
 function migrateWorkflow(workflow: Workflow, plugins: MagicConchPlugin[]): Workflow {
+  workflow = bypassLegacyParallelNodes(workflow);
   const legacyFlowEdges = workflow.edges.filter(
     (edge) => !edge.dataType || !edge.fromPort || !edge.toPort || edge.dataType === "flow" || edge.fromPort === "flow" || edge.toPort === "flow",
   );
@@ -1312,6 +1311,9 @@ export default function Workbench() {
   const [collapsedNodeGroups, setCollapsedNodeGroups] = useState<Record<string, boolean>>({});
   const [undoLimit, setUndoLimit] = useState(50);
   const [workflowParallelism, setWorkflowParallelism] = useState(DEFAULT_WORKFLOW_PARALLELISM);
+  const [automaticWorkflowParallelism, setAutomaticWorkflowParallelism] = useState(true);
+  const [automaticParallelism, setAutomaticParallelism] = useState(DEFAULT_WORKFLOW_PARALLELISM);
+  const [systemPressureLevel, setSystemPressureLevel] = useState<SystemPressureLevel>("low");
   const [defaultDirectoryPath, setDefaultDirectoryPath] = useState(DEFAULT_LOCAL_DIRECTORY);
   const [userPreference, setUserPreference] = useState("");
   const [userMemories, setUserMemories] = useState<UserMemory[]>([]);
@@ -1356,6 +1358,9 @@ export default function Workbench() {
   const panRef = useRef<{ startX: number; startY: number; panX: number; panY: number } | null>(null);
   const selectionRef = useRef<{ startX: number; startY: number; currentX: number; currentY: number; additive: boolean } | null>(null);
   const connectRef = useRef<{ nodeId: string; portId: string; dataType: PortDataType; pointerId: number } | null>(null);
+  const effectiveWorkflowParallelism = automaticWorkflowParallelism ? automaticParallelism : workflowParallelism;
+  const workflowParallelismRef = useRef(effectiveWorkflowParallelism);
+  workflowParallelismRef.current = effectiveWorkflowParallelism;
 
   const activeWorkflow = useMemo(
     () => workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0],
@@ -1496,6 +1501,7 @@ export default function Workbench() {
         const savedPluginsJson = localStorage.getItem("magic-conch-plugins");
         const savedUndoLimit = localStorage.getItem("magic-conch-undo-limit");
         const savedWorkflowParallelism = localStorage.getItem("magic-conch-workflow-parallelism");
+        const savedAutomaticWorkflowParallelism = localStorage.getItem("magic-conch-workflow-parallelism-auto");
         const savedDefaultDirectory = localStorage.getItem("magic-conch-default-directory");
         const savedUserPreference = localStorage.getItem("magic-conch-user-preference");
         const savedUserMemories = localStorage.getItem("magic-conch-user-memories");
@@ -1551,6 +1557,9 @@ export default function Workbench() {
         if (restoredPlugins.length) setPlugins(restoredPlugins);
         if (savedUndoLimit) setUndoLimit(Math.max(1, Math.min(500, Number(savedUndoLimit))));
         if (savedWorkflowParallelism) setWorkflowParallelism(normalizeWorkflowParallelism(savedWorkflowParallelism));
+        setAutomaticWorkflowParallelism(savedAutomaticWorkflowParallelism === null
+          ? !savedWorkflowParallelism
+          : savedAutomaticWorkflowParallelism === "true");
         if (savedDefaultDirectory) setDefaultDirectoryPath(savedDefaultDirectory);
         if (savedUserPreference) setUserPreference(savedUserPreference);
         if (savedUserMemories) replaceUserMemories(normalizeUserMemories(JSON.parse(savedUserMemories)));
@@ -1665,6 +1674,54 @@ export default function Workbench() {
     if (!storageRestoredRef.current) return;
     localStorage.setItem("magic-conch-workflow-parallelism", String(workflowParallelism));
   }, [workflowParallelism]);
+
+  useEffect(() => {
+    if (!storageRestoredRef.current) return;
+    localStorage.setItem("magic-conch-workflow-parallelism-auto", String(automaticWorkflowParallelism));
+  }, [automaticWorkflowParallelism]);
+
+  useEffect(() => {
+    type MemoryPerformance = Performance & { memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number } };
+    type MemoryNavigator = Navigator & { deviceMemory?: number };
+    type PressureRecord = { state: "nominal" | "fair" | "serious" | "critical" };
+    type PressureObserverInstance = { observe: (source: "cpu", options?: { sampleInterval?: number }) => Promise<void>; disconnect: () => void };
+    type PressureObserverConstructor = new (callback: (records: PressureRecord[]) => void) => PressureObserverInstance;
+
+    let cpuPressure: PressureRecord["state"] | undefined;
+    let expected = performance.now() + 2000;
+    let observer: PressureObserverInstance | undefined;
+    const update = () => {
+      const now = performance.now();
+      const eventLoopLagMs = Math.max(0, now - expected);
+      expected = now + 2000;
+      const memory = (performance as MemoryPerformance).memory;
+      const recommendation = recommendWorkflowParallelism({
+        hardwareConcurrency: navigator.hardwareConcurrency,
+        deviceMemoryGb: (navigator as MemoryNavigator).deviceMemory,
+        heapUtilization: memory?.jsHeapSizeLimit ? memory.usedJSHeapSize / memory.jsHeapSizeLimit : undefined,
+        eventLoopLagMs,
+        cpuPressure,
+      });
+      setAutomaticParallelism(recommendation.limit);
+      setSystemPressureLevel(recommendation.level);
+    };
+    update();
+    const timer = window.setInterval(update, 2000);
+    const PressureObserver = (window as unknown as { PressureObserver?: PressureObserverConstructor }).PressureObserver;
+    if (PressureObserver) {
+      try {
+        observer = new PressureObserver((records) => {
+          cpuPressure = records.at(-1)?.state;
+          update();
+        });
+        void observer.observe("cpu", { sampleInterval: 2000 }).catch(() => observer?.disconnect());
+      } catch { /* Capacity, heap, and event-loop signals remain available. */ }
+    }
+    return () => {
+      window.clearInterval(timer);
+      observer?.disconnect();
+    };
+  }, []);
 
   useEffect(() => {
     if (!storageRestoredRef.current) return;
@@ -2145,9 +2202,7 @@ export default function Workbench() {
                                 ? { parserFormat: "auto" }
                                 : type === "join"
                                   ? { aggregateOperation: "array", aggregateTemplate: "", joinInputs: [createJoinInput(1)] }
-                                  : type === "parallel"
-                                    ? {}
-                                    : type === "router-condition"
+                                  : type === "router-condition"
                                       ? { conditionKind: "truthy", conditionValue: "" }
                 : pluginDefinition
                   ? {
@@ -2503,8 +2558,8 @@ export default function Workbench() {
       nodes: workflow.nodes.map((node) => {
         if (node.id !== nodeId) return node;
         const options = node.config.routeOptions || [];
-        const outputName = node.type === "parallel" ? "Branch" : node.type === "ai-assigner" ? "Output" : "Option";
-        return { ...node, config: { ...node.config, routeOptions: [...options, { id: uid(node.type === "parallel" ? "branch" : node.type === "ai-assigner" ? "output" : "route"), label: `${outputName} ${options.length + 1}`, value: "" }] } };
+        const outputName = node.type === "ai-assigner" ? "Output" : "Option";
+        return { ...node, config: { ...node.config, routeOptions: [...options, { id: uid(node.type === "ai-assigner" ? "output" : "route"), label: `${outputName} ${options.length + 1}`, value: "" }] } };
       }),
     }));
   }
@@ -2706,7 +2761,9 @@ export default function Workbench() {
   }
 
   function exportWorkflow() {
-    const json = JSON.stringify(workflowJsonManifest(activeWorkflow), null, 2);
+    const bundled = collectWorkflowBundleDependencies(activeWorkflow, workflows, []);
+    const exported = createWorkflowJsonBundle(bundled.workflows.map(workflowJsonManifest));
+    const json = JSON.stringify(exported, null, 2);
     const blob = new Blob([new TextEncoder().encode(json)], {
       type: "application/json;charset=utf-8",
     });
@@ -2716,7 +2773,10 @@ export default function Workbench() {
     link.download = workflowExportFilename(activeWorkflow.name);
     link.click();
     URL.revokeObjectURL(url);
-    showToast("Workflow exported");
+    const dependencyCount = bundled.workflows.length - 1;
+    showToast(dependencyCount
+      ? `Workflow exported with ${dependencyCount} dependent workflow${dependencyCount === 1 ? "" : "s"}`
+      : "Workflow exported");
   }
 
   function exportDebugLog() {
@@ -2835,7 +2895,7 @@ export default function Workbench() {
         ];
         packagedPlugins = readPortableBundleParts(bytes, "plugin.json").map((part) => validatePlugin(part.manifest));
       } else {
-        packagedWorkflows = [JSON.parse(workflowFileText(await file.text())) as Workflow];
+        packagedWorkflows = unpackWorkflowJsonBundle<Workflow>(JSON.parse(workflowFileText(await file.text())));
       }
       if (packagedWorkflows.some((workflow) => !workflow.nodes || !workflow.edges || !workflow.name)) throw new Error();
       packagedWorkflows = packagedWorkflows.map((workflow, index) => ({
@@ -3070,7 +3130,7 @@ export default function Workbench() {
       if (activeReady.some((node) => node.type === "input")) {
         throw new Error(`Called workflow “${workflow.name}” pauses at a Message node. Reusable workflows must run from Start to End without requesting another message.`);
       }
-      const results = await mapWithConcurrencyLimit(activeReady, workflowParallelism, async (node) => ({
+      const results = await mapWithConcurrencyLimit(activeReady, () => workflowParallelismRef.current, async (node) => ({
         node,
         result: await executeScheduledGraphNode(node, context, emitted, workflow),
       }));
@@ -3649,12 +3709,6 @@ export default function Workbench() {
         debugDetail = `Aggregated ${joinedInputs.length} input${joinedInputs.length === 1 ? "" : "s"}.`;
       }
 
-      if (node.type === "parallel") {
-        const value = inputFor<unknown>("value", promptInput);
-        output("value", value);
-        debugDetail = "Passed the value to every connected branch.";
-      }
-
       if (node.type === "condition-rule") {
         const value = inputFor<unknown>("value", promptInput);
         const matched = evaluateBooleanRule(value, fileInput, {
@@ -3831,7 +3885,7 @@ export default function Workbench() {
 
       const waitingNode = activeReady.find((node) => node.type === "input");
       const executable = activeReady.filter((node) => node.type !== "input");
-      const results = await mapWithConcurrencyLimit(executable, workflowParallelism, async (node) => ({
+      const results = await mapWithConcurrencyLimit(executable, () => workflowParallelismRef.current, async (node) => ({
         node,
         result: await executeScheduledGraphNode(node, context, emitted, activeWorkflow),
       }));
@@ -3911,7 +3965,7 @@ export default function Workbench() {
         messages: structuredClone(priorMessages),
       },
       workflowStack: [activeWorkflow.id],
-      executionLimiter: createWorkflowTaskLimiter(workflowParallelism),
+      executionLimiter: createWorkflowTaskLimiter(() => workflowParallelismRef.current),
     };
     context.values[portValueKey(start.id, "prompt")] = startInputs.prompt;
     context.values[portValueKey(start.id, "files")] = files;
@@ -4913,7 +4967,12 @@ export default function Workbench() {
                 <>
                   <div className="settings-section tab-section">
                     <div className="section-title"><WorkflowIcon size={17} /><div><strong>Workflow execution</strong><small>Control how quickly parallel branches and calls are started.</small></div></div>
-                    <label className="field-label history-limit">Maximum parallel nodes<input type="number" min={MIN_WORKFLOW_PARALLELISM} max={MAX_WORKFLOW_PARALLELISM} value={workflowParallelism} onChange={(event) => setWorkflowParallelism(normalizeWorkflowParallelism(event.target.value))} /><small className="field-help">Between {MIN_WORKFLOW_PARALLELISM} and {MAX_WORKFLOW_PARALLELISM}. Use 1 for sequential execution; lower values reduce memory use and API request bursts.</small></label>
+                    <label className="check-field automatic-parallelism"><input type="checkbox" checked={automaticWorkflowParallelism} onChange={(event) => setAutomaticWorkflowParallelism(event.target.checked)} /><span>Set limit automatically</span></label>
+                    {automaticWorkflowParallelism ? (
+                      <div className={`pressure-status pressure-${systemPressureLevel}`}><span>System pressure: <strong>{systemPressureLevel}</strong></span><span>Current limit: <strong>{automaticParallelism} node{automaticParallelism === 1 ? "" : "s"}</strong></span><small>Rechecked every 2 seconds using available CPU, memory, and responsiveness signals.</small></div>
+                    ) : (
+                      <label className="field-label history-limit">Maximum parallel nodes<input type="number" min={MIN_WORKFLOW_PARALLELISM} max={MAX_WORKFLOW_PARALLELISM} value={workflowParallelism} onChange={(event) => setWorkflowParallelism(normalizeWorkflowParallelism(event.target.value))} /><small className="field-help">Between {MIN_WORKFLOW_PARALLELISM} and {MAX_WORKFLOW_PARALLELISM}. Use 1 for sequential execution; lower values reduce memory use and API request bursts.</small></label>
+                    )}
                   </div>
                   <div className="settings-section">
                     <div className="section-title"><Undo2 size={17} /><div><strong>Workflow history</strong><small>Choose how many workflow changes are available to undo.</small></div></div>

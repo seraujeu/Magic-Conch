@@ -36,7 +36,7 @@ test("uses typed data edges as concurrent workflow dependencies", async () => {
 
   assert.match(workbench, /type PortDataType = "prompt" \| "files"/);
   assert.doesNotMatch(workbench, /type PortDataType = [^;]*"flow"/);
-  assert.match(workbench, /mapWithConcurrencyLimit\(executable, workflowParallelism/);
+  assert.match(workbench, /mapWithConcurrencyLimit\(executable, \(\) => workflowParallelismRef\.current/);
   assert.match(workbench, /predecessors\.every\(\(id\) => settled\.has\(id\)\)/);
   assert.match(workbench, /function migrateWorkflow/);
   assert.doesNotMatch(css, /\.type-flow|\.edge-flow/);
@@ -215,9 +215,18 @@ test("lets users limit parallel workflow execution", async () => {
   const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
   assert.match(workbench, /magic-conch-workflow-parallelism/);
   assert.match(workbench, />Maximum parallel nodes</);
-  assert.match(workbench, /createWorkflowTaskLimiter\(workflowParallelism\)/);
-  assert.match(workbench, /mapWithConcurrencyLimit\(activeReady, workflowParallelism/);
-  assert.match(workbench, /mapWithConcurrencyLimit\(executable, workflowParallelism/);
+  assert.match(workbench, />Set limit automatically</);
+  assert.match(workbench, /magic-conch-workflow-parallelism-auto/);
+  assert.match(workbench, /createWorkflowTaskLimiter\(\(\) => workflowParallelismRef\.current\)/);
+  assert.match(workbench, /mapWithConcurrencyLimit\(activeReady, \(\) => workflowParallelismRef\.current/);
+  assert.match(workbench, /mapWithConcurrencyLimit\(executable, \(\) => workflowParallelismRef\.current/);
+});
+
+test("uses direct links for fan-out instead of offering a Parallel node", async () => {
+  const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(workbench, /parallel: \{ label: "Parallel"/);
+  assert.doesNotMatch(workbench, /types: \[[^\]]*"parallel"/);
+  assert.match(workbench, /bypassLegacyParallelNodes\(workflow\)/);
 });
 
 test("renders chat messages as GitHub-flavored Markdown", async () => {

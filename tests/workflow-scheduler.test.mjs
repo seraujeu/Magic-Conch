@@ -8,6 +8,7 @@ import {
   mapWithConcurrencyLimit,
   normalizeWorkflowParallelism,
 } from "../lib/workflow-scheduler.ts";
+import { recommendWorkflowParallelism } from "../lib/system-pressure.ts";
 
 const edge = (from, fromPort, toPort) => ({ from, fromPort, toPort });
 
@@ -195,4 +196,36 @@ test("shares one execution budget across nested workflow schedulers", async () =
   ]);
 
   assert.equal(peak, 3);
+});
+
+test("reduces automatic parallelism as system pressure rises", () => {
+  const base = { hardwareConcurrency: 16, deviceMemoryGb: 16 };
+  assert.deepEqual(recommendWorkflowParallelism(base), { level: "low", limit: 8, capacity: 8 });
+  assert.equal(recommendWorkflowParallelism({ ...base, eventLoopLagMs: 75 }).limit, 5);
+  assert.equal(recommendWorkflowParallelism({ ...base, heapUtilization: 0.8 }).limit, 2);
+  assert.equal(recommendWorkflowParallelism({ ...base, cpuPressure: "critical" }).limit, 1);
+});
+
+test("a shared limiter reads an updated automatic limit before starting queued work", async () => {
+  let limit = 2;
+  const limiter = createWorkflowTaskLimiter(() => limit);
+  let releaseFirst;
+  let releaseSecond;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const secondGate = new Promise((resolve) => { releaseSecond = resolve; });
+  const starts = [];
+  const tasks = [0, 1, 2].map((index) => limiter.run(async () => {
+    starts.push(index);
+    if (index === 0) await firstGate;
+    if (index === 1) await secondGate;
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(starts, [0, 1]);
+  limit = 1;
+  releaseFirst();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(starts, [0, 1]);
+  releaseSecond();
+  await Promise.all(tasks);
+  assert.deepEqual(starts, [0, 1, 2]);
 });

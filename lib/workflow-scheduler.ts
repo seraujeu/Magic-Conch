@@ -21,10 +21,16 @@ export type WorkflowTaskLimiter = {
   run: <T>(task: () => Promise<T>) => Promise<T>;
 };
 
+export type WorkflowParallelism = number | (() => number);
+
 export function normalizeWorkflowParallelism(value: unknown) {
   const parsed = Math.trunc(Number(value));
   if (!Number.isFinite(parsed)) return DEFAULT_WORKFLOW_PARALLELISM;
   return Math.max(MIN_WORKFLOW_PARALLELISM, Math.min(MAX_WORKFLOW_PARALLELISM, parsed));
+}
+
+function resolveWorkflowParallelism(parallelism: WorkflowParallelism) {
+  return normalizeWorkflowParallelism(typeof parallelism === "function" ? parallelism() : parallelism);
 }
 
 /**
@@ -33,11 +39,11 @@ export function normalizeWorkflowParallelism(value: unknown) {
  */
 export async function mapWithConcurrencyLimit<T, R>(
   items: readonly T[],
-  parallelism: number,
+  parallelism: WorkflowParallelism,
   task: (item: T, index: number) => Promise<R>,
 ) {
   const results = new Array<R>(items.length);
-  const workerCount = Math.min(normalizeWorkflowParallelism(parallelism), items.length);
+  const workerCount = Math.min(resolveWorkflowParallelism(parallelism), items.length);
   let nextIndex = 0;
   let stopped = false;
   let hasError = false;
@@ -67,8 +73,7 @@ export async function mapWithConcurrencyLimit<T, R>(
  * Shares one concurrency budget across nested reusable workflows. Workflow
  * container nodes do not acquire a permit; their executable child nodes do.
  */
-export function createWorkflowTaskLimiter(parallelism: number): WorkflowTaskLimiter {
-  const limit = normalizeWorkflowParallelism(parallelism);
+export function createWorkflowTaskLimiter(parallelism: WorkflowParallelism): WorkflowTaskLimiter {
   const queue: Array<{
     task: () => Promise<unknown>;
     resolve: (value: unknown) => void;
@@ -77,7 +82,7 @@ export function createWorkflowTaskLimiter(parallelism: number): WorkflowTaskLimi
   let active = 0;
 
   const drain = () => {
-    while (active < limit && queue.length) {
+    while (active < resolveWorkflowParallelism(parallelism) && queue.length) {
       const entry = queue.shift()!;
       active += 1;
       Promise.resolve()

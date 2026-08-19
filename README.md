@@ -150,3 +150,9 @@ npm run lint
 The application uses vinext, React, Vite, and Cloudflare's local development
 runtime. `.openai/hosting.json` retains the optional Sites binding contract;
 D1 and R2 remain disabled for this local-first application.
+
+## Creator guides
+
+- [Vibe-coding a plug-in](docs/VIBE_CODING_PLUGIN.md)
+- [Vibe-coding a workflow](docs/VIBE_CODING_WORKFLOW.md)
+- [Node purpose, ports, and rules reference](docs/NODE_REFERENCE.md)

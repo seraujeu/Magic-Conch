@@ -6,6 +6,7 @@ import {
   createJoinInput,
   defaultJoinTemplate,
   growJoinInputs,
+  joinInputVariable,
 } from "../lib/join-aggregate.ts";
 
 const inputs = [
@@ -45,4 +46,13 @@ test("adds a fresh join input only when the final available port is linked", () 
     ...ports,
     { id: "next-port", variable: "input3" },
   ]);
+});
+
+test("falls back to a generated variable for legacy join inputs", () => {
+  assert.equal(joinInputVariable({ id: "legacy-port" }, 0), "input1");
+  assert.equal(defaultJoinTemplate([{ id: "legacy-port" }]), "{{input1}}");
+  assert.deepEqual(
+    aggregateJoinValues("object", [{ id: "legacy-port", value: "Hello" }]),
+    { input1: "Hello" },
+  );
 });

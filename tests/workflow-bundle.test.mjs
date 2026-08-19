@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { collectWorkflowBundleDependencies, portableDependencySegment, remapPackagedWorkflowIds, workflowRuntimeNodeIds } from "../lib/workflow-bundle.ts";
+import { collectWorkflowBundleDependencies, createWorkflowJsonBundle, portableDependencySegment, remapPackagedWorkflowIds, unpackWorkflowJsonBundle, workflowRuntimeNodeIds } from "../lib/workflow-bundle.ts";
 
 test("collects called workflows transitively and only their used plug-ins", () => {
   const leaf = { id: "leaf", nodes: [{ type: "image-tools:resize", config: {} }] };
@@ -35,6 +35,32 @@ test("remaps imported workflow ids and their internal calls together", () => {
   assert.equal(imported[1].id, "new-2");
   assert.equal(imported[0].nodes[0].config.calledWorkflowId, "new-2");
   assert.equal(imported[1].nodes[0].config.calledWorkflowId, "external");
+});
+
+test("keeps single-workflow JSON exports backward compatible", () => {
+  const root = { id: "root", nodes: [] };
+  assert.equal(createWorkflowJsonBundle([root]), root);
+  assert.deepEqual(unpackWorkflowJsonBundle(root), [root]);
+});
+
+test("packs and unpacks dependent workflows in JSON exports", () => {
+  const root = { id: "root", nodes: [{ type: "workflow", config: { calledWorkflowId: "child" } }] };
+  const child = { id: "child", nodes: [] };
+  const leaf = { id: "leaf", nodes: [] };
+  const exported = createWorkflowJsonBundle([root, child, leaf]);
+
+  assert.equal(exported.format, "magic-conch-workflow-bundle");
+  assert.equal(exported.version, 1);
+  assert.equal(exported.workflow, root);
+  assert.deepEqual(exported.dependentWorkflows, [child, leaf]);
+  assert.deepEqual(unpackWorkflowJsonBundle(exported), [root, child, leaf]);
+});
+
+test("rejects malformed workflow JSON bundle envelopes", () => {
+  assert.throws(
+    () => unpackWorkflowJsonBundle({ format: "magic-conch-workflow-bundle", version: 2, workflow: {}, dependentWorkflows: [] }),
+    /invalid or unsupported/,
+  );
 });
 
 test("finds runtime Load sources without including disconnected nodes", () => {

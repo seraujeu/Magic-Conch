@@ -495,6 +495,11 @@ button { color: inherit; }
 .local-first-note > div { display: flex; flex-direction: column; gap: 3px; }
 .local-first-note strong { font-size: 10px; }.local-first-note span { font-size: 8px; line-height: 1.4; }
 .history-limit { max-width: 210px; }
+.automatic-parallelism { margin-bottom: 12px; }
+.pressure-status { max-width: 360px; border: 1px solid #dce2d7; background: #f7f9f4; border-radius: 9px; padding: 10px 12px; display: flex; flex-wrap: wrap; gap: 5px 16px; color: #687169; font-size: 10px; }
+.pressure-status strong { color: var(--ink); text-transform: capitalize; }
+.pressure-status small { flex-basis: 100%; color: #929a94; font-size: 8px; line-height: 1.4; }
+.pressure-status.pressure-high, .pressure-status.pressure-critical { border-color: #ead8ca; background: #fcf7f2; }
 .ollama-test { margin-top: 2px; }
 .model-tags { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 5px; }
 .model-tags span { background: #f0f3e8; color: #657240; border: 1px solid #dfe6cf; border-radius: 6px; padding: 5px 7px; font-size: 8px; }

@@ -15,6 +15,37 @@ export type BundlePlugin = {
   nodes: { type: string }[];
 };
 
+export const WORKFLOW_JSON_BUNDLE_FORMAT = "magic-conch-workflow-bundle";
+
+export type WorkflowJsonBundle<W> = {
+  format: typeof WORKFLOW_JSON_BUNDLE_FORMAT;
+  version: 1;
+  workflow: W;
+  dependentWorkflows: W[];
+};
+
+export function createWorkflowJsonBundle<W>(workflows: W[]): W | WorkflowJsonBundle<W> {
+  if (!workflows.length) throw new Error("A workflow bundle needs a root workflow.");
+  if (workflows.length === 1) return workflows[0];
+  return {
+    format: WORKFLOW_JSON_BUNDLE_FORMAT,
+    version: 1,
+    workflow: workflows[0],
+    dependentWorkflows: workflows.slice(1),
+  };
+}
+
+export function unpackWorkflowJsonBundle<W>(value: unknown): W[] {
+  if (!value || typeof value !== "object" || (value as { format?: unknown }).format !== WORKFLOW_JSON_BUNDLE_FORMAT) {
+    return [value as W];
+  }
+  const bundle = value as Partial<WorkflowJsonBundle<W>>;
+  if (bundle.version !== 1 || !bundle.workflow || !Array.isArray(bundle.dependentWorkflows)) {
+    throw new Error("The workflow JSON bundle is invalid or unsupported.");
+  }
+  return [bundle.workflow, ...bundle.dependentWorkflows];
+}
+
 function bundleRuntimeNodes(workflow: BundleWorkflow) {
   if (!workflow.edges || workflow.nodes.some((node) => !node.id)) return workflow.nodes;
   const runtimeIds = workflowRuntimeNodeIds(workflow as {
