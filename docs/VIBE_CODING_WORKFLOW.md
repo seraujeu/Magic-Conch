@@ -274,6 +274,7 @@ Dynamic nodes need IDs stored in configuration. For example, router output ports
   },
   "save": {
     "key": "latest-result",
+    "fileExtension": "md",
     "collision": "overwrite",
     "saveFiles": "both"
   },
@@ -425,7 +426,7 @@ Use a **Workflow** node for behavior that is independently meaningful and reusab
 
 ### Add files and persistence
 
-Save and Load paths may be relative to the Magic Conch program folder or absolute. With no configured directory, they use `user-data/` by default. **Export JSON** contains the root definition and any transitively called workflow definitions; **Export with files** creates a ZIP that also contains used plug-ins and snapshots of runtime Load/List Directory data.
+Save and Load paths may be relative to the Magic Conch program folder or absolute. With no configured directory, they use `user-data/` by default. Their optional `fileExtension` setting accepts values such as `json`, `.txt`, or `md`; it defaults to `json`, must match between paired Save and Load nodes, and changes the record filename rather than its JSON content. **Export JSON** contains the root definition and any transitively called workflow definitions; **Export with files** creates a ZIP that also contains used plug-ins and snapshots of runtime Load/List Directory data.
 
 Do not use Load/Save as invisible glue. Name keys and subfolders after the data they contain, and decide whether overwrites, timestamps, or increments are appropriate.
 

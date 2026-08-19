@@ -26,6 +26,7 @@ import {
   History,
   Info,
   KeyRound,
+  LayoutGrid,
   LoaderCircle,
   Menu,
   MessageCircleQuestion,
@@ -65,6 +66,7 @@ import {
 import {
   ChangeEvent,
   DragEvent as ReactDragEvent,
+  MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
   WheelEvent as ReactWheelEvent,
   useEffect,
@@ -142,6 +144,7 @@ import { displayNodeDirectory, migrateLegacyNodeDirectory, resolveNodeDirectory 
 import { collectWorkflowBundleDependencies, createWorkflowJsonBundle, portableDependencySegment, remapPackagedWorkflowIds, unpackWorkflowJsonBundle, workflowRuntimeNodeIds } from "../lib/workflow-bundle";
 import { applyBundledLoadSnapshots, bundledLoadResult, BundledLoadSnapshot, materializedLoadDirectory } from "../lib/workflow-load-bundle";
 import { workflowArchiveFilename, workflowExportFilename, workflowFileText } from "../lib/workflow-files";
+import { organizeWorkflowNodes } from "../lib/workflow-layout";
 import { createDebugLog, debugLogFilename } from "../lib/debug-log";
 import { buildAIWorkAssignerSystemPrompt, parseAIWorkAssignments } from "../lib/ai-work-assigner";
 import { composeStartInputs } from "../lib/start-inputs";
@@ -263,6 +266,7 @@ type FlowNode = {
     ollamaRepeatLastN?: number;
     ollamaStop?: string;
     key?: string;
+    fileExtension?: string;
     collision?: "overwrite" | "timestamp" | "increment";
     loadMode?: "latest" | "all" | "exact" | "folder";
     directoryName?: string;
@@ -841,6 +845,7 @@ async function materializeWorkflowLoadFiles(workflow: Workflow) {
         operation: "materialize-load",
         directory,
         key: recordKey,
+        fileExtension: node.config.fileExtension || "json",
         value: snapshot.value,
         files: snapshot.files,
         writeRecord: node.type === "load" && node.config.loadMode !== "folder",
@@ -1287,6 +1292,7 @@ export default function Workbench() {
   const [isDraggingWorkflowFile, setIsDraggingWorkflowFile] = useState(false);
   const [editingMessage, setEditingMessage] = useState<{ id: string; text: string } | null>(null);
   const [editingWorkflow, setEditingWorkflow] = useState<{ id: string; name: string } | null>(null);
+  const [workflowContextMenu, setWorkflowContextMenu] = useState<{ workflowId: string; x: number; y: number } | null>(null);
   const [editingChatSession, setEditingChatSession] = useState<{ id: string; title: string } | null>(null);
   const [newChatFolderName, setNewChatFolderName] = useState<string | null>(null);
   const [editingChatFolder, setEditingChatFolder] = useState<{ id: string; name: string } | null>(null);
@@ -1780,6 +1786,24 @@ export default function Workbench() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, isRunning]);
 
+  useEffect(() => {
+    if (!workflowContextMenu) return;
+    const closeMenu = () => setWorkflowContextMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeMenu();
+    };
+    window.addEventListener("pointerdown", closeMenu);
+    window.addEventListener("blur", closeMenu);
+    window.addEventListener("resize", closeMenu);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeMenu);
+      window.removeEventListener("blur", closeMenu);
+      window.removeEventListener("resize", closeMenu);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [workflowContextMenu]);
+
   function showToast(message: string) {
     setToast(message);
     window.setTimeout(() => setToast(null), 2800);
@@ -2177,9 +2201,9 @@ export default function Workbench() {
           : type === "input"
             ? { prompt: "What additional information should I know?" }
             : type === "save"
-              ? { key: "record-name", collision: "increment", saveFiles: "both" }
+              ? { key: "record-name", fileExtension: "json", collision: "increment", saveFiles: "both" }
               : type === "load"
-                ? { key: "record-name", loadMode: "latest" }
+                ? { key: "record-name", fileExtension: "json", loadMode: "latest" }
                 : type === "condition-ai"
                   ? { provider: "openai", model: modelDefaults.openai, temperature: 0, routeCriteria: "Return true when the input satisfies this condition." }
                   : type === "condition-rule"
@@ -2640,6 +2664,36 @@ export default function Workbench() {
     showToast("Workflow duplicated");
   }
 
+  function openWorkflowCanvasContextMenu(event: ReactMouseEvent) {
+    const target = event.target as Element;
+    if (target.closest(".flow-node, .edge-group, .zoom-controls")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const menuWidth = 190;
+    const menuHeight = 176;
+    setWorkflowContextMenu({
+      workflowId: activeWorkflowId,
+      x: Math.min(event.clientX, window.innerWidth - menuWidth - 8),
+      y: Math.min(event.clientY, window.innerHeight - menuHeight - 8),
+    });
+  }
+
+  function organizeWorkflow(workflowId: string) {
+    setWorkflows((current) => current.map((workflow) => {
+      if (workflow.id !== workflowId) return workflow;
+      rememberWorkflow(workflow);
+      return {
+        ...workflow,
+        nodes: organizeWorkflowNodes(workflow.nodes, workflow.edges, {
+          nodeHeight: (node) => nodeCardHeight(node, plugins),
+        }),
+        updatedAt: new Date().toISOString(),
+      };
+    }));
+    setWorkflowContextMenu(null);
+    showToast("Nodes organized");
+  }
+
   function deleteWorkflow(workflowId: string) {
     if (workflows.length <= 1) {
       showToast("Keep at least one workflow");
@@ -2664,8 +2718,9 @@ export default function Workbench() {
     await writable.close();
   }
 
-  function localRecordKey(safeKey: string, segments: string[]) {
-    return `magic-conch-record:${segments.length ? `${segments.join("/")}/` : ""}${safeKey}`;
+  function localRecordKey(safeKey: string, fileExtension: string, segments: string[]) {
+    const extensionSuffix = fileExtension === "json" ? "" : `.${fileExtension}`;
+    return `magic-conch-record:${segments.length ? `${segments.join("/")}/` : ""}${safeKey}${extensionSuffix}`;
   }
 
   function configuredDefaultDirectory() {
@@ -2952,6 +3007,7 @@ export default function Workbench() {
   async function persistRecord(node: FlowNode, value: string, files: FileAsset[]) {
     const key = node.config.key || "workflow-result";
     const safeKey = (key || "workflow-result").replace(/[^a-zA-Z0-9-_]/g, "-");
+    const fileExtension = node.config.fileExtension?.trim().replace(/^\.+/, "").toLowerCase() || "json";
     const location = resolvedDirectoryForNode(node);
     const segments = location.subfolder;
     const localResult = await localDirectoryRequest<{ record: { files: string[] } }>({
@@ -2959,6 +3015,7 @@ export default function Workbench() {
       operation: "save-record",
       subfolder: segments,
       key: safeKey,
+      fileExtension,
       value,
       files,
       saveFiles: node.config.saveFiles || "both",
@@ -2972,16 +3029,17 @@ export default function Workbench() {
       assets: !localResult && node.config.saveFiles !== "data" ? files : undefined,
       savedAt: new Date().toISOString(),
     };
-    localStorage.setItem(localRecordKey(safeKey, segments), JSON.stringify(record));
+    localStorage.setItem(localRecordKey(safeKey, fileExtension, segments), JSON.stringify(record));
   }
 
   async function loadRecord(node: FlowNode) {
     const safeKey = (node.config.key || "workflow-result").replace(/[^a-zA-Z0-9-_]/g, "-");
+    const fileExtension = node.config.fileExtension?.trim().replace(/^\.+/, "").toLowerCase() || "json";
     const location = resolvedDirectoryForNode(node);
     const segments = location.subfolder;
     type StoredRecord = { value?: unknown; files?: string[]; assets?: FileAsset[] };
     const localRecord = () => {
-      const raw = localStorage.getItem(localRecordKey(safeKey, segments));
+      const raw = localStorage.getItem(localRecordKey(safeKey, fileExtension, segments));
       if (!raw) return null;
       try { return JSON.parse(raw) as StoredRecord; } catch { return null; }
     };
@@ -2996,6 +3054,7 @@ export default function Workbench() {
       operation: "load-record",
       subfolder: segments,
       key: safeKey,
+      fileExtension,
       loadMode: node.config.loadMode || "latest",
     });
     if (result?.found) return {
@@ -4321,6 +4380,7 @@ export default function Workbench() {
               onPointerCancel={finishPointer}
               onLostPointerCapture={finishPointer}
               onWheel={zoomCanvasWithWheel}
+              onContextMenu={openWorkflowCanvasContextMenu}
             >
               <div className="canvas-hint"><MousePointer2 size={13} /> Drag to select · Shift-click adds · Alt-drag pans · Scroll to zoom</div>
               {selectionBox && <div className="selection-box" style={{ left: selectionBox.x, top: selectionBox.y, width: selectionBox.width, height: selectionBox.height }} />}
@@ -4701,6 +4761,7 @@ export default function Workbench() {
                   {(selectedNode.type === "save" || selectedNode.type === "load") && (
                     <>
                       {(selectedNode.type === "save" || selectedNode.config.loadMode !== "folder") && <label className="field-label">File key<input value={selectedNode.config.key || ""} placeholder="record-name" onChange={(event) => updateNode({ config: { key: event.target.value } })} /><small className="field-help">Versioned files with the same key can coexist.</small></label>}
+                      {(selectedNode.type === "save" || selectedNode.config.loadMode !== "folder") && <label className="field-label">File extension<input value={selectedNode.config.fileExtension || "json"} placeholder="json" onChange={(event) => updateNode({ config: { fileExtension: event.target.value } })} /><small className="field-help">Enter an extension with or without a leading dot. Saved record content remains JSON.</small></label>}
                       <label className="field-label">Subfolder path<input value={selectedNode.config.subfolder || ""} placeholder="Optional, relative to the directory below" onChange={(event) => updateNode({ config: { subfolder: event.target.value } })} /><small className="field-help">Leave blank to use the directory itself.</small></label>
                       <label className="field-label">Directory path<input value={selectedNode.config.directoryPath ?? selectedNode.config.directoryName ?? ""} placeholder={`${configuredDefaultDirectory()} (default)`} onChange={(event) => updateNode({ config: { directoryPath: event.target.value, directoryName: undefined } })} /><small className="field-help">Relative paths start at the Magic Conch program folder. Absolute paths are supported. No browser permission is required.</small></label>
                       {selectedNode.type === "save" ? (
@@ -5003,6 +5064,25 @@ export default function Workbench() {
         </div>
       )}
       {toast && <div className="toast"><Check size={15} /> {toast}</div>}
+      {workflowContextMenu && (() => {
+        const workflow = workflows.find((item) => item.id === workflowContextMenu.workflowId);
+        if (!workflow) return null;
+        return (
+          <div
+            className="workflow-context-menu"
+            role="menu"
+            aria-label={`${workflow.name} options`}
+            style={{ left: workflowContextMenu.x, top: workflowContextMenu.y }}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <button role="menuitem" onClick={() => organizeWorkflow(workflow.id)}><LayoutGrid size={14} /> Organize nodes</button>
+            <div className="context-menu-divider" />
+            <button role="menuitem" onClick={() => { setEditingWorkflow({ id: workflow.id, name: workflow.name }); setWorkflowContextMenu(null); }}><Pencil size={14} /> Rename</button>
+            <button role="menuitem" onClick={() => { duplicateWorkflow(workflow.id); setWorkflowContextMenu(null); }}><Copy size={14} /> Duplicate</button>
+            <button className="danger" role="menuitem" onClick={() => { deleteWorkflow(workflow.id); setWorkflowContextMenu(null); }}><Trash2 size={14} /> Delete</button>
+          </div>
+        );
+      })()}
     </main>
   );
 }

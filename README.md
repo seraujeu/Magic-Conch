@@ -155,4 +155,5 @@ D1 and R2 remain disabled for this local-first application.
 
 - [Vibe-coding a plug-in](docs/VIBE_CODING_PLUGIN.md)
 - [Vibe-coding a workflow](docs/VIBE_CODING_WORKFLOW.md)
+- [Workflow syntax and template tokens](docs/WORKFLOW_SYNTAX.md)
 - [Node purpose, ports, and rules reference](docs/NODE_REFERENCE.md)

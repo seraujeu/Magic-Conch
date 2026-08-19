@@ -85,6 +85,39 @@ test("uses a configured relative directory and keeps subfolders below it", async
   );
 });
 
+test("saves and loads records with a configured file extension", async (t) => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "magic-conch-record-extension-"));
+  t.after(() => rm(projectRoot, { recursive: true, force: true }));
+
+  await handleLocalDirectoryRequest(projectRoot, {
+    operation: "save-record",
+    key: "notes",
+    fileExtension: ".md",
+    value: "custom extension",
+    saveFiles: "data",
+  });
+
+  const stored = JSON.parse(await readFile(join(projectRoot, "user-data", "notes.md"), "utf8"));
+  assert.equal(stored.value, "custom extension");
+  const loaded = await handleLocalDirectoryRequest(projectRoot, {
+    operation: "load-record",
+    key: "notes",
+    fileExtension: "md",
+  });
+  assert.equal(loaded.found, true);
+  assert.equal(loaded.value, "custom extension");
+});
+
+test("rejects invalid record file extensions", async () => {
+  await assert.rejects(handleLocalDirectoryRequest(".", {
+    operation: "save-record",
+    key: "notes",
+    fileExtension: "../txt",
+    value: "unsafe",
+    saveFiles: "data",
+  }), /file extension is invalid/);
+});
+
 test("uses configured absolute paths without browser permission handles", async (t) => {
   const projectRoot = await mkdtemp(join(tmpdir(), "magic-conch-project-root-"));
   const absoluteDirectory = await mkdtemp(join(tmpdir(), "magic-conch-absolute-directory-"));

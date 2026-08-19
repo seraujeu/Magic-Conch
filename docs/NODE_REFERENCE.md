@@ -248,6 +248,7 @@ Ports use `port_id:type`. For example, `prompt:prompt` means the JSON port ID is
 - Connected `key`, `subfolder`, and `recursive` values override configured fallbacks.
 - `folder` mode uses `includeSubfolders`/`recursive` and returns file names as the prompt value.
 - Other modes use `key` (default `workflow-result`) to select saved records.
+- `fileExtension` selects the record extension, with or without a leading dot, and defaults to `json`. Save and Load must use the same extension.
 - Directory paths follow the same absolute/relative rules as Load Directory.
 - With no incoming edge, Load runs as a pull-style source; any connected input becomes an execution gate.
 
@@ -262,6 +263,7 @@ Ports use `port_id:type`. For example, `prompt:prompt` means the JSON port ID is
 **Rules and settings:**
 
 - Connected `key` and `subfolder` override configured values. The default key is `workflow-result`.
+- `fileExtension` selects the record extension, with or without a leading dot, and defaults to `json`. The record content remains JSON.
 - `saveFiles` is `data`, `files`, or `both`.
 - `collision` is `increment`, `timestamp`, or `overwrite`.
 - Directory paths may be absolute or relative; omitted paths use the application default, normally `user-data/`.

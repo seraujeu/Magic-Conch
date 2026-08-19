@@ -15,6 +15,7 @@ export type LocalDirectoryRequest = {
   operation?: "save-record" | "load-record" | "list-files" | "materialize-load";
   subfolder?: string[];
   key?: string;
+  fileExtension?: string;
   value?: string;
   files?: FileAsset[];
   saveFiles?: "both" | "data" | "files";
@@ -74,6 +75,20 @@ function safeFilename(name: unknown) {
     throw new Error("The file name is invalid.");
   }
   return name;
+}
+
+function recordExtension(extension: unknown) {
+  if (extension == null || extension === "") return "json";
+  if (typeof extension !== "string") throw new Error("The file extension is invalid.");
+  const normalized = extension.trim().replace(/^\.+/, "").toLowerCase();
+  if (!normalized || !/^[a-z0-9][a-z0-9._-]*$/.test(normalized)) {
+    throw new Error("The file extension is invalid.");
+  }
+  return normalized;
+}
+
+function recordFilename(key: string, extension: unknown) {
+  return `${key}.${recordExtension(extension)}`;
 }
 
 function safeRelativeFilename(name: unknown) {
@@ -137,6 +152,7 @@ async function saveRecord(projectRoot: string, request: LocalDirectoryRequest) {
   const folder = resolveSubfolder(root, request.subfolder);
   await mkdir(folder, { recursive: true });
   const key = safeFilename(request.key || "workflow-result");
+  const filename = recordFilename(key, request.fileExtension);
   const collision = request.collision || "increment";
   const savedFiles: string[] = [];
   if (request.saveFiles !== "data") {
@@ -153,7 +169,7 @@ async function saveRecord(projectRoot: string, request: LocalDirectoryRequest) {
     savedAt: new Date().toISOString(),
   };
   if (request.saveFiles !== "files") {
-    const path = await collisionSafePath(folder, `${key}.json`, collision);
+    const path = await collisionSafePath(folder, filename, collision);
     await writeFile(path, `${JSON.stringify(record, null, 2)}\n`, "utf8");
   }
   return { record, directory: root };
@@ -181,13 +197,14 @@ async function materializeLoad(projectRoot: string, request: LocalDirectoryReque
   }
   if (request.writeRecord) {
     const key = safeFilename(request.key || "workflow-result");
+    const filename = recordFilename(key, request.fileExtension);
     const record: StoredRecord = {
       key,
       value: String(request.value ?? ""),
       files,
       savedAt: new Date().toISOString(),
     };
-    await writeFile(resolve(folder, `${key}.json`), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    await writeFile(resolve(folder, filename), `${JSON.stringify(record, null, 2)}\n`, "utf8");
   }
   return { files, directory: root };
 }
@@ -196,6 +213,9 @@ async function loadRecord(projectRoot: string, request: LocalDirectoryRequest) {
   const root = resolveConfiguredDirectory(projectRoot, request.directory);
   const folder = resolveSubfolder(root, request.subfolder);
   const key = safeFilename(request.key || "workflow-result");
+  const filename = recordFilename(key, request.fileExtension);
+  const extension = extname(filename);
+  const stem = filename.slice(0, -extension.length);
   let entries;
   try {
     entries = await readdir(folder, { withFileTypes: true });
@@ -204,8 +224,8 @@ async function loadRecord(projectRoot: string, request: LocalDirectoryRequest) {
     throw error;
   }
   const names = entries.filter((entry) => entry.isFile()).map((entry) => entry.name).filter((name) => {
-    const exact = name === `${key}.json`;
-    const versioned = name.startsWith(`${key}-`) && name.endsWith(".json");
+    const exact = name === filename;
+    const versioned = name.startsWith(`${stem}-`) && name.endsWith(extension);
     return request.loadMode === "exact" ? exact : exact || versioned;
   });
   const matches = await Promise.all(names.map(async (name) => ({ name, modified: (await stat(resolve(folder, name))).mtimeMs })));
