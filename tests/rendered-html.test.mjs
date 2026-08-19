@@ -36,7 +36,7 @@ test("uses typed data edges as concurrent workflow dependencies", async () => {
 
   assert.match(workbench, /type PortDataType = "prompt" \| "files"/);
   assert.doesNotMatch(workbench, /type PortDataType = [^;]*"flow"/);
-  assert.match(workbench, /Promise\.all\(executable\.map/);
+  assert.match(workbench, /mapWithConcurrencyLimit\(executable, workflowParallelism/);
   assert.match(workbench, /predecessors\.every\(\(id\) => settled\.has\(id\)\)/);
   assert.match(workbench, /function migrateWorkflow/);
   assert.doesNotMatch(css, /\.type-flow|\.edge-flow/);
@@ -119,9 +119,10 @@ test("provides a Chat Session source node with typed history and metadata output
 });
 
 test("offers guided OCR languages and selectable local or AI vision engines", async () => {
-  const [workbench, ocr] = await Promise.all([
+  const [workbench, ocr, ocrBrowser] = await Promise.all([
     readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
     readFile(new URL("../lib/ocr.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/ocr-browser.ts", import.meta.url), "utf8"),
   ]);
 
   assert.match(workbench, />OCR engine</);
@@ -132,9 +133,14 @@ test("offers guided OCR languages and selectable local or AI vision engines", as
   assert.match(workbench, />Ollama vision — local model</);
   assert.match(workbench, />Primary language</);
   assert.match(workbench, />Additional languages</);
-  assert.match(workbench, /prepareVisionOcrInputs/);
+  assert.match(workbench, /await import\("\.\.\/lib\/ocr-browser"\)/);
   assert.match(ocr, /OCR_LANGUAGE_OPTIONS/);
   assert.match(ocr, /visionOcrPrompt/);
+  assert.doesNotMatch(ocr, /import\("(?:pdfjs-dist|tesseract\.js)/);
+  assert.doesNotMatch(ocr, /document\.createElement|typeof window/);
+  assert.match(ocrBrowser, /^"use client";/);
+  assert.match(ocrBrowser, /typeof window === "undefined"/);
+  assert.match(ocrBrowser, /import\("pdfjs-dist\/build\/pdf\.worker\.min\.mjs\?url"\)/);
 });
 
 test("runs one workflow from another through the Use Workflow node", async () => {
@@ -144,7 +150,7 @@ test("runs one workflow from another through the Use Workflow node", async () =>
   assert.match(workbench, /if \(node\.type === "workflow"\) return \{ inputs: \[\{ id: "prompt"/);
   assert.match(workbench, /calledWorkflowId\?: string/);
   assert.match(workbench, /async function executeCalledWorkflow/);
-  assert.match(workbench, /result: await executeGraphNode\(node, context, emitted, workflow\)/);
+  assert.match(workbench, /result: await executeScheduledGraphNode\(node, context, emitted, workflow\)/);
   assert.match(workbench, /Workflow recursion detected/);
   assert.match(workbench, /Reusable workflows must run from Start to End without requesting another message/);
   assert.match(workbench, />Select a workflow…<\/option>/);
@@ -203,6 +209,15 @@ test("stores large workflow and plug-in artifacts outside localStorage", async (
   assert.match(workbench, /writeStoredArtifact\("plugins", plugins\)/);
   assert.match(workbench, /artifactFallbackJson\(workflows\)/);
   assert.doesNotMatch(workbench, /localStorage\.setItem\("magic-conch-workflows", JSON\.stringify\(workflows\)\)/);
+});
+
+test("lets users limit parallel workflow execution", async () => {
+  const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
+  assert.match(workbench, /magic-conch-workflow-parallelism/);
+  assert.match(workbench, />Maximum parallel nodes</);
+  assert.match(workbench, /createWorkflowTaskLimiter\(workflowParallelism\)/);
+  assert.match(workbench, /mapWithConcurrencyLimit\(activeReady, workflowParallelism/);
+  assert.match(workbench, /mapWithConcurrencyLimit\(executable, workflowParallelism/);
 });
 
 test("renders chat messages as GitHub-flavored Markdown", async () => {

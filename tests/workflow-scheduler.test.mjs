@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { isWorkflowNodeActive } from "../lib/workflow-scheduler.ts";
+import {
+  createWorkflowTaskLimiter,
+  DEFAULT_WORKFLOW_PARALLELISM,
+  isWorkflowNodeActive,
+  mapWithConcurrencyLimit,
+  normalizeWorkflowParallelism,
+} from "../lib/workflow-scheduler.ts";
 
 const edge = (from, fromPort, toPort) => ({ from, fromPort, toPort });
 
@@ -16,6 +22,15 @@ test("runs configured Load nodes as pull sources when their outputs are needed",
   assert.equal(isWorkflowNodeActive({
     nodeType: "list-directory",
     inputPorts: [{ id: "trigger" }, { id: "subfolder" }, { id: "recursive" }],
+    incoming: [],
+    emittedPortKeys: new Set(),
+  }), true);
+});
+
+test("runs configured memory updates as pull sources", () => {
+  assert.equal(isWorkflowNodeActive({
+    nodeType: "update-memory",
+    inputPorts: [{ id: "content" }, { id: "memory_id" }],
     incoming: [],
     emittedPortKeys: new Set(),
   }), true);
@@ -139,4 +154,45 @@ test("activates Join with an empty result when no connected input emitted", () =
     ],
     emittedPortKeys: new Set(),
   }), true);
+});
+
+test("normalizes the saved workflow parallelism setting", () => {
+  assert.equal(normalizeWorkflowParallelism(undefined), DEFAULT_WORKFLOW_PARALLELISM);
+  assert.equal(normalizeWorkflowParallelism("8"), 8);
+  assert.equal(normalizeWorkflowParallelism(0), 1);
+  assert.equal(normalizeWorkflowParallelism(500), 32);
+});
+
+test("maps ready nodes without exceeding the selected parallelism", async () => {
+  let active = 0;
+  let peak = 0;
+  const results = await mapWithConcurrencyLimit([1, 2, 3, 4, 5, 6], 2, async (value) => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    active -= 1;
+    return value * 10;
+  });
+
+  assert.equal(peak, 2);
+  assert.deepEqual(results, [10, 20, 30, 40, 50, 60]);
+});
+
+test("shares one execution budget across nested workflow schedulers", async () => {
+  const limiter = createWorkflowTaskLimiter(3);
+  let active = 0;
+  let peak = 0;
+  const runTask = () => limiter.run(async () => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    active -= 1;
+  });
+
+  await Promise.all([
+    mapWithConcurrencyLimit([1, 2, 3, 4], 4, runTask),
+    mapWithConcurrencyLimit([5, 6, 7, 8], 4, runTask),
+  ]);
+
+  assert.equal(peak, 3);
 });

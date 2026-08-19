@@ -13,7 +13,98 @@ export type NodeActivation = {
   emittedPortKeys: ReadonlySet<string>;
 };
 
-const PULL_SOURCE_NODE_TYPES = new Set(["load", "list-directory"]);
+export const DEFAULT_WORKFLOW_PARALLELISM = 4;
+export const MIN_WORKFLOW_PARALLELISM = 1;
+export const MAX_WORKFLOW_PARALLELISM = 32;
+
+export type WorkflowTaskLimiter = {
+  run: <T>(task: () => Promise<T>) => Promise<T>;
+};
+
+export function normalizeWorkflowParallelism(value: unknown) {
+  const parsed = Math.trunc(Number(value));
+  if (!Number.isFinite(parsed)) return DEFAULT_WORKFLOW_PARALLELISM;
+  return Math.max(MIN_WORKFLOW_PARALLELISM, Math.min(MAX_WORKFLOW_PARALLELISM, parsed));
+}
+
+/**
+ * Runs a list with bounded parallelism while preserving result order.
+ * Once one item fails, no additional queued items are started.
+ */
+export async function mapWithConcurrencyLimit<T, R>(
+  items: readonly T[],
+  parallelism: number,
+  task: (item: T, index: number) => Promise<R>,
+) {
+  const results = new Array<R>(items.length);
+  const workerCount = Math.min(normalizeWorkflowParallelism(parallelism), items.length);
+  let nextIndex = 0;
+  let stopped = false;
+  let hasError = false;
+  let firstError: unknown;
+
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (!stopped) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      try {
+        results[index] = await task(items[index], index);
+      } catch (error) {
+        stopped = true;
+        if (!hasError) firstError = error;
+        hasError = true;
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  if (hasError) throw firstError;
+  return results;
+}
+
+/**
+ * Shares one concurrency budget across nested reusable workflows. Workflow
+ * container nodes do not acquire a permit; their executable child nodes do.
+ */
+export function createWorkflowTaskLimiter(parallelism: number): WorkflowTaskLimiter {
+  const limit = normalizeWorkflowParallelism(parallelism);
+  const queue: Array<{
+    task: () => Promise<unknown>;
+    resolve: (value: unknown) => void;
+    reject: (reason?: unknown) => void;
+  }> = [];
+  let active = 0;
+
+  const drain = () => {
+    while (active < limit && queue.length) {
+      const entry = queue.shift()!;
+      active += 1;
+      Promise.resolve()
+        .then(entry.task)
+        .then(entry.resolve, entry.reject)
+        .finally(() => {
+          active -= 1;
+          drain();
+        });
+    }
+  };
+
+  return {
+    run<T>(task: () => Promise<T>) {
+      return new Promise<T>((resolve, reject) => {
+        queue.push({
+          task,
+          resolve: resolve as (value: unknown) => void,
+          reject,
+        });
+        drain();
+      });
+    },
+  };
+}
+
+const PULL_SOURCE_NODE_TYPES = new Set(["load", "list-directory", "update-memory"]);
 
 function portValueKey(nodeId: string, portId: string) {
   return `${nodeId}:${portId}`;

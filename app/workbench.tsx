@@ -127,7 +127,16 @@ import {
   WORKFLOW_SYNTAX,
   WorkflowSyntaxContext,
 } from "../lib/workflow-syntax";
-import { isWorkflowNodeActive } from "../lib/workflow-scheduler";
+import {
+  createWorkflowTaskLimiter,
+  DEFAULT_WORKFLOW_PARALLELISM,
+  isWorkflowNodeActive,
+  mapWithConcurrencyLimit,
+  MAX_WORKFLOW_PARALLELISM,
+  MIN_WORKFLOW_PARALLELISM,
+  normalizeWorkflowParallelism,
+  WorkflowTaskLimiter,
+} from "../lib/workflow-scheduler";
 import { displayNodeDirectory, migrateLegacyNodeDirectory, resolveNodeDirectory } from "../lib/node-directory";
 import { collectWorkflowBundleDependencies, portableDependencySegment, remapPackagedWorkflowIds, workflowRuntimeNodeIds } from "../lib/workflow-bundle";
 import { applyBundledLoadSnapshots, bundledLoadResult, BundledLoadSnapshot, materializedLoadDirectory } from "../lib/workflow-load-bundle";
@@ -137,18 +146,23 @@ import { buildAIWorkAssignerSystemPrompt, parseAIWorkAssignments } from "../lib/
 import { composeStartInputs } from "../lib/start-inputs";
 import { loadChatSession } from "../lib/chat-session-node";
 import {
+  applyUserMemoryOperation,
+  formatUserMemory,
+  formatUserSettings,
+  MemoryOperation,
+  normalizeUserMemories,
+  UserMemory,
+} from "../lib/user-personalization";
+import {
   combineOcrResults,
   configuredOcrLanguages,
   OCR_LANGUAGE_OPTIONS,
-  OcrEngine,
-  OcrResult,
   ocrOutputFileNames,
-  performOcr,
-  prepareVisionOcrInputs,
   visionOcrPrompt,
 } from "../lib/ocr";
+import type { OcrEngine, OcrResult } from "../lib/ocr";
 
-type BuiltinNodeType = "start" | "chat-session" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "ocr" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
+type BuiltinNodeType = "start" | "chat-session" | "load-settings" | "update-memory" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "ocr" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "parallel" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
 type FileAsset = { name: string; type: string; data: string; size: number; bundleLoadNodeId?: string };
 type PortDataType = "prompt" | "files" | "document" | "text" | "number" | "boolean" | "string" | "integer" | "float" | "image" | "video" | "audio" | "any";
@@ -173,6 +187,7 @@ type WorkflowContext = {
     messages: Message[];
   };
   workflowStack?: string[];
+  executionLimiter: WorkflowTaskLimiter;
 };
 type FlowNode = {
   id: string;
@@ -203,6 +218,11 @@ type FlowNode = {
     sessionHistoryLimit?: number;
     sessionIncludeMessageTimes?: boolean;
     sessionIncludeAttachments?: boolean;
+    settingsIncludePreference?: boolean;
+    settingsIncludeMemory?: boolean;
+    memoryOperation?: MemoryOperation;
+    memoryContent?: string;
+    memoryId?: string;
     provider?: AIProvider;
     model?: string;
     systemPrompt?: string;
@@ -459,6 +479,8 @@ const NODE_META: Record<
 > = {
   start: { label: "Start", subtitle: "Entry point", color: "#27a36a", icon: Play },
   "chat-session": { label: "Chat Session", subtitle: "Load messages and session details", color: "#5279bd", icon: History },
+  "load-settings": { label: "Load User Settings", subtitle: "Load preference and memory", color: "#6873c8", icon: Settings },
+  "update-memory": { label: "Update User Memory", subtitle: "Add, edit, or remove a memory", color: "#9a5ca8", icon: BrainCircuit },
   input: { label: "Message", subtitle: "Prompt and file output", color: "#7c63e8", icon: MessageCircleQuestion },
   request: { label: "Request", subtitle: "Call an AI model", color: "#e17444", icon: Cloud },
   "ai-assigner": { label: "AI Work Assigner", subtitle: "Assign work to selected outputs", color: "#b95aa2", icon: BrainCircuit },
@@ -492,6 +514,7 @@ const NODE_META: Record<
 
 const BUILTIN_NODE_GROUPS: { id: string; label: string; types: BuiltinNodeType[] }[] = [
   { id: "essentials", label: "Essentials", types: ["start", "chat-session", "input", "end"] },
+  { id: "personalization", label: "Personalization", types: ["load-settings", "update-memory"] },
   { id: "ai", label: "AI", types: ["request", "ai-assigner"] },
   { id: "values", label: "Values", types: ["string", "integer", "float", "math", "set-state"] },
   { id: "files", label: "Files", types: ["list-directory", "load", "save", "media-size", "file-name", "ocr"] },
@@ -555,6 +578,29 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
       { id: "session_number", label: "session number", type: "integer" },
       { id: "message_count", label: "message count", type: "integer" },
       { id: "updated_at", label: "updated at", type: "string" },
+    ],
+  };
+  if (node.type === "load-settings") return {
+    inputs: [],
+    outputs: [
+      { id: "settings", label: "settings", type: "prompt" },
+      { id: "preference", label: "preference", type: "text" },
+      { id: "memory", label: "memory", type: "text" },
+      { id: "memories", label: "memories", type: "any" },
+      { id: "memory_count", label: "memory count", type: "integer" },
+    ],
+  };
+  if (node.type === "update-memory") return {
+    inputs: [
+      { id: "content", label: "memory content", type: "text" },
+      { id: "memory_id", label: "memory ID", type: "string" },
+    ],
+    outputs: [
+      { id: "memory", label: "memory", type: "any" },
+      { id: "memories", label: "memories", type: "any" },
+      { id: "memory_text", label: "memory text", type: "text" },
+      { id: "count", label: "count", type: "integer" },
+      { id: "changed", label: "changed", type: "boolean" },
     ],
   };
   if (node.type === "input") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "question", label: "question", type: "string" }, { id: "files", label: "files", type: "files" }, ...mediaInputs, documentIn], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
@@ -1255,7 +1301,7 @@ export default function Workbench() {
   const [connectionSource, setConnectionSource] = useState<{ nodeId: string; portId: string; dataType: PortDataType } | null>(null);
   const [connectionDraft, setConnectionDraft] = useState<{ x: number; y: number } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
-  const [settingsTab, setSettingsTab] = useState<"general" | "api" | "plugins">("api");
+  const [settingsTab, setSettingsTab] = useState<"general" | "personalization" | "api" | "plugins">("api");
   const [providerSettings, setProviderSettings] = useState<ProviderSettings>({
     ollamaUrl: "http://localhost:11434",
   });
@@ -1265,7 +1311,11 @@ export default function Workbench() {
   const [nodeSearch, setNodeSearch] = useState("");
   const [collapsedNodeGroups, setCollapsedNodeGroups] = useState<Record<string, boolean>>({});
   const [undoLimit, setUndoLimit] = useState(50);
+  const [workflowParallelism, setWorkflowParallelism] = useState(DEFAULT_WORKFLOW_PARALLELISM);
   const [defaultDirectoryPath, setDefaultDirectoryPath] = useState(DEFAULT_LOCAL_DIRECTORY);
+  const [userPreference, setUserPreference] = useState("");
+  const [userMemories, setUserMemories] = useState<UserMemory[]>([]);
+  const [newMemoryContent, setNewMemoryContent] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<FileAsset[]>([]);
   const [workflowFolder, setWorkflowFolder] = useState<DirectoryHandle | null>(null);
   const [pendingInput, setPendingInput] = useState<PendingWorkflowInput | null>(null);
@@ -1276,6 +1326,12 @@ export default function Workbench() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pluginInputRef = useRef<HTMLInputElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
+
+  function replaceUserMemories(next: UserMemory[] | ((current: UserMemory[]) => UserMemory[])) {
+    const resolved = typeof next === "function" ? next(userMemoriesRef.current) : next;
+    userMemoriesRef.current = resolved;
+    setUserMemories(resolved);
+  }
   const chatSessionTitleInputRef = useRef<HTMLInputElement>(null);
   const chatFolderNameInputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1287,6 +1343,7 @@ export default function Workbench() {
   const dragDepthRef = useRef(0);
   const workflowDragDepthRef = useRef(0);
   const storageRestoredRef = useRef(false);
+  const userMemoriesRef = useRef<UserMemory[]>([]);
   const storageWarningShownRef = useRef(false);
   const artifactStorageWarningShownRef = useRef(false);
   const dragRef = useRef<{
@@ -1438,7 +1495,10 @@ export default function Workbench() {
         const savedSettings = localStorage.getItem("magic-conch-provider-settings");
         const savedPluginsJson = localStorage.getItem("magic-conch-plugins");
         const savedUndoLimit = localStorage.getItem("magic-conch-undo-limit");
+        const savedWorkflowParallelism = localStorage.getItem("magic-conch-workflow-parallelism");
         const savedDefaultDirectory = localStorage.getItem("magic-conch-default-directory");
+        const savedUserPreference = localStorage.getItem("magic-conch-user-preference");
+        const savedUserMemories = localStorage.getItem("magic-conch-user-memories");
         const savedSessionsJson = localStorage.getItem("magic-conch-chat-sessions");
         const [indexedFlows, indexedPlugins, indexedSessions] = await Promise.all([
           readStoredArtifact<Workflow[]>("workflows").catch(() => null),
@@ -1490,7 +1550,10 @@ export default function Workbench() {
         if (savedSettings) setProviderSettings(JSON.parse(savedSettings));
         if (restoredPlugins.length) setPlugins(restoredPlugins);
         if (savedUndoLimit) setUndoLimit(Math.max(1, Math.min(500, Number(savedUndoLimit))));
+        if (savedWorkflowParallelism) setWorkflowParallelism(normalizeWorkflowParallelism(savedWorkflowParallelism));
         if (savedDefaultDirectory) setDefaultDirectoryPath(savedDefaultDirectory);
+        if (savedUserPreference) setUserPreference(savedUserPreference);
+        if (savedUserMemories) replaceUserMemories(normalizeUserMemories(JSON.parse(savedUserMemories)));
         if (savedChatFolders) {
           const restoredFolders = JSON.parse(savedChatFolders) as Partial<ChatFolder>[];
           setChatFolders(restoredFolders.filter((folder) => folder.id && folder.name).map((folder, index) => ({
@@ -1600,8 +1663,23 @@ export default function Workbench() {
 
   useEffect(() => {
     if (!storageRestoredRef.current) return;
+    localStorage.setItem("magic-conch-workflow-parallelism", String(workflowParallelism));
+  }, [workflowParallelism]);
+
+  useEffect(() => {
+    if (!storageRestoredRef.current) return;
     localStorage.setItem("magic-conch-default-directory", defaultDirectoryPath.trim() || DEFAULT_LOCAL_DIRECTORY);
   }, [defaultDirectoryPath]);
+
+  useEffect(() => {
+    if (!storageRestoredRef.current) return;
+    localStorage.setItem("magic-conch-user-preference", userPreference);
+  }, [userPreference]);
+
+  useEffect(() => {
+    if (!storageRestoredRef.current) return;
+    localStorage.setItem("magic-conch-user-memories", JSON.stringify(userMemories));
+  }, [userMemories]);
 
   useEffect(() => {
     if (!storageRestoredRef.current) return;
@@ -2013,7 +2091,11 @@ export default function Workbench() {
       x: Math.max(120, (460 - pan.x) / zoom) + count * 18,
       y: Math.max(100, (240 - pan.y) / zoom) + count * 18,
       config:
-        type === "request"
+        type === "load-settings"
+          ? { settingsIncludePreference: true, settingsIncludeMemory: true }
+          : type === "update-memory"
+            ? { memoryOperation: "add", memoryContent: "", memoryId: "" }
+          : type === "request"
           ? { provider: "openai", model: modelDefaults.openai, temperature: 0.7 }
           : type === "chat-session"
             ? { sessionIncludeUserMessages: true, sessionIncludeAssistantMessages: true, sessionIncludeSystemMessages: false, sessionHistoryLimit: 20, sessionIncludeMessageTimes: false, sessionIncludeAttachments: true }
@@ -2892,6 +2974,19 @@ export default function Workbench() {
     return files.filter((file) => file.type.startsWith(`${kind}/`) || extensions[kind].test(file.name));
   }
 
+  function executeScheduledGraphNode(
+    node: FlowNode,
+    context: WorkflowContext,
+    availablePortKeys: Set<string>,
+    workflow: Workflow,
+  ) {
+    const execute = () => executeGraphNode(node, context, availablePortKeys, workflow);
+    // A Use Workflow node is an orchestration container. Its child nodes share
+    // the parent's limiter, so holding a permit here could deadlock when every
+    // active permit is waiting for nested work to start.
+    return node.type === "workflow" ? execute() : context.executionLimiter.run(execute);
+  }
+
   async function executeCalledWorkflow(
     workflow: Workflow,
     prompt: string,
@@ -2917,6 +3012,7 @@ export default function Workbench() {
       syntax,
       chatSession: parentContext.chatSession,
       workflowStack: [...workflowStack, workflow.id],
+      executionLimiter: parentContext.executionLimiter,
     };
     context.values[portValueKey(start.id, "prompt")] = startInputs.prompt;
     context.values[portValueKey(start.id, "files")] = files;
@@ -2974,10 +3070,10 @@ export default function Workbench() {
       if (activeReady.some((node) => node.type === "input")) {
         throw new Error(`Called workflow “${workflow.name}” pauses at a Message node. Reusable workflows must run from Start to End without requesting another message.`);
       }
-      const results = await Promise.all(activeReady.map(async (node) => ({
+      const results = await mapWithConcurrencyLimit(activeReady, workflowParallelism, async (node) => ({
         node,
-        result: await executeGraphNode(node, context, emitted, workflow),
-      })));
+        result: await executeScheduledGraphNode(node, context, emitted, workflow),
+      }));
       results.forEach(({ node, result }) => {
         completed.add(node.id);
         result.emittedPortKeys.forEach((key) => emitted.add(key));
@@ -3094,6 +3190,39 @@ export default function Workbench() {
         debugDetail = `Loaded ${loaded.messages.length} previous message${loaded.messages.length === 1 ? "" : "s"} and ${loaded.files.length} attachment${loaded.files.length === 1 ? "" : "s"} from this chat session.`;
       }
 
+      if (node.type === "load-settings") {
+        const preference = node.config.settingsIncludePreference === false ? "" : userPreference.trim();
+        const memories = node.config.settingsIncludeMemory === false ? [] : [...userMemoriesRef.current];
+        const memoryText = formatUserMemory(memories);
+        const settings = formatUserSettings(preference, memories);
+        output("settings", settings);
+        output("preference", preference);
+        output("memory", memoryText);
+        output("memories", memories);
+        output("memory_count", memories.length);
+        context.lastOutput = settings;
+        debugDetail = `Loaded ${preference ? "the user preference and " : ""}${memories.length} memor${memories.length === 1 ? "y" : "ies"}.`;
+      }
+
+      if (node.type === "update-memory") {
+        const operation = node.config.memoryOperation || "add";
+        const result = applyUserMemoryOperation(userMemoriesRef.current, operation, {
+          content: inputFor("content", node.config.memoryContent || ""),
+          memoryId: inputFor("memory_id", node.config.memoryId || ""),
+          createId: () => uid("memory"),
+        });
+        replaceUserMemories(result.memories);
+        const memoryText = formatUserMemory(result.memories);
+        output("memory", result.memory);
+        output("memories", result.memories);
+        output("memory_text", memoryText);
+        output("count", result.memories.length);
+        output("changed", result.changed);
+        context.lastOutput = memoryText;
+        const action = { add: "Added", update: "Updated", delete: "Deleted", clear: "Cleared" }[operation];
+        debugDetail = `${action} ${operation === "clear" ? "user memory" : "a user memory"}. ${result.memories.length} memor${result.memories.length === 1 ? "y remains" : "ies remain"}.`;
+      }
+
       if (node.type === "integer") {
         const value = Math.trunc(node.config.integerValue || 0);
         output("value", value);
@@ -3162,6 +3291,7 @@ export default function Workbench() {
         let results: OcrResult[];
         if (engine === "tesseract") {
           if (languages === "auto") throw new Error("Choose a specific language when using Tesseract.js OCR.");
+          const { performOcr } = await import("../lib/ocr-browser");
           results = await performOcr(fileInput, {
             languages,
             pdfScale: node.config.ocrPdfScale,
@@ -3174,6 +3304,7 @@ export default function Workbench() {
             );
           });
         } else {
+          const { prepareVisionOcrInputs } = await import("../lib/ocr-browser");
           const outputNames = ocrOutputFileNames(fileInput.map((file) => file.name));
           results = [];
           for (let fileIndex = 0; fileIndex < fileInput.length; fileIndex += 1) {
@@ -3700,10 +3831,10 @@ export default function Workbench() {
 
       const waitingNode = activeReady.find((node) => node.type === "input");
       const executable = activeReady.filter((node) => node.type !== "input");
-      const results = await Promise.all(executable.map(async (node) => ({
+      const results = await mapWithConcurrencyLimit(executable, workflowParallelism, async (node) => ({
         node,
-        result: await executeGraphNode(node, context, emitted),
-      })));
+        result: await executeScheduledGraphNode(node, context, emitted, activeWorkflow),
+      }));
       results.forEach(({ node, result }) => {
         completed.add(node.id);
         result.emittedPortKeys.forEach((key) => emitted.add(key));
@@ -3780,6 +3911,7 @@ export default function Workbench() {
         messages: structuredClone(priorMessages),
       },
       workflowStack: [activeWorkflow.id],
+      executionLimiter: createWorkflowTaskLimiter(workflowParallelism),
     };
     context.values[portValueKey(start.id, "prompt")] = startInputs.prompt;
     context.values[portValueKey(start.id, "files")] = files;
@@ -4294,6 +4426,22 @@ export default function Workbench() {
                       <div className="local-first-note"><Info size={14} /><div><strong>Session metadata is always available</strong><span>Use the session, title, session ID, session number, message count, and updated-at outputs independently of message filters.</span></div></div>
                     </>
                   )}
+                  {selectedNode.type === "load-settings" && (
+                    <>
+                      <div className="start-input-intro"><Settings size={14} /><span><b>Personalization data</b><small>Choose which local user settings this node exposes.</small></span></div>
+                      <label className="check-field"><input type="checkbox" checked={selectedNode.config.settingsIncludePreference !== false} onChange={(event) => updateNode({ config: { settingsIncludePreference: event.target.checked } })} /><span>User preference</span></label>
+                      <label className="check-field"><input type="checkbox" checked={selectedNode.config.settingsIncludeMemory !== false} onChange={(event) => updateNode({ config: { settingsIncludeMemory: event.target.checked } })} /><span>User memory</span></label>
+                      <div className="local-first-note"><Info size={14} /><div><strong>Connect settings to a model prompt</strong><span>The settings output combines both sections. Separate text and structured outputs are also available.</span></div></div>
+                    </>
+                  )}
+                  {selectedNode.type === "update-memory" && (
+                    <>
+                      <label className="field-label">Operation<div className="select-wrap"><select value={selectedNode.config.memoryOperation || "add"} onChange={(event) => updateNode({ config: { memoryOperation: event.target.value as MemoryOperation } })}><option value="add">Add memory</option><option value="update">Update memory</option><option value="delete">Delete memory</option><option value="clear">Clear all memory</option></select><ChevronDown size={14} /></div></label>
+                      {(selectedNode.config.memoryOperation || "add") !== "clear" && (selectedNode.config.memoryOperation || "add") !== "delete" && <label className="field-label">Fallback memory content<textarea rows={4} value={selectedNode.config.memoryContent || ""} placeholder="What should Magic Conch remember?" onChange={(event) => updateNode({ config: { memoryContent: event.target.value } })} /><small className="field-help">Used when the memory content port is not connected.</small></label>}
+                      {(["update", "delete"] as MemoryOperation[]).includes(selectedNode.config.memoryOperation || "add") && <label className="field-label">Fallback memory ID<input value={selectedNode.config.memoryId || ""} placeholder="memory-…" onChange={(event) => updateNode({ config: { memoryId: event.target.value } })} /><small className="field-help">Use an ID from the Load User Settings memories output.</small></label>}
+                      <div className="local-first-note"><Info size={14} /><div><strong>Updates persist immediately</strong><span>Memory changes are stored on this device and are available to later nodes and workflow runs.</span></div></div>
+                    </>
+                  )}
                   {selectedNode.type === "start" && (
                     <>
                       <label className="field-label">Agent name<input value={selectedNode.config.agentName || ""} placeholder={DEFAULT_AGENT_NAME} onChange={(event) => updateNode({ config: { agentName: event.target.value } })} /><small className="field-help">Shown beside every message sent by this workflow.</small></label>
@@ -4711,10 +4859,40 @@ export default function Workbench() {
             <div className="modal-heading"><div><span className="eyebrow">Workspace</span><h2>Settings</h2></div><button className="icon-button" onClick={() => setSettingsOpen(false)} aria-label="Close"><X size={18} /></button></div>
             <nav className="settings-tabs" aria-label="Settings sections">
               <button className={settingsTab === "general" ? "active" : ""} onClick={() => setSettingsTab("general")}><Settings size={14} /> General</button>
+              <button className={settingsTab === "personalization" ? "active" : ""} onClick={() => setSettingsTab("personalization")}><BrainCircuit size={14} /> Personalization</button>
               <button className={settingsTab === "api" ? "active" : ""} onClick={() => setSettingsTab("api")}><KeyRound size={14} /> API</button>
               <button className={settingsTab === "plugins" ? "active" : ""} onClick={() => setSettingsTab("plugins")}><Plug size={14} /> Plug-ins</button>
             </nav>
             <div className="settings-scroll">
+              {settingsTab === "personalization" && (
+                <>
+                  <div className="settings-section tab-section">
+                    <div className="section-title"><Settings size={17} /><div><strong>User preference</strong><small>Describe how workflows and assistants should respond to you.</small></div></div>
+                    <label className="field-label">Your preference<textarea rows={7} value={userPreference} placeholder="For example: Use concise answers, explain technical terms plainly, and use Korean unless I ask otherwise." onChange={(event) => setUserPreference(event.target.value)} /><small className="field-help">This is only included in a workflow when you connect a Load User Settings node.</small></label>
+                  </div>
+                  <div className="settings-section">
+                    <div className="section-title"><BrainCircuit size={17} /><div><strong>User memory</strong><small>Facts and context you want Magic Conch to remember across chats and workflows.</small></div></div>
+                    <div className="memory-composer">
+                      <textarea rows={3} value={newMemoryContent} placeholder="Add something to remember…" onChange={(event) => setNewMemoryContent(event.target.value)} />
+                      <button className="primary-button" disabled={!newMemoryContent.trim()} onClick={() => {
+                        const result = applyUserMemoryOperation(userMemoriesRef.current, "add", { content: newMemoryContent, createId: () => uid("memory") });
+                        replaceUserMemories(result.memories);
+                        setNewMemoryContent("");
+                      }}><Plus size={14} /> Add memory</button>
+                    </div>
+                    <div className="user-memory-list">
+                      {userMemories.length ? userMemories.map((memory) => (
+                        <div className="user-memory-item" key={memory.id}>
+                          <textarea rows={2} aria-label={`Memory ${memory.id}`} value={memory.content} onChange={(event) => replaceUserMemories((current) => current.map((item) => item.id === memory.id ? { ...item, content: event.target.value, updatedAt: new Date().toISOString() } : item))} />
+                          <button className="mini-icon" aria-label="Delete memory" title="Delete memory" onClick={() => replaceUserMemories((current) => current.filter((item) => item.id !== memory.id))}><Trash2 size={14} /></button>
+                        </div>
+                      )) : <div className="no-memories"><BrainCircuit size={22} /><span>No saved memories yet</span><small>Add facts, goals, preferences, or recurring context.</small></div>}
+                    </div>
+                    {!!userMemories.length && <button className="danger-button clear-memory-button" onClick={() => replaceUserMemories([])}><Trash2 size={14} /> Clear all memory</button>}
+                  </div>
+                  <div className="local-first-note"><HardDrive size={17} /><div><strong>Private and local</strong><span>Preference and memory stay in this browser unless a workflow sends them to an AI provider.</span></div></div>
+                </>
+              )}
               {settingsTab === "api" && (
                 <div className="settings-section tab-section">
                   <div className="section-title"><KeyRound size={17} /><div><strong>AI provider connections</strong><small>Keys stay on this device and are sent only to the selected provider.</small></div></div>
@@ -4734,6 +4912,10 @@ export default function Workbench() {
               {settingsTab === "general" && (
                 <>
                   <div className="settings-section tab-section">
+                    <div className="section-title"><WorkflowIcon size={17} /><div><strong>Workflow execution</strong><small>Control how quickly parallel branches and calls are started.</small></div></div>
+                    <label className="field-label history-limit">Maximum parallel nodes<input type="number" min={MIN_WORKFLOW_PARALLELISM} max={MAX_WORKFLOW_PARALLELISM} value={workflowParallelism} onChange={(event) => setWorkflowParallelism(normalizeWorkflowParallelism(event.target.value))} /><small className="field-help">Between {MIN_WORKFLOW_PARALLELISM} and {MAX_WORKFLOW_PARALLELISM}. Use 1 for sequential execution; lower values reduce memory use and API request bursts.</small></label>
+                  </div>
+                  <div className="settings-section">
                     <div className="section-title"><Undo2 size={17} /><div><strong>Workflow history</strong><small>Choose how many workflow changes are available to undo.</small></div></div>
                     <label className="field-label history-limit">Undo records<input type="number" min="1" max="500" value={undoLimit} onChange={(event) => setUndoLimit(Math.max(1, Math.min(500, Number(event.target.value) || 1)))} /><small className="field-help">Between 1 and 500 records per workflow.</small></label>
                   </div>
