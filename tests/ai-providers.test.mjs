@@ -70,6 +70,33 @@ test("loads installed Ollama model options", async () => {
   }
 });
 
+test("omits optional generation settings when model defaults are requested", async () => {
+  const originalFetch = globalThis.fetch;
+  const bodies = [];
+  globalThis.fetch = async (url, init) => {
+    bodies.push({ url: String(url), body: JSON.parse(init.body) });
+    if (String(url).includes("generativelanguage")) return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] }), { status: 200 });
+    if (String(url).endsWith("/messages")) return new Response(JSON.stringify({ content: [{ type: "text", text: "ok" }] }), { status: 200 });
+    if (String(url).endsWith("/api/chat")) return new Response(JSON.stringify({ message: { content: "ok" } }), { status: 200 });
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 });
+  };
+  try {
+    await requestAI({ provider: "openai", model: "default-only", prompt: "Test.", useModelDefaults: true }, { openaiKey: "test-key" });
+    await requestAI({ provider: "gemini", model: "default-only", prompt: "Test.", useModelDefaults: true }, { geminiKey: "test-key" });
+    await requestAI({ provider: "claude", model: "default-only", prompt: "Test.", useModelDefaults: true }, { claudeKey: "test-key" });
+    await requestAI({ provider: "ollama", model: "default-only", prompt: "Test.", useModelDefaults: true }, { ollamaUrl: "http://ollama.test" });
+
+    assert.equal("temperature" in bodies[0].body, false);
+    assert.equal("temperature" in bodies[1].body.generationConfig, false);
+    assert.equal("temperature" in bodies[2].body, false);
+    assert.equal("temperature" in bodies[3].body.options, false);
+    assert.deepEqual(bodies[1].body.generationConfig, {});
+    assert.deepEqual(bodies[3].body.options, {});
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("passes OpenAI reasoning and generation settings in Chat Completions fields", async () => {
   const originalFetch = globalThis.fetch;
   let body;
@@ -104,6 +131,33 @@ test("passes OpenAI reasoning and generation settings in Chat Completions fields
     assert.equal(body.seed, 42);
     assert.deepEqual(body.stop, ["END"]);
     assert.equal("temperature" in body, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("retries OpenAI without reasoning_effort when an endpoint rejects that argument", async () => {
+  const originalFetch = globalThis.fetch;
+  const bodies = [];
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    if (bodies.length === 1) {
+      return new Response(JSON.stringify({ error: { message: "Unrecognized request argument supplied: reasoning_effort" } }), { status: 400 });
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: "compatible" } }] }), { status: 200 });
+  };
+  try {
+    const result = await requestAI({
+      provider: "openai",
+      model: "openai-compatible-model",
+      prompt: "Test compatibility.",
+      openai: { reasoningEffort: "none" },
+    }, { openaiKey: "test-key", openaiUrl: "https://compatible.test/v1" });
+
+    assert.equal(result, "compatible");
+    assert.equal(bodies[0].reasoning_effort, "none");
+    assert.equal("reasoning_effort" in bodies[1], false);
+    assert.equal(bodies[1].temperature, 0.7);
   } finally {
     globalThis.fetch = originalFetch;
   }

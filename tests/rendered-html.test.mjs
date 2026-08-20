@@ -54,6 +54,14 @@ test("anchors workflow connections to the rendered port centers", async () => {
   assert.doesNotMatch(workbench, /node\.y \+ 62 \+ index \* 25/);
 });
 
+test("allows workflow nodes to be dragged into negative canvas coordinates", async () => {
+  const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
+
+  assert.match(workbench, /x: drag\.positions\[node\.id\]\.x \+ deltaX, y: drag\.positions\[node\.id\]\.y \+ deltaY/);
+  assert.doesNotMatch(workbench, /x: Math\.max\(20, drag\.positions\[node\.id\]\.x \+ deltaX\)/);
+  assert.doesNotMatch(workbench, /y: Math\.max\(20, drag\.positions\[node\.id\]\.y \+ deltaY\)/);
+});
+
 test("uses Start node settings for the chat agent and opening message", async () => {
   const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
 
@@ -133,6 +141,10 @@ test("offers guided OCR languages and selectable local or AI vision engines", as
   assert.match(workbench, />Ollama vision — local model</);
   assert.match(workbench, />Primary language</);
   assert.match(workbench, />Additional languages</);
+  assert.match(workbench, />PDF pages</);
+  assert.match(workbench, />Document layout</);
+  assert.match(workbench, />Image cleanup</);
+  assert.match(workbench, />Automatically detect text rotation</);
   assert.match(workbench, /await import\("\.\.\/lib\/ocr-browser"\)/);
   assert.match(ocr, /OCR_LANGUAGE_OPTIONS/);
   assert.match(ocr, /visionOcrPrompt/);
@@ -140,7 +152,9 @@ test("offers guided OCR languages and selectable local or AI vision engines", as
   assert.doesNotMatch(ocr, /document\.createElement|typeof window/);
   assert.match(ocrBrowser, /^"use client";/);
   assert.match(ocrBrowser, /typeof window === "undefined"/);
-  assert.match(ocrBrowser, /import\("pdfjs-dist\/build\/pdf\.worker\.min\.mjs\?url"\)/);
+  assert.match(ocrBrowser, /workerSrc = `\$\{window\.location\.origin\}\/pdfjs\/pdf\.worker\.min\.mjs`/);
+  assert.doesNotMatch(ocrBrowser, /pdf\.worker\.min\.mjs\?url|pdf\.worker\.min\.mjs\?worker/);
+  assert.match(ocrBrowser, /wasmUrl: `\$\{window\.location\.origin\}\/pdfjs-wasm\/`/);
 });
 
 test("runs one workflow from another through the Use Workflow node", async () => {
@@ -267,10 +281,18 @@ test("searches and groups the Workflow node library", async () => {
 
   assert.match(workbench, /const BUILTIN_NODE_GROUPS/);
   assert.match(workbench, /aria-label="Search nodes by name"/);
+  assert.match(workbench, /aria-controls="workflow-list-section"/);
+  assert.match(workbench, /aria-controls="node-library-section"/);
+  assert.match(workbench, /inspectorOpen \? "" : "inspector-closed"/);
+  assert.match(workbench, /aria-label="Open inspector"/);
+  assert.doesNotMatch(css, /\.reopen-inspector/);
   assert.match(workbench, /label\.toLocaleLowerCase\(\)\.includes\(query\)/);
   assert.match(workbench, /aria-expanded=\{isOpen\}/);
   assert.match(workbench, /plugin-\$\{plugin\.id\}/);
   assert.match(css, /\.node-search:focus-within/);
+  assert.match(css, /\.workflow-list \{[^}]*overflow-y: auto;/);
+  assert.match(css, /\.workflow-view\.inspector-closed \{ --inspector-width: 0px; \}/);
+  assert.match(css, /\.sidebar-section-toggle\.collapsed/);
   assert.match(css, /\.node-group-toggle\.collapsed/);
 });
 

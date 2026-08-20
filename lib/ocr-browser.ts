@@ -1,12 +1,14 @@
 "use client";
 
 import {
+  formatOcrPages,
   isOcrSupportedAsset,
   isPdfAsset,
   normalizeOcrLanguages,
   ocrOutputFileNames,
+  parseOcrPageSelection,
 } from "./ocr";
-import type { OcrInputAsset, OcrProgress, OcrResult } from "./ocr";
+import type { OcrInputAsset, OcrLayout, OcrPreprocess, OcrProgress, OcrResult } from "./ocr";
 
 function requireBrowser() {
   if (typeof window === "undefined" || typeof document === "undefined") {
@@ -28,35 +30,95 @@ function dataUrlBytes(dataUrl: string) {
 
 async function openPdf(file: OcrInputAsset) {
   requireBrowser();
-  const [pdfjs, pdfWorker] = await Promise.all([
-    import("pdfjs-dist"),
-    import("pdfjs-dist/build/pdf.worker.min.mjs?url"),
-  ]);
-  pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker.default;
-  const loadingTask = pdfjs.getDocument({ data: dataUrlBytes(file.data), useWasm: false });
+  const pdfjs = await import("pdfjs-dist");
+  pdfjs.GlobalWorkerOptions.workerSrc = `${window.location.origin}/pdfjs/pdf.worker.min.mjs`;
+  const loadingTask = pdfjs.getDocument({
+    data: dataUrlBytes(file.data),
+    useWasm: true,
+    wasmUrl: `${window.location.origin}/pdfjs-wasm/`,
+  });
   return { loadingTask, pdf: await loadingTask.promise };
 }
+
+function preprocessCanvas(canvas: HTMLCanvasElement, mode: OcrPreprocess) {
+  if (mode === "none") return canvas;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) throw new Error("The browser could not prepare this image for OCR.");
+  const image = context.getImageData(0, 0, canvas.width, canvas.height);
+  const pixels = image.data;
+  for (let index = 0; index < pixels.length; index += 4) {
+    const luminance = Math.round(0.299 * pixels[index] + 0.587 * pixels[index + 1] + 0.114 * pixels[index + 2]);
+    const value = mode === "binary"
+      ? (luminance >= 170 ? 255 : 0)
+      : mode === "contrast"
+        ? Math.max(0, Math.min(255, Math.round((luminance - 128) * 1.65 + 128)))
+        : luminance;
+    pixels[index] = value;
+    pixels[index + 1] = value;
+    pixels[index + 2] = value;
+  }
+  context.putImageData(image, 0, 0);
+  return canvas;
+}
+
+async function preprocessImage(file: OcrInputAsset, mode: OcrPreprocess) {
+  if (mode === "none") return file.data;
+  const image = new Image();
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error(`Could not decode ${file.name} for OCR.`));
+    image.src = file.data;
+  });
+  const canvas = document.createElement("canvas");
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  canvas.getContext("2d")?.drawImage(image, 0, 0);
+  preprocessCanvas(canvas, mode);
+  return canvas;
+}
+
+type BrowserOcrOptions = {
+  languages?: string;
+  pdfScale?: number;
+  pages?: string;
+  layout?: OcrLayout;
+  preprocess?: OcrPreprocess;
+  autoRotate?: boolean;
+  preserveSpacing?: boolean;
+  includePageSeparators?: boolean;
+};
 
 export async function prepareVisionOcrInputs(
   file: OcrInputAsset,
   pdfScale = 2,
   onPage?: (page: number, pageCount: number) => void,
+  options: Pick<BrowserOcrOptions, "pages" | "preprocess"> = {},
 ) {
   requireBrowser();
-  if (!isPdfAsset(file)) return { files: [file], pageCount: 1 };
+  const preprocess = options.preprocess || "none";
+  if (!isPdfAsset(file)) {
+    const prepared = await preprocessImage(file, preprocess);
+    if (prepared instanceof HTMLCanvasElement) {
+      const data = prepared.toDataURL("image/png");
+      return { files: [{ ...file, type: "image/png", data, size: Math.floor(data.length * 0.75) }], pageCount: 1, pageNumbers: [1], totalPageCount: 1 };
+    }
+    return { files: [file], pageCount: 1, pageNumbers: [1], totalPageCount: 1 };
+  }
   const { loadingTask, pdf } = await openPdf(file);
   const files: OcrInputAsset[] = [];
   const baseName = file.name.replace(/\.pdf$/i, "") || "document";
-  const pageCount = pdf.numPages;
+  const pageNumbers = parseOcrPageSelection(options.pages, pdf.numPages);
   try {
-    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-      onPage?.(pageNumber, pdf.numPages);
+    for (let pageIndex = 0; pageIndex < pageNumbers.length; pageIndex += 1) {
+      const pageNumber = pageNumbers[pageIndex];
+      onPage?.(pageIndex + 1, pageNumbers.length);
       const page = await pdf.getPage(pageNumber);
       const viewport = page.getViewport({ scale: Math.max(1, Math.min(4, pdfScale)) });
       const canvas = document.createElement("canvas");
       canvas.width = Math.ceil(viewport.width);
       canvas.height = Math.ceil(viewport.height);
       await page.render({ canvas, viewport }).promise;
+      preprocessCanvas(canvas, preprocess);
       const data = canvas.toDataURL("image/png");
       files.push({
         name: `${baseName}-page-${pageNumber}.png`,
@@ -69,12 +131,12 @@ export async function prepareVisionOcrInputs(
   } finally {
     await loadingTask.destroy();
   }
-  return { files, pageCount };
+  return { files, pageCount: files.length, pageNumbers, totalPageCount: pdf.numPages };
 }
 
 export async function performOcr(
   files: OcrInputAsset[],
-  options: { languages?: string; pdfScale?: number } = {},
+  options: BrowserOcrOptions = {},
   onProgress?: (progress: OcrProgress) => void,
 ): Promise<OcrResult[]> {
   requireBrowser();
@@ -86,7 +148,7 @@ export async function performOcr(
 
   const languages = normalizeOcrLanguages(options.languages);
   const outputNames = ocrOutputFileNames(files.map((file) => file.name));
-  const { createWorker, OEM } = await import("tesseract.js");
+  const { createWorker, OEM, PSM } = await import("tesseract.js");
   let activeProgress = { fileIndex: 0, fileName: files[0].name, page: 1, pageCount: 1 };
   const worker = await createWorker(languages, OEM.LSTM_ONLY, {
     logger: (message) => onProgress?.({
@@ -96,6 +158,17 @@ export async function performOcr(
       progress: message.progress,
     }),
   });
+  const segmentation = {
+    auto: PSM.AUTO,
+    "single-column": PSM.SINGLE_COLUMN,
+    "single-block": PSM.SINGLE_BLOCK,
+    sparse: PSM.SPARSE_TEXT,
+    "single-line": PSM.SINGLE_LINE,
+  }[options.layout || "auto"];
+  await worker.setParameters({
+    tessedit_pageseg_mode: segmentation,
+    preserve_interword_spaces: options.preserveSpacing === false ? "0" : "1",
+  });
 
   try {
     const results: OcrResult[] = [];
@@ -103,13 +176,15 @@ export async function performOcr(
       const file = files[fileIndex];
       if (!isPdfAsset(file)) {
         activeProgress = { fileIndex, fileName: file.name, page: 1, pageCount: 1 };
-        const recognized = await worker.recognize(file.data);
+        const prepared = await preprocessImage(file, options.preprocess || "none");
+        const recognized = await worker.recognize(prepared, { rotateAuto: options.autoRotate !== false });
         results.push({
           sourceName: file.name,
           outputName: outputNames[fileIndex],
           text: recognized.data.text,
           pageCount: 1,
           confidence: recognized.data.confidence,
+          pages: [1],
         });
         continue;
       }
@@ -117,16 +192,19 @@ export async function performOcr(
       const { loadingTask, pdf } = await openPdf(file);
       const pageTexts: string[] = [];
       const confidences: number[] = [];
+      const pageNumbers = parseOcrPageSelection(options.pages, pdf.numPages);
       try {
-        for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-          activeProgress = { fileIndex, fileName: file.name, page: pageNumber, pageCount: pdf.numPages };
+        for (let pageIndex = 0; pageIndex < pageNumbers.length; pageIndex += 1) {
+          const pageNumber = pageNumbers[pageIndex];
+          activeProgress = { fileIndex, fileName: file.name, page: pageIndex + 1, pageCount: pageNumbers.length };
           const page = await pdf.getPage(pageNumber);
           const viewport = page.getViewport({ scale: Math.max(1, Math.min(4, options.pdfScale || 2)) });
           const canvas = document.createElement("canvas");
           canvas.width = Math.ceil(viewport.width);
           canvas.height = Math.ceil(viewport.height);
           await page.render({ canvas, viewport }).promise;
-          const recognized = await worker.recognize(canvas);
+          preprocessCanvas(canvas, options.preprocess || "none");
+          const recognized = await worker.recognize(canvas, { rotateAuto: options.autoRotate !== false });
           pageTexts.push(recognized.data.text.trim());
           confidences.push(recognized.data.confidence);
           page.cleanup();
@@ -137,9 +215,10 @@ export async function performOcr(
       results.push({
         sourceName: file.name,
         outputName: outputNames[fileIndex],
-        text: pageTexts.map((text, index) => `--- Page ${index + 1} ---\n\n${text}`).join("\n\n"),
+        text: formatOcrPages(pageTexts, pageNumbers, options.includePageSeparators !== false),
         pageCount: pageTexts.length,
         confidence: confidences.length ? confidences.reduce((sum, value) => sum + value, 0) / confidences.length : 0,
+        pages: pageNumbers,
       });
     }
     return results;

@@ -303,7 +303,11 @@ Ports use `port_id:type`. For example, `prompt:prompt` means the JSON port ID is
 - `ocrEngine` may be `tesseract`, `openai`, `gemini`, `claude`, or `ollama`.
 - Tesseract.js runs in the browser and requires an explicit language; `auto` is invalid.
 - Cloud engines send rendered pages to the selected provider. Ollama uses the configured local server.
-- `ocrPrimaryLanguage`, `ocrAdditionalLanguages`, and `ocrPdfScale` control recognition and PDF rendering. Higher scale uses more memory and time.
+- `ocrPrimaryLanguage` and `ocrAdditionalLanguages` control recognition languages. `ocrPdfScale` controls PDF rendering; higher scale uses more memory and time.
+- `ocrPages` accepts `all`, individual pages, ranges (`1-3, 5`), open ranges (`4-`), and `last`.
+- `ocrLayout` hints at automatic, single-column, single-block, sparse, or single-line text. `ocrPreprocess` can use the original image, grayscale, boosted contrast, or a black-and-white threshold.
+- `ocrAutoRotate` controls Tesseract orientation correction. `ocrPreserveSpacing` and `ocrPageSeparators` control text formatting.
+- AI OCR can use optional `ocrGuidance` for document-specific recognition hints.
 - AI OCR requires a vision-capable `ocrModel`.
 - `results` is structured per source; `files` contains one generated text file per input; `text` combines all results.
 

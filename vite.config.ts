@@ -2,6 +2,7 @@ import vinext from "vinext";
 import { defineConfig } from "vite";
 import hostingConfig from "./.openai/hosting.json";
 import { localDirectory } from "./build/local-directory-vite-plugin";
+import { pdfJsAssets } from "./build/pdfjs-assets-vite-plugin";
 import { sites } from "./build/sites-vite-plugin";
 
 const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
@@ -50,6 +51,7 @@ export default defineConfig(async () => {
       : undefined,
     plugins: [
       localDirectory(),
+      pdfJsAssets(),
       vinext(),
       sites(),
       cloudflare({

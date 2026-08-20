@@ -4,10 +4,12 @@ import test from "node:test";
 import {
   combineOcrResults,
   configuredOcrLanguages,
+  formatOcrPages,
   isOcrSupportedAsset,
   normalizeOcrLanguages,
   ocrLanguageDescription,
   ocrOutputFileNames,
+  parseOcrPageSelection,
   visionOcrPrompt,
 } from "../lib/ocr.ts";
 
@@ -38,6 +40,21 @@ test("describes OCR languages clearly in the vision-engine transcription prompt"
   assert.equal(ocrLanguageDescription("kor+eng"), "Korean and English");
   assert.match(visionOcrPrompt("scan.pdf", "auto"), /automatically detect every language/i);
   assert.match(visionOcrPrompt("scan.pdf", "eng"), /Return only the extracted text/);
+  assert.match(visionOcrPrompt("receipt.png", "eng", { layout: "sparse", guidance: "Keep prices aligned" }), /scattered text/i);
+  assert.match(visionOcrPrompt("receipt.png", "eng", { layout: "sparse", guidance: "Keep prices aligned" }), /Keep prices aligned/);
+});
+
+test("selects PDF pages with ranges, open ranges, and last", () => {
+  assert.deepEqual(parseOcrPageSelection("all", 5), [1, 2, 3, 4, 5]);
+  assert.deepEqual(parseOcrPageSelection("1-2, 4, last", 6), [1, 2, 4, 6]);
+  assert.deepEqual(parseOcrPageSelection("3-", 5), [3, 4, 5]);
+  assert.throws(() => parseOcrPageSelection("4-2", 5), /between 1 and 5/);
+  assert.throws(() => parseOcrPageSelection("one", 5), /PDF pages must look like/);
+});
+
+test("formats selected OCR pages with optional source page labels", () => {
+  assert.equal(formatOcrPages([" Alpha ", "Beta"], [2, 5]), "--- Page 2 ---\n\nAlpha\n\n--- Page 5 ---\n\nBeta");
+  assert.equal(formatOcrPages(["Alpha", "Beta"], [2, 5], false), "Alpha\n\nBeta");
 });
 
 test("creates a unique text export for every OCR input", () => {

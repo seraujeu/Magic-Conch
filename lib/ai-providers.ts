@@ -16,6 +16,7 @@ export type AIRequest = {
   systemPrompt?: string;
   prompt: string;
   temperature?: number;
+  useModelDefaults?: boolean;
   files?: AIFile[];
   openai?: OpenAIRequestSettings;
   gemini?: GeminiRequestSettings;
@@ -126,6 +127,12 @@ function definedObject(values: Record<string, unknown>) {
   return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined));
 }
 
+function rejectsOpenAIReasoningEffort(status: number, body: string) {
+  return status === 400
+    && /reasoning_effort/i.test(body)
+    && /(unrecognized|unknown|unsupported|not permitted|extra inputs)/i.test(body);
+}
+
 async function readOllamaStream(
   response: Response,
   onProgress: (progress: AIProgress) => void,
@@ -223,45 +230,54 @@ export async function requestAI(
   settings: ProviderSettings,
   onProgress?: (progress: AIProgress) => void,
 ): Promise<string> {
-  const temperature = request.temperature ?? 0.7;
+  const temperature = request.useModelDefaults ? undefined : request.temperature ?? 0.7;
 
   if (request.provider === "openai") {
     if (!settings.openaiKey) throw new Error("Add an OpenAI API key in Settings.");
     const baseUrl = (settings.openaiUrl || "https://api.openai.com/v1").replace(/\/$/, "");
     const openai = request.openai || {};
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+    const url = `${baseUrl}/chat/completions`;
+    const body = definedObject({
+      model: request.model,
+      temperature: openai.reasoningEffort && openai.reasoningEffort !== "none" ? undefined : temperature,
+      reasoning_effort: openai.reasoningEffort,
+      verbosity: openai.verbosity,
+      max_completion_tokens: openai.maxCompletionTokens,
+      top_p: openai.topP,
+      frequency_penalty: openai.frequencyPenalty,
+      presence_penalty: openai.presencePenalty,
+      seed: openai.seed,
+      stop: openai.stop?.length ? openai.stop : undefined,
+      messages: [
+        ...(request.systemPrompt
+          ? [{ role: "system", content: request.systemPrompt }]
+          : []),
+        {
+          role: "user",
+          content: imageFiles(request.files).length
+            ? [
+                { type: "text", text: request.prompt },
+                ...imageFiles(request.files).map((file) => ({ type: "image_url", image_url: { url: file.data } })),
+              ]
+            : request.prompt,
+        },
+      ],
+    });
+    const send = () => fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${settings.openaiKey}`,
       },
-      body: JSON.stringify(definedObject({
-        model: request.model,
-        temperature: openai.reasoningEffort && openai.reasoningEffort !== "none" ? undefined : temperature,
-        reasoning_effort: openai.reasoningEffort,
-        verbosity: openai.verbosity,
-        max_completion_tokens: openai.maxCompletionTokens,
-        top_p: openai.topP,
-        frequency_penalty: openai.frequencyPenalty,
-        presence_penalty: openai.presencePenalty,
-        seed: openai.seed,
-        stop: openai.stop?.length ? openai.stop : undefined,
-        messages: [
-          ...(request.systemPrompt
-            ? [{ role: "system", content: request.systemPrompt }]
-            : []),
-          {
-            role: "user",
-            content: imageFiles(request.files).length
-              ? [
-                  { type: "text", text: request.prompt },
-                  ...imageFiles(request.files).map((file) => ({ type: "image_url", image_url: { url: file.data } })),
-                ]
-              : request.prompt,
-          },
-        ],
-      })),
+      body: JSON.stringify(body),
     });
+    let response = await send();
+    if (!response.ok && "reasoning_effort" in body) {
+      const errorBody = await response.text();
+      if (!rejectsOpenAIReasoningEffort(response.status, errorBody)) throw apiError("OpenAI", response.status, errorBody);
+      delete body.reasoning_effort;
+      response = await send();
+    }
     const data = await readJson(response, "OpenAI");
     return data.choices?.[0]?.message?.content ?? "";
   }

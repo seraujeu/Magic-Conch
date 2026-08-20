@@ -6,6 +6,8 @@ export type OcrInputAsset = {
 };
 
 export type OcrEngine = "tesseract" | "openai" | "gemini" | "claude" | "ollama";
+export type OcrLayout = "auto" | "single-column" | "single-block" | "sparse" | "single-line";
+export type OcrPreprocess = "none" | "grayscale" | "contrast" | "binary";
 
 export const OCR_LANGUAGE_OPTIONS = [
   { code: "eng", label: "English" },
@@ -40,6 +42,7 @@ export type OcrResult = {
   text: string;
   pageCount: number;
   confidence: number | null;
+  pages?: number[];
 };
 
 export type OcrProgress = {
@@ -96,15 +99,62 @@ export function ocrLanguageDescription(value?: string) {
     .join(" and ");
 }
 
-export function visionOcrPrompt(fileName: string, languages?: string) {
+export function parseOcrPageSelection(value: string | undefined, pageCount: number) {
+  if (!Number.isInteger(pageCount) || pageCount < 1) throw new Error("The PDF has no readable pages.");
+  const selection = value?.trim().toLowerCase();
+  if (!selection || selection === "all") return Array.from({ length: pageCount }, (_, index) => index + 1);
+
+  const pages = new Set<number>();
+  for (const part of selection.split(",")) {
+    const token = part.trim();
+    const match = /^(\d+|last)?\s*(?:-\s*(\d+|last)?)?$/.exec(token);
+    if (!match || (!match[1] && !match[2])) {
+      throw new Error('PDF pages must look like "all", "1-3, 5", "3-", or "last".');
+    }
+    const resolve = (raw: string | undefined, fallback: number) => raw === "last" ? pageCount : raw ? Number(raw) : fallback;
+    const start = resolve(match[1], 1);
+    const end = match[0].includes("-") ? resolve(match[2], pageCount) : start;
+    if (start < 1 || end < 1 || start > pageCount || end > pageCount || start > end) {
+      throw new Error(`PDF page selection must stay between 1 and ${pageCount}.`);
+    }
+    for (let page = start; page <= end; page += 1) pages.add(page);
+  }
+  return [...pages].sort((a, b) => a - b);
+}
+
+export function formatOcrPages(pageTexts: string[], pageNumbers?: number[], includePageSeparators = true) {
+  const cleaned = pageTexts.map((text) => text.trim());
+  if (!includePageSeparators || cleaned.length === 1) return cleaned.filter(Boolean).join("\n\n");
+  return cleaned
+    .map((text, index) => `--- Page ${pageNumbers?.[index] ?? index + 1} ---\n\n${text}`)
+    .join("\n\n");
+}
+
+const OCR_LAYOUT_DESCRIPTIONS: Record<OcrLayout, string> = {
+  auto: "infer the natural document layout and reading order",
+  "single-column": "treat the page as one column of text",
+  "single-block": "treat the page as one uniform block of text",
+  sparse: "find scattered text without assuming a continuous document",
+  "single-line": "treat the image as a single line of text",
+};
+
+export function visionOcrPrompt(
+  fileName: string,
+  languages?: string,
+  options: { layout?: OcrLayout; preserveSpacing?: boolean; guidance?: string } = {},
+) {
+  const layout = options.layout || "auto";
   return [
     `Perform OCR on ${fileName}.`,
     `Recognition language: ${ocrLanguageDescription(languages)}.`,
+    `Layout: ${OCR_LAYOUT_DESCRIPTIONS[layout]}.`,
     "Return only the extracted text, with no commentary or code fences.",
-    "Preserve reading order, meaningful line breaks, headings, and table structure as plain text.",
-    "For a multi-page document, separate pages with headings in the exact form: --- Page N ---",
+    options.preserveSpacing === false
+      ? "Preserve reading order and meaningful line breaks, but normalize excessive spacing."
+      : "Preserve reading order, meaningful line breaks, headings, columns, spacing, and table structure as plain text.",
     "Do not summarize, translate, correct, or invent text. Mark unreadable fragments as [unclear].",
-  ].join("\n");
+    options.guidance?.trim() ? `Additional recognition guidance: ${options.guidance.trim()}` : "",
+  ].filter(Boolean).join("\n");
 }
 
 export function ocrOutputFileNames(sourceNames: string[]) {

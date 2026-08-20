@@ -151,6 +151,16 @@ import { composeStartInputs } from "../lib/start-inputs";
 import { loadChatSession } from "../lib/chat-session-node";
 import { bypassLegacyParallelNodes } from "../lib/workflow-migration";
 import {
+  buildWorkflowAssistantRequest,
+  buildWorkflowAssistantSystemPrompt,
+  normalizeWorkflowAssistantFanIn,
+  parseWorkflowAssistantResponse,
+  validateWorkflowAssistantGraph,
+} from "../lib/workflow-assistant";
+import nodeReference from "../docs/NODE_REFERENCE.md?raw";
+import vibeCodingWorkflow from "../docs/VIBE_CODING_WORKFLOW.md?raw";
+import workflowSyntaxInstructions from "../docs/WORKFLOW_SYNTAX.md?raw";
+import {
   applyUserMemoryOperation,
   formatUserMemory,
   formatUserSettings,
@@ -161,11 +171,12 @@ import {
 import {
   combineOcrResults,
   configuredOcrLanguages,
+  formatOcrPages,
   OCR_LANGUAGE_OPTIONS,
   ocrOutputFileNames,
   visionOcrPrompt,
 } from "../lib/ocr";
-import type { OcrEngine, OcrResult } from "../lib/ocr";
+import type { OcrEngine, OcrLayout, OcrPreprocess, OcrResult } from "../lib/ocr";
 
 type BuiltinNodeType = "start" | "chat-session" | "load-settings" | "update-memory" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "ocr" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
@@ -314,6 +325,13 @@ type FlowNode = {
     ocrAdditionalLanguages?: string;
     ocrModel?: string;
     ocrPdfScale?: number;
+    ocrPages?: string;
+    ocrLayout?: OcrLayout;
+    ocrPreprocess?: OcrPreprocess;
+    ocrAutoRotate?: boolean;
+    ocrPreserveSpacing?: boolean;
+    ocrPageSeparators?: boolean;
+    ocrGuidance?: string;
     includeSubfolders?: boolean;
     calledWorkflowId?: string;
   };
@@ -1248,18 +1266,18 @@ function ConchMark({ small = false }: { small?: boolean }) {
   );
 }
 
-function DebugDataSection({ title, items }: { title: string; items: DebugDatum[] }) {
+function DebugDataSection({ title, items = [] }: { title: string; items?: DebugDatum[] }) {
   if (!items.length) return null;
   return (
     <div className="debug-data-section">
       <span className="debug-data-title">{title}</span>
-      {items.map((item) => {
+      {items.map((item, index) => {
         const isFileType = ["files", "image", "video", "audio"].includes(item.type);
         const files = isFileType && Array.isArray(item.value)
           ? item.value.filter((value): value is FileAsset => Boolean(value && typeof value === "object" && "name" in value))
           : [];
         return (
-          <div className={`debug-datum datum-${item.type}`} key={`${title}-${item.port}`}>
+          <div className={`debug-datum datum-${item.type}`} key={`${title}-${item.port}-${index}`}>
             <div><strong>{item.label}</strong><small>{item.type}</small></div>
             {isFileType ? (
               files.length ? <div className="debug-file-list">{files.map((file, index) => <a key={`${file.name}-${index}`} href={file.data} download={file.name} title={`Download ${file.name}`}><FileJson size={12} /><span><b>{file.name}</b><small>{file.type || "file"} · {Math.max(1, Math.round(file.size / 1024))} KB</small></span><Download size={11} /></a>)}</div> : <em>No files</em>
@@ -1314,6 +1332,8 @@ export default function Workbench() {
   const [modelsLoading, setModelsLoading] = useState<Partial<Record<AIProvider, boolean>>>({});
   const [plugins, setPlugins] = useState<MagicConchPlugin[]>([]);
   const [nodeSearch, setNodeSearch] = useState("");
+  const [workflowsSectionOpen, setWorkflowsSectionOpen] = useState(true);
+  const [nodeLibrarySectionOpen, setNodeLibrarySectionOpen] = useState(true);
   const [collapsedNodeGroups, setCollapsedNodeGroups] = useState<Record<string, boolean>>({});
   const [undoLimit, setUndoLimit] = useState(50);
   const [workflowParallelism, setWorkflowParallelism] = useState(DEFAULT_WORKFLOW_PARALLELISM);
@@ -1328,12 +1348,19 @@ export default function Workbench() {
   const [workflowFolder, setWorkflowFolder] = useState<DirectoryHandle | null>(null);
   const [pendingInput, setPendingInput] = useState<PendingWorkflowInput | null>(null);
   const [portOffsets, setPortOffsets] = useState<PortOffsets>({});
+  const [workflowAssistantOpen, setWorkflowAssistantOpen] = useState(false);
+  const [workflowAssistantRequest, setWorkflowAssistantRequest] = useState("");
+  const [workflowAssistantProvider, setWorkflowAssistantProvider] = useState<AIProvider>("openai");
+  const [workflowAssistantModel, setWorkflowAssistantModel] = useState(modelDefaults.openai);
+  const [workflowAssistantRunning, setWorkflowAssistantRunning] = useState(false);
+  const [workflowAssistantStatus, setWorkflowAssistantStatus] = useState<{ kind: "success" | "error"; message: string } | null>(null);
 
   const canvasRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pluginInputRef = useRef<HTMLInputElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const messageInputRef = useRef<HTMLTextAreaElement>(null);
 
   function replaceUserMemories(next: UserMemory[] | ((current: UserMemory[]) => UserMemory[])) {
     const resolved = typeof next === "function" ? next(userMemoriesRef.current) : next;
@@ -1364,6 +1391,8 @@ export default function Workbench() {
   const panRef = useRef<{ startX: number; startY: number; panX: number; panY: number } | null>(null);
   const selectionRef = useRef<{ startX: number; startY: number; currentX: number; currentY: number; additive: boolean } | null>(null);
   const connectRef = useRef<{ nodeId: string; portId: string; dataType: PortDataType; pointerId: number } | null>(null);
+  const activeWorkflowIdRef = useRef(activeWorkflowId);
+  activeWorkflowIdRef.current = activeWorkflowId;
   const effectiveWorkflowParallelism = automaticWorkflowParallelism ? automaticParallelism : workflowParallelism;
   const workflowParallelismRef = useRef(effectiveWorkflowParallelism);
   workflowParallelismRef.current = effectiveWorkflowParallelism;
@@ -1407,6 +1436,15 @@ export default function Workbench() {
     [knownChatFolderIds, sortedChatSessions],
   );
   const editingChatSessionId = editingChatSession?.id;
+
+  useLayoutEffect(() => {
+    const textarea = messageInputRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 100)}px`;
+    textarea.style.overflowY = textarea.scrollHeight > 100 ? "auto" : "hidden";
+  }, [debugOpen, messageInput, tab]);
 
   useLayoutEffect(() => {
     if (tab !== "workflow") return;
@@ -2195,7 +2233,7 @@ export default function Workbench() {
                   : type === "file-name"
                     ? { includeExtension: true }
                     : type === "ocr"
-                      ? { ocrEngine: "tesseract", ocrLanguages: "eng", ocrPrimaryLanguage: "eng", ocrAdditionalLanguages: "", ocrPdfScale: 2 }
+                      ? { ocrEngine: "tesseract", ocrLanguages: "eng", ocrPrimaryLanguage: "eng", ocrAdditionalLanguages: "", ocrPdfScale: 2, ocrPages: "all", ocrLayout: "auto", ocrPreprocess: "none", ocrAutoRotate: true, ocrPreserveSpacing: true, ocrPageSeparators: true }
                 : type === "list-directory"
                   ? { subfolder: "", includeSubfolders: false }
           : type === "input"
@@ -2402,7 +2440,7 @@ export default function Workbench() {
       }
       updateWorkflow((workflow) => ({
         ...workflow,
-        nodes: workflow.nodes.map((node) => drag.positions[node.id] ? { ...node, x: Math.max(20, drag.positions[node.id].x + deltaX), y: Math.max(20, drag.positions[node.id].y + deltaY) } : node),
+        nodes: workflow.nodes.map((node) => drag.positions[node.id] ? { ...node, x: drag.positions[node.id].x + deltaX, y: drag.positions[node.id].y + deltaY } : node),
       }), { remember: false });
     } else if (selectionRef.current && canvasRef.current) {
       selectionRef.current.currentX = event.clientX;
@@ -2801,6 +2839,109 @@ export default function Workbench() {
       showToast(error instanceof Error ? error.message : "Could not load available models");
     } finally {
       setModelsLoading((current) => ({ ...current, [provider]: false }));
+    }
+  }
+
+  function validateAssistantWorkflow(workflow: Workflow) {
+    validateWorkflowAssistantGraph(workflow);
+    const seenInputs = new Set<string>();
+    const indegree = new Map(workflow.nodes.map((node) => [node.id, 0]));
+    const outgoing = new Map(workflow.nodes.map((node) => [node.id, [] as string[]]));
+
+    for (const node of workflow.nodes) {
+      const knownBuiltin = Object.prototype.hasOwnProperty.call(NODE_META, node.type);
+      const knownPlugin = plugins.some((plugin) => plugin.nodes.some((definition) => definition.type === node.type));
+      if (!knownBuiltin && !knownPlugin) throw new Error(`The model used an unknown node type: ${node.type}.`);
+      if (!node.name || !Number.isFinite(node.x) || !Number.isFinite(node.y) || !node.config || typeof node.config !== "object") {
+        throw new Error(`The model returned malformed settings for node ${node.id}.`);
+      }
+    }
+
+    for (const edge of workflow.edges) {
+      const source = workflow.nodes.find((node) => node.id === edge.from)!;
+      const target = workflow.nodes.find((node) => node.id === edge.to)!;
+      const sourcePort = getNodeSchema(source, plugins).outputs.find((port) => port.id === edge.fromPort);
+      const targetPort = getNodeSchema(target, plugins).inputs.find((port) => port.id === edge.toPort);
+      if (!sourcePort || !targetPort) throw new Error(`The model used an unknown port on edge ${edge.id}.`);
+      if (edge.dataType !== sourcePort.type || !portsCompatible(sourcePort.type, targetPort.type)) {
+        throw new Error(`The model used incompatible port types on edge ${edge.id}.`);
+      }
+      const inputKey = `${edge.to}:${edge.toPort}`;
+      if (!targetPort.multiple && seenInputs.has(inputKey)) throw new Error(`The model connected more than one edge to ${target.name} · ${targetPort.label}.`);
+      seenInputs.add(inputKey);
+      indegree.set(target.id, (indegree.get(target.id) || 0) + 1);
+      outgoing.get(source.id)?.push(target.id);
+    }
+
+    const ready = [...indegree.entries()].filter(([, count]) => count === 0).map(([id]) => id);
+    let visited = 0;
+    while (ready.length) {
+      const id = ready.shift()!;
+      visited += 1;
+      for (const targetId of outgoing.get(id) || []) {
+        const next = (indegree.get(targetId) || 0) - 1;
+        indegree.set(targetId, next);
+        if (next === 0) ready.push(targetId);
+      }
+    }
+    if (visited !== workflow.nodes.length) throw new Error("The model created a workflow cycle.");
+  }
+
+  async function runWorkflowAssistant() {
+    const userRequest = workflowAssistantRequest.trim();
+    const model = workflowAssistantModel.trim();
+    if (!userRequest) {
+      setWorkflowAssistantStatus({ kind: "error", message: "Describe the workflow change you want." });
+      return;
+    }
+    if (!model) {
+      setWorkflowAssistantStatus({ kind: "error", message: "Select or enter a model." });
+      return;
+    }
+
+    const sourceWorkflow = structuredClone(activeWorkflow);
+    const sourceManifest = workflowJsonManifest(sourceWorkflow);
+    setWorkflowAssistantRunning(true);
+    setWorkflowAssistantStatus(null);
+    try {
+      const response = await requestAI({
+        provider: workflowAssistantProvider,
+        model,
+        useModelDefaults: true,
+        systemPrompt: buildWorkflowAssistantSystemPrompt({ nodeReference, vibeCodingWorkflow, workflowSyntax: workflowSyntaxInstructions }),
+        prompt: buildWorkflowAssistantRequest(userRequest, sourceManifest),
+      }, providerSettings);
+      const parsed = parseWorkflowAssistantResponse(response);
+      if (parsed.id !== sourceWorkflow.id) throw new Error("The model changed the workflow id, so its edit was not applied.");
+      const normalized = normalizeWorkflowAssistantFanIn(parsed, (node, portId) =>
+        getNodeSchema(node as FlowNode, plugins).inputs.find((port) => port.id === portId),
+      );
+      const edited = {
+        ...normalized,
+        id: sourceWorkflow.id,
+        version: Math.max(4, Number(parsed.version) || sourceWorkflow.version),
+        updatedAt: new Date().toISOString(),
+        files: sourceWorkflow.files,
+        bundledLoads: sourceWorkflow.bundledLoads,
+      } as Workflow;
+      validateAssistantWorkflow(edited);
+      if (activeWorkflowIdRef.current !== sourceWorkflow.id) {
+        throw new Error(`Return to ${sourceWorkflow.name} and run the request again; the active workflow changed while the model was responding.`);
+      }
+      updateWorkflow((workflow) => ({
+        ...edited,
+        files: workflow.files,
+        bundledLoads: workflow.bundledLoads,
+      }));
+      setSelectedNodeId((id) => id && edited.nodes.some((node) => node.id === id) ? id : null);
+      setSelectedNodeIds((ids) => ids.filter((id) => edited.nodes.some((node) => node.id === id)));
+      setWorkflowAssistantRequest("");
+      setWorkflowAssistantStatus({ kind: "success", message: `${sourceWorkflow.name} updated. Undo restores the previous version.` });
+      showToast("AI workflow edit applied — use Undo to reverse it");
+    } catch (error) {
+      setWorkflowAssistantStatus({ kind: "error", message: error instanceof Error ? error.message : "The AI workflow edit could not be applied." });
+    } finally {
+      setWorkflowAssistantRunning(false);
     }
   }
 
@@ -3414,6 +3555,12 @@ export default function Workbench() {
           results = await performOcr(fileInput, {
             languages,
             pdfScale: node.config.ocrPdfScale,
+            pages: node.config.ocrPages,
+            layout: node.config.ocrLayout,
+            preprocess: node.config.ocrPreprocess,
+            autoRotate: node.config.ocrAutoRotate,
+            preserveSpacing: node.config.ocrPreserveSpacing,
+            includePageSeparators: node.config.ocrPageSeparators,
           }, (progress) => {
             const percent = Math.round(progress.progress * 100);
             updateDebugEvent(
@@ -3433,6 +3580,7 @@ export default function Workbench() {
               file,
               node.config.ocrPdfScale || 2,
               (page, pageCount) => updateDebugEvent(debugId, "running", `Rendering ${file.name}, page ${page}/${pageCount} for ${engine} OCR…`),
+              { pages: node.config.ocrPages, preprocess: node.config.ocrPreprocess },
             );
             const pageTexts: string[] = [];
             for (let pageIndex = 0; pageIndex < prepared.files.length; pageIndex += 1) {
@@ -3442,25 +3590,28 @@ export default function Workbench() {
                 provider: engine,
                 model: node.config.ocrModel || modelDefaults[engine],
                 systemPrompt: "You are a precise OCR engine. Follow the requested transcription format exactly.",
-                prompt: visionOcrPrompt(prepared.pageCount > 1 ? `${file.name}, page ${pageIndex + 1}` : file.name, languages),
+                prompt: visionOcrPrompt(
+                  prepared.pageCount > 1 ? `${file.name}, page ${prepared.pageNumbers[pageIndex]}` : file.name,
+                  languages,
+                  { layout: node.config.ocrLayout, preserveSpacing: node.config.ocrPreserveSpacing, guidance: node.config.ocrGuidance },
+                ),
                 temperature: 0,
                 files: [pageFile],
-                openai: engine === "openai" ? { reasoningEffort: "none", maxCompletionTokens: 16384 } : undefined,
+                openai: engine === "openai" ? { maxCompletionTokens: 16384 } : undefined,
                 gemini: engine === "gemini" ? { maxOutputTokens: 16384 } : undefined,
                 claude: engine === "claude" ? { thinking: "disabled", maxTokens: 16384 } : undefined,
                 ollama: engine === "ollama" ? { think: false, numPredict: 16384 } : undefined,
               }, providerSettings);
               pageTexts.push(pageText.trim());
             }
-            const text = prepared.pageCount > 1
-              ? pageTexts.map((pageText, pageIndex) => `--- Page ${pageIndex + 1} ---\n\n${pageText}`).join("\n\n")
-              : pageTexts[0] || "";
+            const text = formatOcrPages(pageTexts, prepared.pageNumbers, node.config.ocrPageSeparators !== false);
             results.push({
               sourceName: file.name,
               outputName: outputNames[fileIndex],
               text,
               pageCount: prepared.pageCount,
               confidence: null,
+              pages: prepared.pageNumbers,
             });
           }
         }
@@ -4264,7 +4415,7 @@ export default function Workbench() {
 
       {tab === "workflow" ? (
         <section
-          className={`workflow-view ${isDraggingWorkflowFile ? "dragging-files" : ""}`}
+          className={`workflow-view ${isDraggingWorkflowFile ? "dragging-files" : ""} ${inspectorOpen ? "" : "inspector-closed"}`}
           onDragEnter={handleWorkflowDragEnter}
           onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; }}
           onDragLeave={handleWorkflowDragLeave}
@@ -4273,10 +4424,18 @@ export default function Workbench() {
           {isDraggingWorkflowFile && <div className="file-drop-overlay"><span><FileJson size={24} /><strong>Drop workflow files to import</strong><small>Magic Conch workflow JSON files are supported.</small></span></div>}
           <aside className={`workflow-sidebar ${sidebarOpen ? "open" : ""}`}>
             <div className="sidebar-heading">
-              <span>Workflows</span>
+              <button
+                type="button"
+                className={`sidebar-section-toggle ${workflowsSectionOpen ? "" : "collapsed"}`}
+                onClick={() => setWorkflowsSectionOpen((open) => !open)}
+                aria-expanded={workflowsSectionOpen}
+                aria-controls="workflow-list-section"
+              >
+                <span>Workflows</span><ChevronDown size={13} />
+              </button>
               <button className="mini-icon" aria-label="New workflow" onClick={newWorkflow}><Plus size={16} /></button>
             </div>
-            <div className="workflow-list">
+            {workflowsSectionOpen && <div className="workflow-list" id="workflow-list-section">
               {workflows.map((workflow) => (
                 <div
                   key={workflow.id}
@@ -4286,10 +4445,20 @@ export default function Workbench() {
                   <span className="workflow-item-actions"><button onClick={() => setEditingWorkflow({ id: workflow.id, name: workflow.name })} aria-label={`Rename ${workflow.name}`} title="Rename"><Pencil size={11} /></button><button onClick={() => duplicateWorkflow(workflow.id)} aria-label={`Duplicate ${workflow.name}`} title="Duplicate"><Copy size={11} /></button><button onClick={() => deleteWorkflow(workflow.id)} aria-label={`Delete ${workflow.name}`} title="Delete"><Trash2 size={11} /></button></span>
                 </div>
               ))}
-            </div>
+            </div>}
             <div className="sidebar-divider" />
-            <div className="sidebar-heading library-heading"><span>Node library</span></div>
-            <label className="node-search">
+            <div className="sidebar-heading library-heading">
+              <button
+                type="button"
+                className={`sidebar-section-toggle ${nodeLibrarySectionOpen ? "" : "collapsed"}`}
+                onClick={() => setNodeLibrarySectionOpen((open) => !open)}
+                aria-expanded={nodeLibrarySectionOpen}
+                aria-controls="node-library-section"
+              >
+                <span>Node library</span><ChevronDown size={13} />
+              </button>
+            </div>
+            {nodeLibrarySectionOpen && <><label className="node-search">
               <Search size={14} />
               <input
                 type="search"
@@ -4300,7 +4469,7 @@ export default function Workbench() {
               />
               {nodeSearch && <button type="button" onClick={() => setNodeSearch("")} aria-label="Clear node search"><X size={12} /></button>}
             </label>
-            <div className="node-library">
+            <div className="node-library" id="node-library-section">
               {nodeLibraryGroups.map((group) => {
                 const isOpen = Boolean(nodeSearch.trim()) || !collapsedNodeGroups[group.id];
                 return (
@@ -4328,7 +4497,7 @@ export default function Workbench() {
                 );
               })}
               {!matchingNodeCount && <div className="node-library-empty"><Search size={18} /><strong>No nodes found</strong><span>Try a different node name.</span></div>}
-            </div>
+            </div></>}
             <details className="syntax-reference">
               <summary><span><Braces size={14} /> Syntax</span><ChevronDown size={14} /></summary>
               <div className="syntax-reference-body">
@@ -4365,11 +4534,34 @@ export default function Workbench() {
               <div className="workflow-toolbar-actions">
                 <button className="icon-button" onClick={undoWorkflow} aria-label="Undo last workflow change" title="Undo (Ctrl+Z)"><Undo2 size={16} /></button>
                 <button className="icon-button" onClick={redoWorkflow} aria-label="Redo workflow change" title="Redo (Ctrl+Shift+Z)"><Redo2 size={16} /></button>
+                <button className={`assistant-toggle ${workflowAssistantOpen ? "active" : ""}`} onClick={() => setWorkflowAssistantOpen((open) => !open)} aria-expanded={workflowAssistantOpen} aria-controls="workflow-ai-assistant"><Sparkles size={15} /> AI assistant</button>
                 <button className="secondary-button" onClick={saveWorkflow}><Save size={15} /> Save</button>
                 <button className="primary-button" onClick={openWorkflowChat}><Play size={15} fill="currentColor" /> Test workflow</button>
+                {!inspectorOpen && <button className="icon-button" onClick={() => setInspectorOpen(true)} aria-label="Open inspector" title="Open inspector"><PanelRightOpen size={17} /></button>}
                 <button className="icon-button hide-mobile" aria-label="More options"><MoreHorizontal size={18} /></button>
               </div>
             </div>
+
+            {workflowAssistantOpen && (
+              <aside className="workflow-assistant" id="workflow-ai-assistant" aria-label="AI workflow assistant">
+                <div className="workflow-assistant-heading">
+                  <span className="assistant-mark"><Sparkles size={16} /></span>
+                  <div><strong>AI workflow assistant</strong><small>Edits {activeWorkflow.name}</small></div>
+                  <button className="mini-icon" onClick={() => setWorkflowAssistantOpen(false)} aria-label="Close AI workflow assistant"><X size={16} /></button>
+                </div>
+                <form onSubmit={(event) => { event.preventDefault(); void runWorkflowAssistant(); }}>
+                  <p className="workflow-assistant-intro">Describe a change. The selected model receives this workflow plus the node, workflow, and syntax guides.</p>
+                  <div className="workflow-assistant-models">
+                    <label>Provider<div className="select-wrap"><select value={workflowAssistantProvider} disabled={workflowAssistantRunning} onChange={(event) => { const provider = event.target.value as AIProvider; setWorkflowAssistantProvider(provider); setWorkflowAssistantModel(modelDefaults[provider]); setWorkflowAssistantStatus(null); }}><option value="openai">OpenAI</option><option value="gemini">Google Gemini</option><option value="claude">Anthropic Claude</option><option value="ollama">Ollama</option></select><ChevronDown size={14} /></div></label>
+                    <label><span>Model<button type="button" onClick={() => refreshAvailableModels(workflowAssistantProvider)} disabled={workflowAssistantRunning || modelsLoading[workflowAssistantProvider]} title="Refresh available models"><RefreshCw size={11} className={modelsLoading[workflowAssistantProvider] ? "spin" : ""} /> Refresh</button></span><input list="workflow-assistant-models" value={workflowAssistantModel} disabled={workflowAssistantRunning} onChange={(event) => setWorkflowAssistantModel(event.target.value)} /><datalist id="workflow-assistant-models">{(availableModels[workflowAssistantProvider] || []).map((model) => <option key={model} value={model} />)}</datalist></label>
+                  </div>
+                  <label className="workflow-assistant-request">Change request<textarea rows={6} value={workflowAssistantRequest} disabled={workflowAssistantRunning} onChange={(event) => { setWorkflowAssistantRequest(event.target.value); setWorkflowAssistantStatus(null); }} placeholder="For example: Add a Request node that summarizes the user message in three bullets, then send its response to End." /></label>
+                  {workflowAssistantStatus && <div className={`workflow-assistant-status ${workflowAssistantStatus.kind}`} role="status">{workflowAssistantStatus.kind === "success" ? <Check size={14} /> : <Info size={14} />}<span>{workflowAssistantStatus.message}</span></div>}
+                  <button className="workflow-assistant-submit" type="submit" disabled={workflowAssistantRunning || !workflowAssistantRequest.trim() || !workflowAssistantModel.trim()}>{workflowAssistantRunning ? <><LoaderCircle size={15} className="spin" /> Editing workflow…</> : <><Sparkles size={15} /> Edit workflow</>}</button>
+                  <small className="workflow-assistant-footnote"><Undo2 size={12} /> AI edits use the same Undo/Redo history as manual edits.</small>
+                </form>
+              </aside>
+            )}
 
             <div
               className={`canvas ${connectionSource ? "connecting" : ""}`}
@@ -4521,6 +4713,13 @@ export default function Workbench() {
                       <label className="field-label">Primary language<div className="select-wrap"><select value={primaryLanguage} onChange={(event) => updateNode({ config: { ocrPrimaryLanguage: event.target.value } })}>{engine !== "tesseract" && <option value="auto">Auto detect</option>}{!knownPrimary && primaryLanguage !== "auto" && <option value={primaryLanguage}>Custom ({primaryLanguage})</option>}{OCR_LANGUAGE_OPTIONS.map((language) => <option key={language.code} value={language.code}>{language.label}</option>)}</select><ChevronDown size={14} /></div></label>
                       <label className="field-label">Additional languages<input value={additionalLanguages} disabled={primaryLanguage === "auto"} placeholder="Optional, e.g. eng+kor" onChange={(event) => updateNode({ config: { ocrAdditionalLanguages: event.target.value } })} /><small className="field-help">Optional Tesseract codes separated by +, commas, or spaces. Leave empty for one language.</small></label>
                       <label className="field-label">PDF render quality<div className="select-wrap"><select value={selectedNode.config.ocrPdfScale || 2} onChange={(event) => updateNode({ config: { ocrPdfScale: Number(event.target.value) } })}><option value="1">Standard (1×)</option><option value="2">High (2×)</option><option value="3">Very high (3×)</option><option value="4">Maximum (4×)</option></select><ChevronDown size={14} /></div><small className="field-help">Higher quality can improve scanned PDFs but uses more memory and takes longer.</small></label>
+                      <label className="field-label">PDF pages<input value={selectedNode.config.ocrPages || "all"} placeholder="all or 1-3, 5, 8-" onChange={(event) => updateNode({ config: { ocrPages: event.target.value } })} /><small className="field-help">Process all pages, individual pages, ranges, open ranges such as 4-, or last.</small></label>
+                      <label className="field-label">Document layout<div className="select-wrap"><select value={selectedNode.config.ocrLayout || "auto"} onChange={(event) => updateNode({ config: { ocrLayout: event.target.value as OcrLayout } })}><option value="auto">Automatic</option><option value="single-column">Single column</option><option value="single-block">Single text block</option><option value="sparse">Scattered / sparse text</option><option value="single-line">Single line</option></select><ChevronDown size={14} /></div><small className="field-help">A layout hint improves recognition of receipts, screenshots, labels, and simple forms.</small></label>
+                      <label className="field-label">Image cleanup<div className="select-wrap"><select value={selectedNode.config.ocrPreprocess || "none"} onChange={(event) => updateNode({ config: { ocrPreprocess: event.target.value as OcrPreprocess } })}><option value="none">Original image</option><option value="grayscale">Grayscale</option><option value="contrast">Boost contrast</option><option value="binary">Black and white threshold</option></select><ChevronDown size={14} /></div><small className="field-help">Use cleanup for faint or uneven scans. Original is usually best for photos and AI vision.</small></label>
+                      {engine === "tesseract" && <label className="check-field"><input type="checkbox" checked={selectedNode.config.ocrAutoRotate !== false} onChange={(event) => updateNode({ config: { ocrAutoRotate: event.target.checked } })} /><span>Automatically detect text rotation</span></label>}
+                      <label className="check-field"><input type="checkbox" checked={selectedNode.config.ocrPreserveSpacing !== false} onChange={(event) => updateNode({ config: { ocrPreserveSpacing: event.target.checked } })} /><span>Preserve columns and word spacing</span></label>
+                      <label className="check-field"><input type="checkbox" checked={selectedNode.config.ocrPageSeparators !== false} onChange={(event) => updateNode({ config: { ocrPageSeparators: event.target.checked } })} /><span>Add page separators to multi-page text</span></label>
+                      {provider && <label className="field-label">Recognition guidance<textarea rows={3} value={selectedNode.config.ocrGuidance || ""} placeholder="Optional, e.g. preserve handwritten margin notes" onChange={(event) => updateNode({ config: { ocrGuidance: event.target.value } })} /><small className="field-help">Optional instructions for the vision model. The node still requires literal transcription.</small></label>}
                     </>;
                   })()}
                   {selectedNode.type === "chat-session" && (
@@ -4804,7 +5003,6 @@ export default function Workbench() {
               )}
             </aside>
           )}
-          {!inspectorOpen && <button className="reopen-inspector" onClick={() => setInspectorOpen(true)}><Settings size={16} /> Inspector</button>}
         </section>
       ) : (
         <section
@@ -4934,6 +5132,7 @@ export default function Workbench() {
                 <button className="attach-button" onClick={() => attachmentInputRef.current?.click()} aria-label="Attach files"><Paperclip size={17} /></button>
                 <input ref={attachmentInputRef} type="file" multiple hidden onChange={addMessageFiles} />
                 <textarea
+                  ref={messageInputRef}
                   rows={1}
                   value={messageInput}
                   onChange={(event) => setMessageInput(event.target.value)}
