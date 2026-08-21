@@ -88,6 +88,7 @@ import {
   requestAI,
 } from "../lib/ai-providers";
 import { collectFileAssets, fileAssetsPromptSections } from "../lib/file-content";
+import { collectDebugFiles, sanitizeDebugData, sanitizeDebugValue } from "../lib/debug-data";
 import { artifactFallbackJson, readStoredArtifact, writeStoredArtifact } from "../lib/artifact-storage";
 import { fileNameFromAsset, firstFileAsset, getMediaDimensions } from "../lib/file-metadata";
 import { evaluateBooleanRule, parseAIBoolean } from "../lib/boolean-condition";
@@ -130,6 +131,7 @@ import {
   WorkflowSyntaxContext,
 } from "../lib/workflow-syntax";
 import {
+  createWorkflowResourceLimiter,
   createWorkflowTaskLimiter,
   DEFAULT_WORKFLOW_PARALLELISM,
   isWorkflowNodeActive,
@@ -137,6 +139,7 @@ import {
   MAX_WORKFLOW_PARALLELISM,
   MIN_WORKFLOW_PARALLELISM,
   normalizeWorkflowParallelism,
+  WorkflowResourceLimiter,
   WorkflowTaskLimiter,
 } from "../lib/workflow-scheduler";
 import { recommendWorkflowParallelism, SystemPressureLevel } from "../lib/system-pressure";
@@ -204,6 +207,7 @@ type WorkflowContext = {
   };
   workflowStack?: string[];
   executionLimiter: WorkflowTaskLimiter;
+  fileProcessingLimiter: WorkflowResourceLimiter;
 };
 type FlowNode = {
   id: string;
@@ -1272,15 +1276,13 @@ function DebugDataSection({ title, items = [] }: { title: string; items?: DebugD
     <div className="debug-data-section">
       <span className="debug-data-title">{title}</span>
       {items.map((item, index) => {
-        const isFileType = ["files", "image", "video", "audio"].includes(item.type);
-        const files = isFileType && Array.isArray(item.value)
-          ? item.value.filter((value): value is FileAsset => Boolean(value && typeof value === "object" && "name" in value))
-          : [];
+        const isFileType = ["files", "document", "image", "video", "audio"].includes(item.type);
+        const files = isFileType ? collectDebugFiles(item.value) : [];
         return (
           <div className={`debug-datum datum-${item.type}`} key={`${title}-${item.port}-${index}`}>
             <div><strong>{item.label}</strong><small>{item.type}</small></div>
             {isFileType ? (
-              files.length ? <div className="debug-file-list">{files.map((file, index) => <a key={`${file.name}-${index}`} href={file.data} download={file.name} title={`Download ${file.name}`}><FileJson size={12} /><span><b>{file.name}</b><small>{file.type || "file"} · {Math.max(1, Math.round(file.size / 1024))} KB</small></span><Download size={11} /></a>)}</div> : <em>No files</em>
+              files.length ? <div className="debug-file-list">{files.map((file, index) => <span className="debug-file-item" key={`${file.name}-${index}`} title="File content omitted from the live debugger to reduce memory use"><FileJson size={12} /><span><b>{file.name}</b><small>{file.type || "file"} · {Math.max(1, Math.round(file.size / 1024))} KB · metadata only</small></span></span>)}</div> : <em>No files</em>
             ) : (
               <pre>{item.value == null ? "No value" : typeof item.value === "string" ? item.value : JSON.stringify(item.value, null, 2)}</pre>
             )}
@@ -2076,7 +2078,7 @@ export default function Workbench() {
     const id = uid("debug");
     setDebugEvents((current) => [
       ...current,
-      { id, nodeId: node.id, nodeName: node.name, nodeType: getNodeMeta(node.type, plugins).label, status, detail, time: timeNow(), inputs: data.inputs || [], outputs: data.outputs || [], fileSource: data.fileSource },
+      { id, nodeId: node.id, nodeName: node.name, nodeType: getNodeMeta(node.type, plugins).label, status, detail, time: timeNow(), inputs: sanitizeDebugData(data.inputs || []), outputs: sanitizeDebugData(data.outputs || []), fileSource: data.fileSource },
     ]);
     return id;
   }
@@ -2087,8 +2089,14 @@ export default function Workbench() {
     detail: string,
     data: { inputs?: DebugDatum[]; outputs?: DebugDatum[]; fileSource?: string; modelThinking?: string } = {},
   ) {
+    const debugData = {
+      ...data,
+      ...(data.inputs ? { inputs: sanitizeDebugData(data.inputs) } : {}),
+      ...(data.outputs ? { outputs: sanitizeDebugData(data.outputs) } : {}),
+      ...(data.modelThinking !== undefined ? { modelThinking: String(sanitizeDebugValue(data.modelThinking)) } : {}),
+    };
     setDebugEvents((current) =>
-      current.map((event) => (event.id === id ? { ...event, status, detail, ...data } : event)),
+      current.map((event) => (event.id === id ? { ...event, status, detail, ...debugData } : event)),
     );
   }
 
@@ -2110,7 +2118,7 @@ export default function Workbench() {
     setIsDraggingFiles(false);
     const files = Array.from(event.dataTransfer.files);
     if (!files.length) return;
-    const assets = await Promise.all(files.map(readFileAsset));
+    const assets = await readFileAssets(files);
     setAttachedFiles((current) => [...current, ...assets]);
     showToast(`${assets.length} file${assets.length === 1 ? "" : "s"} attached`);
   }
@@ -2806,8 +2814,14 @@ export default function Workbench() {
     });
   }
 
+  async function readFileAssets(files: File[]) {
+    const assets: FileAsset[] = [];
+    for (const file of files) assets.push(await readFileAsset(file));
+    return assets;
+  }
+
   async function addMessageFiles(event: ChangeEvent<HTMLInputElement>) {
-    const assets = await Promise.all(Array.from(event.target.files || []).map(readFileAsset));
+    const assets = await readFileAssets(Array.from(event.target.files || []));
     setAttachedFiles((current) => [...current, ...assets]);
     event.target.value = "";
   }
@@ -3273,6 +3287,7 @@ export default function Workbench() {
       chatSession: parentContext.chatSession,
       workflowStack: [...workflowStack, workflow.id],
       executionLimiter: parentContext.executionLimiter,
+      fileProcessingLimiter: parentContext.fileProcessingLimiter,
     };
     context.values[portValueKey(start.id, "prompt")] = startInputs.prompt;
     context.values[portValueKey(start.id, "files")] = files;
@@ -3653,11 +3668,14 @@ export default function Workbench() {
           .filter(Boolean)
           .join("\n\n");
         const provider = node.config.provider || "openai";
+        let lastLiveUpdateAt = 0;
         if (provider === "ollama") {
           setLiveModelActivities((current) => ({ ...current, [node.id]: { nodeName: node.name, thinking: "", content: "" } }));
         }
         try {
-          context.lastOutput = await requestAI(
+          context.lastOutput = await context.fileProcessingLimiter.run(
+            fileInput.reduce((total, file) => total + Math.max(0, file.size), 0),
+            () => requestAI(
             {
             provider,
             model: String(inputFor("model", node.config.model || modelDefaults[node.config.provider || "openai"])),
@@ -3672,6 +3690,9 @@ export default function Workbench() {
           },
           providerSettings,
           provider === "ollama" ? (progress) => {
+            const now = performance.now();
+            if (!progress.done && now - lastLiveUpdateAt < 100) return;
+            lastLiveUpdateAt = now;
             setLiveModelActivities((current) => ({
               ...current,
               [node.id]: { nodeName: node.name, thinking: progress.thinking, content: progress.content },
@@ -3685,6 +3706,7 @@ export default function Workbench() {
               { modelThinking: progress.thinking },
             );
           } : undefined,
+            ),
           );
         } finally {
           if (provider === "ollama") {
@@ -4176,6 +4198,7 @@ export default function Workbench() {
       },
       workflowStack: [activeWorkflow.id],
       executionLimiter: createWorkflowTaskLimiter(() => workflowParallelismRef.current),
+      fileProcessingLimiter: createWorkflowResourceLimiter(),
     };
     context.values[portValueKey(start.id, "prompt")] = startInputs.prompt;
     context.values[portValueKey(start.id, "files")] = files;

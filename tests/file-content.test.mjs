@@ -72,3 +72,22 @@ test("keeps unsupported binary attachments visible to the model", () => {
   assert.match(section, /Attached file: archive\.bin/);
   assert.match(section, /Binary content is attached separately/);
 });
+
+test("does not decode unsupported binary attachments", () => {
+  const section = fileAssetPromptSection({
+    name: "large.pdf",
+    type: "application/pdf",
+    data: "data:application/pdf;base64,this-is-deliberately-invalid-base64%%%",
+    size: 36_000_000,
+  });
+
+  assert.match(section, /Attached file: large\.pdf/);
+  assert.doesNotMatch(section, /Content extraction failed/);
+});
+
+test("keeps distinct files with matching metadata", () => {
+  const first = { name: "same.bin", type: "application/octet-stream", size: 3, data: "data:application/octet-stream;base64,AQID" };
+  const second = { name: "same.bin", type: "application/octet-stream", size: 3, data: "data:application/octet-stream;base64,BAUG" };
+
+  assert.deepEqual(collectFileAssets(first, first, second), [first, second]);
+});

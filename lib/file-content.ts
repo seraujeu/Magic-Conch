@@ -23,16 +23,21 @@ function isPromptFileAsset(value: unknown): value is PromptFileAsset {
  */
 export function collectFileAssets(...values: unknown[]): PromptFileAsset[] {
   const files: PromptFileAsset[] = [];
-  const seen = new Set<string>();
+  const seenObjects = new WeakSet<object>();
+  const seenByMetadata = new Map<string, PromptFileAsset[]>();
   const visit = (value: unknown) => {
     if (Array.isArray(value)) {
       value.forEach(visit);
       return;
     }
     if (!isPromptFileAsset(value)) return;
-    const identity = `${value.name}\0${value.data}`;
-    if (seen.has(identity)) return;
-    seen.add(identity);
+    if (seenObjects.has(value)) return;
+    seenObjects.add(value);
+    const identity = `${value.name}\0${value.type}\0${value.size}`;
+    const matches = seenByMetadata.get(identity);
+    if (matches?.some((candidate) => candidate.data === value.data)) return;
+    if (matches) matches.push(value);
+    else seenByMetadata.set(identity, [value]);
     files.push(value);
   };
   values.forEach(visit);
@@ -154,6 +159,11 @@ function isPlainTextFile(file: PromptFileAsset) {
 }
 
 export function fileAssetPromptSection(file: PromptFileAsset) {
+  const supported = /\.(?:xlsx|xlsm|docx)$/i.test(file.name) || isPlainTextFile(file);
+  if (!supported) {
+    return `Attached file: ${file.name} (${file.type || "unknown type"}, ${file.size} bytes)\n[Binary content is attached separately when supported by the selected provider.]`;
+  }
+
   let content = "";
   try {
     const bytes = dataUrlBytes(file.data);

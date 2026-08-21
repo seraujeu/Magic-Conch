@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createWorkflowResourceLimiter,
   createWorkflowTaskLimiter,
   DEFAULT_WORKFLOW_PARALLELISM,
   isWorkflowNodeActive,
@@ -228,4 +229,34 @@ test("a shared limiter reads an updated automatic limit before starting queued w
   releaseSecond();
   await Promise.all(tasks);
   assert.deepEqual(starts, [0, 1, 2]);
+});
+
+test("limits concurrent attachment processing by total byte cost", async () => {
+  const limiter = createWorkflowResourceLimiter(10);
+  let activeCost = 0;
+  let peakCost = 0;
+  const run = (cost) => limiter.run(cost, async () => {
+    activeCost += cost;
+    peakCost = Math.max(peakCost, activeCost);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    activeCost -= cost;
+  });
+
+  await Promise.all([run(6), run(6), run(4)]);
+  assert.equal(peakCost, 10);
+});
+
+test("runs an attachment task larger than the byte budget by itself", async () => {
+  const limiter = createWorkflowResourceLimiter(10);
+  let active = 0;
+  let peak = 0;
+  const run = (cost) => limiter.run(cost, async () => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    active -= 1;
+  });
+
+  await Promise.all([run(20), run(1)]);
+  assert.equal(peak, 1);
 });

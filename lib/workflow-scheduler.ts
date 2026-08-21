@@ -151,3 +151,60 @@ export function isWorkflowNodeActive({
       || portEdges.some((edge) => activeIncoming.includes(edge));
   });
 }
+
+export const DEFAULT_FILE_PROCESSING_BUDGET_BYTES = 32 * 1024 * 1024;
+
+export type WorkflowResourceLimiter = {
+  run: <T>(cost: number, task: () => Promise<T>) => Promise<T>;
+};
+
+/**
+ * Bounds the combined attachment bytes held by expensive browser-side tasks.
+ * A single task larger than the budget is allowed to run alone.
+ */
+export function createWorkflowResourceLimiter(
+  budget = DEFAULT_FILE_PROCESSING_BUDGET_BYTES,
+): WorkflowResourceLimiter {
+  const maximum = Math.max(1, Math.trunc(budget));
+  const queue: Array<{
+    cost: number;
+    task: () => Promise<unknown>;
+    resolve: (value: unknown) => void;
+    reject: (reason?: unknown) => void;
+  }> = [];
+  let activeCost = 0;
+  let activeTasks = 0;
+
+  const drain = () => {
+    while (queue.length) {
+      const entry = queue[0];
+      const cost = Math.max(1, Math.trunc(entry.cost));
+      if (activeTasks && activeCost + Math.min(cost, maximum) > maximum) return;
+      queue.shift();
+      activeTasks += 1;
+      activeCost += Math.min(cost, maximum);
+      Promise.resolve()
+        .then(entry.task)
+        .then(entry.resolve, entry.reject)
+        .finally(() => {
+          activeTasks -= 1;
+          activeCost -= Math.min(cost, maximum);
+          drain();
+        });
+    }
+  };
+
+  return {
+    run<T>(cost: number, task: () => Promise<T>) {
+      return new Promise<T>((resolve, reject) => {
+        queue.push({
+          cost: Number.isFinite(cost) ? Math.max(1, cost) : maximum,
+          task,
+          resolve: resolve as (value: unknown) => void,
+          reject,
+        });
+        drain();
+      });
+    },
+  };
+}
