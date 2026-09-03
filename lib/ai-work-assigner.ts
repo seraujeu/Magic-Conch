@@ -9,8 +9,23 @@ function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function outputTagName(output: AIWorkOutput) {
-  return (output.label.trim() || output.id).replace(/[<>]/g, "");
+function outputSections(outputs: AIWorkOutput[]) {
+  const names = outputs.map((output) => (output.label.trim() || output.id).replace(/[<>]/g, "").trim());
+  const counts = new Map<string, number>();
+  names.forEach((name) => counts.set(name.toLowerCase(), (counts.get(name.toLowerCase()) || 0) + 1));
+  // Reserve every configured name so generated tags cannot shadow another output.
+  const reserved = new Set(names.map((name) => name.toLowerCase()));
+  return outputs.map((output, index) => {
+    let tag = names[index];
+    if (!tag || (counts.get(tag.toLowerCase()) || 0) > 1) {
+      const base = `assignment-${index + 1}`;
+      tag = base;
+      let suffix = 2;
+      while (reserved.has(tag.toLowerCase())) tag = `${base}-${suffix++}`;
+      reserved.add(tag.toLowerCase());
+    }
+    return { output, tag };
+  });
 }
 
 export function buildAIWorkAssignerSystemPrompt(systemPrompt: string, outputs: AIWorkOutput[]) {
@@ -20,11 +35,11 @@ export function buildAIWorkAssignerSystemPrompt(systemPrompt: string, outputs: A
     "For every output you activate, return one XML-style section using that output's exact tag name.",
     "The text inside each section must be a complete, standalone natural-language prompt for the AI Request node connected to that output.",
     "You may activate multiple outputs. Do not include a tag for an output that should remain inactive.",
+    "Omit outputs with no work to assign; never return empty or whitespace-only sections.",
     "Return only output sections, with no explanation or text outside them. Do not invent tags.",
     "",
     "Allowed output sections, activation criteria, and export requirements:",
-    ...outputs.map((output) => {
-      const tag = outputTagName(output);
+    ...outputSections(outputs).map(({ output, tag }) => {
       const activation = output.activation?.trim() || "Use the configured system prompt and this output's name to decide.";
       const exportInstruction = output.exportInstruction?.trim() || "Export a complete prompt tailored to this output's named role.";
       return `- <${tag}>Prompt for ${output.label || output.id}</${tag}>\n  Activate when: ${activation}\n  What to export: ${exportInstruction}`;
@@ -36,11 +51,10 @@ export function buildAIWorkAssignerSystemPrompt(systemPrompt: string, outputs: A
 
 export function parseAIWorkAssignments(response: string, outputs: AIWorkOutput[]) {
   const assignments = new Map<string, string>();
-  outputs.forEach((output) => {
-    const tag = escapeRegExp(outputTagName(output));
-    if (!tag) return;
+  outputSections(outputs).forEach(({ output, tag: sectionTag }) => {
+    const tag = escapeRegExp(sectionTag);
     const pattern = new RegExp(`<\\s*${tag}\\s*>([\\s\\S]*?)<\\/\\s*${tag}\\s*>`, "gi");
-    const prompts = [...response.matchAll(pattern)].map((match) => match[1].trim());
+    const prompts = [...response.matchAll(pattern)].map((match) => match[1].trim()).filter(Boolean);
     if (prompts.length) assignments.set(output.id, prompts.join("\n\n"));
   });
   return assignments;

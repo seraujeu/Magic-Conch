@@ -149,6 +149,7 @@ Ports use `port_id:type`. For example, `prompt:prompt` means the JSON port ID is
 
 - Every output option has an ID, label, optional activation description (`value`), and optional export instruction.
 - Multiple outputs may activate in the same run. Outputs omitted by the model emit nothing, so their downstream branches stay inactive.
+- Empty or whitespace-only assignment sections also emit nothing. If output names collide (ignoring case and angle brackets), the response format gives them distinct tags so each output can be selected independently.
 - The node adds the required named-section response format to the configured system prompt automatically.
 - Connect each output directly to a downstream Request prompt when it represents a worker assignment.
 - Output IDs are part of the graph contract. Do not regenerate them without updating all connected edges.

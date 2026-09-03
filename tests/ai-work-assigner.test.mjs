@@ -6,6 +6,8 @@ import {
   parseAIWorkAssignments,
 } from "../lib/ai-work-assigner.ts";
 
+import { isWorkflowNodeActive } from "../lib/workflow-scheduler.ts";
+
 const outputs = [
   { id: "research", label: "Researcher" },
   { id: "draft", label: "Writer", activation: "The request needs original prose or editing.", exportInstruction: "Export a concise drafting brief with audience, tone, and required sections." },
@@ -76,4 +78,67 @@ test("AI-powered routing nodes accept every file input and send attachments to t
   assert.match(workbench, /if \(node\.type === "condition-ai" \|\| node\.type === "condition-rule"\)[\s\S]*?inputs: \[[^\n]+\.\.\.fileInputs\]/);
   assert.match(workbench, /if \(node\.type === "ai-assigner"\)[\s\S]*?fileAssetsPromptSections\(fileInput\)[\s\S]*?files: fileInput/);
   assert.match(workbench, /if \(node\.type === "router-ai"\)[\s\S]*?fileAssetsPromptSections\(fileInput\)[\s\S]*?files: fileInput/);
+});
+
+
+test("empty assignments leave connected workers inactive even with active file inputs", () => {
+  const assignments = parseAIWorkAssignments(
+    "<Writer> \n\t </Writer><Researcher>Find sources.</Researcher><Reviewer></Reviewer>",
+    outputs,
+  );
+  assert.deepEqual([...assignments], [["research", "Find sources."]]);
+  const emittedPortKeys = new Set(["start:files", ...[...assignments.keys()].map((id) => `assigner:${id}`)]);
+  for (const output of outputs) {
+    assert.equal(isWorkflowNodeActive({
+      nodeType: "request",
+      inputPorts: [{ id: "prompt" }, { id: "files" }],
+      incoming: [
+        { from: "assigner", fromPort: output.id, toPort: "prompt" },
+        { from: "start", fromPort: "files", toPort: "files" },
+      ],
+      emittedPortKeys,
+    }), output.id === "research");
+  }
+});
+
+test("ignores empty repeated sections while keeping actual assignments", () => {
+  const assignments = parseAIWorkAssignments(
+    "<Writer></Writer><Writer>First task.</Writer><Writer> </Writer><Writer>Second task.</Writer>",
+    outputs,
+  );
+  assert.deepEqual([...assignments], [["draft", "First task.\n\nSecond task."]]);
+});
+
+for (const labels of [["Writer", "Writer"], ["Writer", "writer"], ["Writer", "<Writer>"], ["Writer", " Writer "]]) {
+  test(`colliding labels ${JSON.stringify(labels)} can be selected independently`, () => {
+    const options = labels.map((label, index) => ({ id: `worker-${index}`, label }));
+    const prompt = buildAIWorkAssignerSystemPrompt("", options);
+    const tags = [...prompt.matchAll(/^- <([^>]+)>/gm)].map((match) => match[1]);
+    assert.equal(tags.length, options.length);
+    assert.equal(new Set(tags.map((tag) => tag.toLowerCase())).size, options.length);
+    tags.forEach((tag, index) => {
+      assert.deepEqual([...parseAIWorkAssignments(`<${tag}>Only this worker.</${tag}>`, options)], [
+        [options[index].id, "Only this worker."],
+      ]);
+    });
+    assert.equal(parseAIWorkAssignments("<Writer>Ambiguous work.</Writer>", options).size, 0);
+  });
+}
+
+test("generated tags avoid configured names and support names that become empty", () => {
+  const options = [
+    { id: "a", label: "Writer" },
+    { id: "b", label: "writer" },
+    { id: "c", label: "assignment-1" },
+    { id: "d", label: "ASSIGNMENT-1-2" },
+    { id: "e", label: "<>" },
+    { id: "f", label: "" },
+  ];
+  const prompt = buildAIWorkAssignerSystemPrompt("", options);
+  const tags = [...prompt.matchAll(/^- <([^>]+)>/gm)].map((match) => match[1]);
+  assert.equal(tags.length, options.length);
+  assert.equal(new Set(tags.map((tag) => tag.toLowerCase())).size, options.length);
+  tags.forEach((tag, index) => {
+    assert.deepEqual([...parseAIWorkAssignments(`<${tag}>Task.</${tag}>`, options)], [[options[index].id, "Task."]]);
+  });
 });

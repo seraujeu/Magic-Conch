@@ -3768,7 +3768,7 @@ export default function Workbench() {
         debugStatus = "routed";
         debugDetail = activated.length
           ? `Assigned work to ${activated.map((option) => option.label).join(", ")}.`
-          : "The AI response did not include any complete output sections, so no outputs were activated.";
+          : "The AI response did not include any non-empty output sections, so no outputs were activated.";
       }
 
       if (node.type === "workflow") {
