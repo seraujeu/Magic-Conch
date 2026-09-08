@@ -139,7 +139,7 @@ Ports use `port_id:type`. For example, `prompt:prompt` means the JSON port ID is
 
 ### AI Work Assigner (`ai-assigner`)
 
-**Purpose:** Uses a model to create standalone work prompts for one or more named downstream workers.
+**Purpose:** Uses a model to select zero or more named downstream workers and create a standalone work prompt for each selected output.
 
 **Inputs:** `prompt:prompt`, `system_prompt:string`, `model:string`, `temperature:float`, `files:files`, `image:image`, `video:video`, `audio:audio`, `document:document`.
 
@@ -147,12 +147,25 @@ Ports use `port_id:type`. For example, `prompt:prompt` means the JSON port ID is
 
 **Rules and settings:**
 
-- Every output option has an ID, label, optional activation description (`value`), and optional export instruction.
-- Multiple outputs may activate in the same run. Outputs omitted by the model emit nothing, so their downstream branches stay inactive.
-- Empty or whitespace-only assignment sections also emit nothing. If output names collide (ignoring case and angle brackets), the response format gives them distinct tags so each output can be selected independently.
-- The node adds the required named-section response format to the configured system prompt automatically.
-- Connect each output directly to a downstream Request prompt when it represents a worker assignment.
-- Output IDs are part of the graph contract. Do not regenerate them without updating all connected edges.
+- Every output option has an `id`, `label`, optional activation description (`value`, shown as **When to activate**), and optional `exportInstruction` (**What to export**).
+- The model uses the system prompt and each output's activation description to decide what work is needed. These descriptions are AI instructions, not deterministic conditions checked by the executor.
+- The node adds the required named-section response format to the configured system prompt automatically. Each activated output receives only the enclosed text, trimmed into a standalone prompt.
+- Only complete matching sections with non-empty text activate outputs. Omitted, empty, or whitespace-only sections emit nothing. A response with no usable sections activates zero outputs.
+- Repeated non-empty sections for the same output are combined with blank lines; empty repetitions are ignored.
+- Unique output names use readable tags. Leading/trailing whitespace and angle brackets are removed from names when constructing tags. Names that collide ignoring case, or become empty, receive distinct generated tags in the automatic response format. Use those supplied tags; an ambiguous original name activates neither colliding output.
+- Response tags are separate from graph port IDs. Keep `config.routeOptions[].id` stable and reference those IDs in edges, even when generated response tags are used.
+- Connect each assignment output directly to its worker's Request `prompt` input. An inactive assignment gates that worker when it is the only connection supplying that input, even if files arrive through another input. Another active connection to the same prompt input can still activate the worker.
+- Join/Aggregate runs after its upstream nodes settle, even when all assignments are inactive. It is not an activation gate; putting Join before a worker can allow that worker to run without an assignment.
+- Assigner emits prompts only. Connect a file source separately to downstream workers when they also need attachments.
+
+**Example:** With uniquely named `Researcher`, `Writer`, and `Reviewer` outputs, this response activates only `Writer`:
+
+```xml
+<Writer>Draft a concise introduction for the requested audience.</Writer>
+<Reviewer>   </Reviewer>
+```
+
+`Researcher` is omitted and `Reviewer` is blank, so neither emits a prompt. The Writer worker receives `Draft a concise introduction for the requested audience.` without the surrounding tags.
 
 ## Values
 
@@ -269,6 +282,37 @@ Ports use `port_id:type`. For example, `prompt:prompt` means the JSON port ID is
 - `collision` is `increment`, `timestamp`, or `overwrite`.
 - Directory paths may be absolute or relative; omitted paths use the application default, normally `user-data/`.
 - Outputs pass the original data and files through after persistence.
+
+### Google Drive Save (`google-drive-save`)
+
+**Purpose:** Persists prompt data, workflow files, or both in the signed-in user's Google Drive.
+
+**Inputs:** `prompt:prompt`, `key:string`, `subfolder:string`, `files:files`, `image:image`, `video:video`, `audio:audio`.
+
+**Outputs:** `prompt:prompt`, `files:files`, `image:image`, `video:video`, `audio:audio`.
+
+**Rules and settings:**
+
+- The app owner configures a Google Web OAuth client ID. End users connect through **Sign in with Google** in Settings before running the node.
+- The node requests the narrow `drive.file` scope and can access files and folders created or opened by Magic Conch, not the user's whole Drive.
+- `driveFolderPath` defaults to `Magic Conch`; missing folders and the optional connected/configured `subfolder` are created automatically.
+- `key`, `fileExtension`, `saveFiles`, and `collision` behave like the local Save node.
+- The access token remains in memory and expires automatically. Reconnect in Settings when prompted.
+
+### Google Drive Load (`google-drive-load`)
+
+**Purpose:** Reads records and files previously created by Magic Conch in the signed-in user's Google Drive.
+
+**Inputs:** `trigger:any`, `key:string`, `subfolder:string`, `recursive:boolean`.
+
+**Outputs:** `prompt:prompt`, `files:files`, `image:image`, `video:video`, `audio:audio`, `document:document`.
+
+**Rules and settings:**
+
+- Uses the same Google Drive connection, folder path, record key, extension, and load modes as Google Drive Save.
+- `loadMode` is `latest`, `all`, `exact`, or `folder`; folder mode can recursively load nested files.
+- With no incoming edge, the node runs as a pull-style source. Any connected input gates execution.
+- Google-native Docs/Sheets/Slides are not exported; the node loads ordinary Drive file content created or opened by the app.
 
 ### Get Image / Video Size (`media-size`)
 

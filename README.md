@@ -20,6 +20,17 @@ folder permission. The optional workflow-folder picker uses the File System
 Access API in Chrome and Edge. Workflow JSON and ZIP import/export remain
 available without that picker.
 
+Google Drive Save and Google Drive Load nodes use Google Identity Services in
+the browser. Enable the Google Drive API, create a **Web application** OAuth
+client in Google Cloud, add the app URL (by default `http://localhost:4173`) as
+an Authorized JavaScript origin, and set `GOOGLE_DRIVE_CLIENT_ID` before launching
+the app. End users can then choose **Sign in with Google** under Settings → API;
+they do not need to enter a client ID. For local development without that
+environment variable, the same settings panel exposes a client-ID fallback.
+Magic Conch requests the limited `drive.file` scope, so it can
+access only Drive files and folders that the app created or that the user opened
+with the app. The short-lived access token is kept in memory and is never saved.
+
 ## Install and launch
 
 Clone or download the repository, then use the launcher for your system:
@@ -155,5 +166,6 @@ D1 and R2 remain disabled for this local-first application.
 
 - [Vibe-coding a plug-in](docs/VIBE_CODING_PLUGIN.md)
 - [Vibe-coding a workflow](docs/VIBE_CODING_WORKFLOW.md)
+- [Creating and using workflow presets](docs/PRESETS.md)
 - [Workflow syntax and template tokens](docs/WORKFLOW_SYNTAX.md)
 - [Node purpose, ports, and rules reference](docs/NODE_REFERENCE.md)

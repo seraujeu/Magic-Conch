@@ -100,6 +100,8 @@ If attachments matter, also connect the `files` ports from Start through Request
 
 Use typed ports as design feedback. If two ports refuse to connect, the data contract is probably wrong. String-like types are compatible with one another, numeric types are compatible with one another, media outputs can feed `files`, and `ANY` accepts anything.
 
+For **AI Assigner**, set **When to activate** and **What to export** for each worker. Connect each assignment output directly to that worker's Request `prompt` input. The AI may select zero, one, or several workers; omitted or blank assignments stay inactive. Keep output names distinct for readability; if names collide, the automatically added response format supplies distinct tags. Join worker results after the workers, since a Join before a worker can run even without an assignment. See [AI Work Assigner](NODE_REFERENCE.md#ai-work-assigner-ai-assigner) for the exact response and activation rules.
+
 ## Generate an importable workflow JSON
 
 For simple graphs, an AI assistant can generate the complete file. Save this example as `action-plan.workflow.json`, then use **Import** in the workflow editor:

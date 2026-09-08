@@ -19,3 +19,17 @@ test("parses strict and structured AI boolean decisions", () => {
   assert.throws(() => parseAIBoolean("true or false"), /unambiguous/);
   assert.throws(() => parseAIBoolean("maybe"), /unambiguous/);
 });
+
+test("file type matching respects case sensitivity for extensions and MIME types", () => {
+  for (const [files, expected, sensitiveMatch] of [
+    [[{ name: "report.PDF", type: "application/octet-stream" }], "PDF", true],
+    [[{ name: "report.PDF", type: "application/octet-stream" }], ".PDF", true],
+    [[{ name: "report.pdf", type: "application/octet-stream" }], "PDF", false],
+    [[{ name: "report.PDF", type: "application/octet-stream" }], ".pdf", false],
+    [[{ name: "report", type: "application/PDF" }], "application/PDF", true],
+    [[{ name: "report", type: "application/pdf" }], "application/PDF", false],
+  ]) {
+    assert.equal(evaluateBooleanRule("", files, { method: "file_type", expected, caseSensitive: true }), sensitiveMatch);
+    assert.equal(evaluateBooleanRule("", files, { method: "file_type", expected, caseSensitive: false }), true);
+  }
+});

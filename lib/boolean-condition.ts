@@ -54,7 +54,11 @@ export function evaluateBooleanRule(
   if (method === "is_empty") return rawSource.trim().length === 0;
   if (method === "file_type") {
     const suffix = expected.startsWith(".") ? expected : `.${expected}`;
-    return files.some((file) => file.type.toLowerCase().includes(expected) || file.name.toLowerCase().endsWith(suffix));
+    return files.some((file) => {
+      const type = rule.caseSensitive ? file.type : file.type.toLowerCase();
+      const name = rule.caseSensitive ? file.name : file.name.toLowerCase();
+      return type.includes(expected) || name.endsWith(suffix);
+    });
   }
   if (method === "file_count_gt") return files.length > Number(rawExpected);
   if (method === "number_gt") return Number(rawSource) > Number(rawExpected);

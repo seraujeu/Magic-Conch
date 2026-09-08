@@ -147,12 +147,21 @@ import { displayNodeDirectory, migrateLegacyNodeDirectory, resolveNodeDirectory 
 import { collectWorkflowBundleDependencies, createWorkflowJsonBundle, portableDependencySegment, remapPackagedWorkflowIds, unpackWorkflowJsonBundle, workflowRuntimeNodeIds } from "../lib/workflow-bundle";
 import { applyBundledLoadSnapshots, bundledLoadResult, BundledLoadSnapshot, materializedLoadDirectory } from "../lib/workflow-load-bundle";
 import { workflowArchiveFilename, workflowExportFilename, workflowFileText } from "../lib/workflow-files";
+import { createWorkflowPreset, instantiateWorkflowPreset, parseWorkflowPresets, WorkflowPreset } from "../lib/workflow-presets";
 import { organizeWorkflowNodes } from "../lib/workflow-layout";
 import { createDebugLog, debugLogFilename } from "../lib/debug-log";
 import { buildAIWorkAssignerSystemPrompt, parseAIWorkAssignments } from "../lib/ai-work-assigner";
 import { composeStartInputs } from "../lib/start-inputs";
 import { loadChatSession } from "../lib/chat-session-node";
 import { bypassLegacyParallelNodes } from "../lib/workflow-migration";
+import {
+  DEFAULT_GOOGLE_DRIVE_FOLDER,
+  loadGoogleDriveRecord,
+  loadGoogleIdentityServices,
+  requestGoogleDriveToken,
+  revokeGoogleDriveToken,
+  saveGoogleDriveRecord,
+} from "../lib/google-drive";
 import {
   buildWorkflowAssistantRequest,
   buildWorkflowAssistantSystemPrompt,
@@ -181,7 +190,7 @@ import {
 } from "../lib/ocr";
 import type { OcrEngine, OcrLayout, OcrPreprocess, OcrResult } from "../lib/ocr";
 
-type BuiltinNodeType = "start" | "chat-session" | "load-settings" | "update-memory" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "ocr" | "list-directory" | "save" | "load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
+type BuiltinNodeType = "start" | "chat-session" | "load-settings" | "update-memory" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "ocr" | "list-directory" | "save" | "load" | "google-drive-save" | "google-drive-load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
 type FileAsset = { name: string; type: string; data: string; size: number; bundleLoadNodeId?: string };
 type PortDataType = "prompt" | "files" | "document" | "text" | "number" | "boolean" | "string" | "integer" | "float" | "image" | "video" | "audio" | "any";
@@ -286,6 +295,7 @@ type FlowNode = {
     loadMode?: "latest" | "all" | "exact" | "folder";
     directoryName?: string;
     directoryPath?: string;
+    driveFolderPath?: string;
     subfolder?: string;
     saveFiles?: "data" | "files" | "both";
     outputFileName?: string;
@@ -352,6 +362,7 @@ type Workflow = {
   files?: FileAsset[];
   bundledLoads?: Record<string, { value: string }>;
 };
+type Preset = WorkflowPreset<FlowNode, FlowEdge>;
 type Message = {
   id: string;
   role: "user" | "assistant" | "system";
@@ -523,6 +534,8 @@ const NODE_META: Record<
   "list-directory": { label: "Load Directory", subtitle: "Load the files in a directory", color: "#718e3c", icon: FolderOpen },
   save: { label: "Save", subtitle: "Write a file", color: "#3188c7", icon: Save },
   load: { label: "Load", subtitle: "Read a file", color: "#c59030", icon: Database },
+  "google-drive-save": { label: "Google Drive Save", subtitle: "Write files to Google Drive", color: "#4285f4", icon: Cloud },
+  "google-drive-load": { label: "Google Drive Load", subtitle: "Read files from Google Drive", color: "#34a853", icon: Cloud },
   "set-state": { label: "Variable / Set State", subtitle: "Create or update a variable", color: "#5279bd", icon: Variable },
   transform: { label: "Transform", subtitle: "Map, filter, format, or extract", color: "#9a6ac3", icon: Shuffle },
   loop: { label: "Loop / For Each", subtitle: "Iterate over a collection", color: "#d07b39", icon: Repeat2 },
@@ -544,7 +557,7 @@ const BUILTIN_NODE_GROUPS: { id: string; label: string; types: BuiltinNodeType[]
   { id: "personalization", label: "Personalization", types: ["load-settings", "update-memory"] },
   { id: "ai", label: "AI", types: ["request", "ai-assigner"] },
   { id: "values", label: "Values", types: ["string", "integer", "float", "math", "set-state"] },
-  { id: "files", label: "Files", types: ["list-directory", "load", "save", "media-size", "file-name", "ocr"] },
+  { id: "files", label: "Files", types: ["list-directory", "load", "save", "google-drive-load", "google-drive-save", "media-size", "file-name", "ocr"] },
   { id: "processing", label: "Processing", types: ["transform", "code", "parser", "join"] },
   { id: "flow-control", label: "Flow control", types: ["workflow", "loop", "retry", "wait"] },
   { id: "routing", label: "Routing", types: ["condition-ai", "condition-rule", "router-condition", "router-ai", "router-rule"] },
@@ -671,6 +684,8 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
   if (node.type === "list-directory") return { inputs: [{ id: "trigger", label: "trigger", type: "any" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "recursive", label: "recursive", type: "boolean" }], outputs: [{ id: "files", label: "files", type: "files" }, { id: "image", label: "images", type: "image" }, { id: "video", label: "videos", type: "video" }, { id: "audio", label: "audio", type: "audio" }, { id: "names", label: "names", type: "any" }, { id: "count", label: "count", type: "integer" }] };
   if (node.type === "save") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "key", label: "file key", type: "string" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "files", label: "files", type: "files" }, ...mediaInputs], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs] };
   if (node.type === "load") return { inputs: [{ id: "trigger", label: "trigger", type: "any" }, { id: "key", label: "file key", type: "string" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "recursive", label: "recursive", type: "boolean" }], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
+  if (node.type === "google-drive-save") return { inputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "key", label: "file key", type: "string" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "files", label: "files", type: "files" }, ...mediaInputs], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs] };
+  if (node.type === "google-drive-load") return { inputs: [{ id: "trigger", label: "trigger", type: "any" }, { id: "key", label: "file key", type: "string" }, { id: "subfolder", label: "subfolder", type: "string" }, { id: "recursive", label: "recursive", type: "boolean" }], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
   if (node.type === "set-state") return { inputs: [{ id: "value", label: "value", type: "any" }], outputs: [{ id: "value", label: node.config.variableName || "value", type: "any" }] };
   if (node.type === "transform") return { inputs: [{ id: "value", label: "value", type: "any" }], outputs: [{ id: "result", label: "result", type: "any" }] };
   if (node.type === "loop") return { inputs: [{ id: "items", label: "items", type: "any" }], outputs: [{ id: "item", label: "item", type: "any" }, { id: "index", label: "index", type: "number" }, { id: "has_more", label: "has more", type: "boolean" }, { id: "done", label: "done", type: "boolean" }] };
@@ -1293,9 +1308,10 @@ function DebugDataSection({ title, items = [] }: { title: string; items?: DebugD
   );
 }
 
-export default function Workbench() {
+export default function Workbench({ configuredGoogleDriveClientId = "" }: { configuredGoogleDriveClientId?: string }) {
   const [tab, setTab] = useState<"chat" | "workflow">("workflow");
   const [workflows, setWorkflows] = useState<Workflow[]>([initialWorkflow]);
+  const [presets, setPresets] = useState<Preset[]>([]);
   const [activeWorkflowId, setActiveWorkflowId] = useState(initialWorkflow.id);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>("request-1");
   const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>(["request-1"]);
@@ -1330,11 +1346,14 @@ export default function Workbench() {
   const [providerSettings, setProviderSettings] = useState<ProviderSettings>({
     ollamaUrl: "http://localhost:11434",
   });
+  const [googleDriveClientId, setGoogleDriveClientId] = useState(configuredGoogleDriveClientId);
+  const [googleDriveConnection, setGoogleDriveConnection] = useState<{ accessToken: string; expiresAt: number } | null>(null);
   const [availableModels, setAvailableModels] = useState<Partial<Record<AIProvider, string[]>>>({});
   const [modelsLoading, setModelsLoading] = useState<Partial<Record<AIProvider, boolean>>>({});
   const [plugins, setPlugins] = useState<MagicConchPlugin[]>([]);
   const [nodeSearch, setNodeSearch] = useState("");
   const [workflowsSectionOpen, setWorkflowsSectionOpen] = useState(true);
+  const [presetsSectionOpen, setPresetsSectionOpen] = useState(true);
   const [nodeLibrarySectionOpen, setNodeLibrarySectionOpen] = useState(true);
   const [collapsedNodeGroups, setCollapsedNodeGroups] = useState<Record<string, boolean>>({});
   const [undoLimit, setUndoLimit] = useState(50);
@@ -1398,6 +1417,8 @@ export default function Workbench() {
   const effectiveWorkflowParallelism = automaticWorkflowParallelism ? automaticParallelism : workflowParallelism;
   const workflowParallelismRef = useRef(effectiveWorkflowParallelism);
   workflowParallelismRef.current = effectiveWorkflowParallelism;
+  const googleDriveConnectionRef = useRef(googleDriveConnection);
+  googleDriveConnectionRef.current = googleDriveConnection;
 
   const activeWorkflow = useMemo(
     () => workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0],
@@ -1416,6 +1437,9 @@ export default function Workbench() {
       })
       .catch(() => { /* Folder access can still be reconnected with Choose. */ });
     return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    void loadGoogleIdentityServices().catch(() => { /* Connect reports a useful error if Google sign-in remains unavailable. */ });
   }, []);
   const portLayoutKey = useMemo(
     () => activeWorkflow.nodes.map((node) => {
@@ -1543,12 +1567,14 @@ export default function Workbench() {
     const restore = window.setTimeout(async () => {
       try {
         const savedFlowsJson = localStorage.getItem("magic-conch-workflows");
+        const savedPresetsJson = localStorage.getItem("magic-conch-presets");
         const savedSettings = localStorage.getItem("magic-conch-provider-settings");
         const savedPluginsJson = localStorage.getItem("magic-conch-plugins");
         const savedUndoLimit = localStorage.getItem("magic-conch-undo-limit");
         const savedWorkflowParallelism = localStorage.getItem("magic-conch-workflow-parallelism");
         const savedAutomaticWorkflowParallelism = localStorage.getItem("magic-conch-workflow-parallelism-auto");
         const savedDefaultDirectory = localStorage.getItem("magic-conch-default-directory");
+        const savedGoogleDriveClientId = localStorage.getItem("magic-conch-google-drive-client-id");
         const savedUserPreference = localStorage.getItem("magic-conch-user-preference");
         const savedUserMemories = localStorage.getItem("magic-conch-user-memories");
         const savedSessionsJson = localStorage.getItem("magic-conch-chat-sessions");
@@ -1563,6 +1589,7 @@ export default function Workbench() {
         const savedChatFolders = localStorage.getItem("magic-conch-chat-folders");
         const savedActiveSession = localStorage.getItem("magic-conch-active-session");
         const restoredPlugins = savedPlugins;
+        if (savedPresetsJson) setPresets(parseWorkflowPresets<FlowNode, FlowEdge>(JSON.parse(savedPresetsJson)));
         if (savedFlows) {
           const parsed = savedFlows;
           if (parsed.length) {
@@ -1607,6 +1634,7 @@ export default function Workbench() {
           ? !savedWorkflowParallelism
           : savedAutomaticWorkflowParallelism === "true");
         if (savedDefaultDirectory) setDefaultDirectoryPath(savedDefaultDirectory);
+        if (!configuredGoogleDriveClientId && savedGoogleDriveClientId) setGoogleDriveClientId(savedGoogleDriveClientId);
         if (savedUserPreference) setUserPreference(savedUserPreference);
         if (savedUserMemories) replaceUserMemories(normalizeUserMemories(JSON.parse(savedUserMemories)));
         if (savedChatFolders) {
@@ -1660,7 +1688,7 @@ export default function Workbench() {
       }
     }, 0);
     return () => window.clearTimeout(restore);
-  }, []);
+  }, [configuredGoogleDriveClientId]);
 
   useEffect(() => {
     if (!storageRestoredRef.current) return;
@@ -1683,8 +1711,22 @@ export default function Workbench() {
 
   useEffect(() => {
     if (!storageRestoredRef.current) return;
+    try {
+      localStorage.setItem("magic-conch-presets", JSON.stringify(presets));
+    } catch {
+      showToast("Preset changes are available now, but this browser could not save them");
+    }
+  }, [presets]);
+
+  useEffect(() => {
+    if (!storageRestoredRef.current) return;
     localStorage.setItem("magic-conch-provider-settings", JSON.stringify(providerSettings));
   }, [providerSettings]);
+
+  useEffect(() => {
+    if (!storageRestoredRef.current) return;
+    localStorage.setItem("magic-conch-google-drive-client-id", googleDriveClientId.trim());
+  }, [googleDriveClientId]);
 
   useEffect(() => {
     if (!storageRestoredRef.current) return;
@@ -2250,6 +2292,10 @@ export default function Workbench() {
               ? { key: "record-name", fileExtension: "json", collision: "increment", saveFiles: "both" }
               : type === "load"
                 ? { key: "record-name", fileExtension: "json", loadMode: "latest" }
+                : type === "google-drive-save"
+                  ? { key: "record-name", fileExtension: "json", collision: "increment", saveFiles: "both", driveFolderPath: DEFAULT_GOOGLE_DRIVE_FOLDER }
+                  : type === "google-drive-load"
+                    ? { key: "record-name", fileExtension: "json", loadMode: "latest", driveFolderPath: DEFAULT_GOOGLE_DRIVE_FOLDER }
                 : type === "condition-ai"
                   ? { provider: "openai", model: modelDefaults.openai, temperature: 0, routeCriteria: "Return true when the input satisfies this condition." }
                   : type === "condition-rule"
@@ -2301,6 +2347,51 @@ export default function Workbench() {
     setSelectedNodeId(null);
     setSelectedNodeIds([]);
     showToast(`${ids.length} node${ids.length === 1 ? "" : "s"} deleted`);
+  }
+
+  function saveSelectionAsPreset() {
+    const ids = selectedNodeIds.length ? selectedNodeIds : selectedNodeId ? [selectedNodeId] : [];
+    const nodes = activeWorkflow.nodes.filter((node) => ids.includes(node.id));
+    if (!nodes.length) {
+      showToast("Select one or more nodes to create a preset");
+      return;
+    }
+    if (nodes.some((node) => node.type === "start" || node.type === "end")) {
+      showToast("Presets cannot include Start or End nodes");
+      return;
+    }
+    const suggestedName = nodes.length === 1 ? `${nodes[0].name} preset` : `${nodes[0].name} + ${nodes.length - 1}`;
+    const name = window.prompt("Name this preset", suggestedName)?.trim();
+    if (!name) return;
+    const preset = createWorkflowPreset(name, nodes, activeWorkflow.edges, uid("preset"));
+    setPresets((current) => [...current, preset]);
+    setPresetsSectionOpen(true);
+    showToast(`${name} preset saved`);
+  }
+
+  function applyPreset(preset: Preset) {
+    const instance = instantiateWorkflowPreset(
+      preset,
+      { x: Math.max(120, (420 - pan.x) / zoom), y: Math.max(100, (180 - pan.y) / zoom) },
+      (node) => uid(node.type),
+      () => uid("edge"),
+    );
+    updateWorkflow((workflow) => ({
+      ...workflow,
+      nodes: [...workflow.nodes, ...instance.nodes],
+      edges: [...workflow.edges, ...instance.edges],
+    }));
+    const ids = instance.nodes.map((node) => node.id);
+    setSelectedNodeIds(ids);
+    setSelectedNodeId(ids.at(-1) || null);
+    setInspectorOpen(true);
+    showToast(`${preset.name} inserted`);
+  }
+
+  function deletePreset(preset: Preset) {
+    if (!window.confirm(`Delete the preset "${preset.name}"?`)) return;
+    setPresets((current) => current.filter((item) => item.id !== preset.id));
+    showToast("Preset deleted");
   }
 
   useEffect(() => {
@@ -2590,12 +2681,13 @@ export default function Workbench() {
             const mathInputs = growMathInputs(inputs, targetPort, uid("math-input"));
             if (mathInputs !== inputs) return { ...node, config: { ...node.config, mathInputs } };
           }
-          if (node.id === source.nodeId && ["ai-assigner", "router-ai", "router-rule"].includes(node.type)) {
-            const fallbackLabel = node.type === "ai-assigner" ? "Output 1" : "Option 1";
+          // Router options are explicit destinations; growing them here changes the fallback.
+          if (node.id === source.nodeId && node.type === "ai-assigner") {
+            const fallbackLabel = "Output 1";
             const options = node.config.routeOptions?.length ? node.config.routeOptions : [{ id: source.portId, label: fallbackLabel, value: node.config.routeValue || "" }];
             if (options.at(-1)?.id === source.portId) {
-              const label = node.type === "ai-assigner" ? "Output" : "Option";
-              return { ...node, config: { ...node.config, routeOptions: [...options, { id: uid(node.type === "ai-assigner" ? "output" : "route"), label: `${label} ${options.length + 1}`, value: "" }] } };
+              const label = "Output";
+              return { ...node, config: { ...node.config, routeOptions: [...options, { id: uid("output"), label: `${label} ${options.length + 1}`, value: "" }] } };
             }
           }
           return node;
@@ -2802,6 +2894,32 @@ export default function Workbench() {
     } catch {
       // The user may intentionally cancel the picker.
     }
+  }
+
+  async function connectGoogleDrive() {
+    try {
+      const connection = await requestGoogleDriveToken(configuredGoogleDriveClientId || googleDriveClientId);
+      setGoogleDriveConnection(connection);
+      showToast("Google Drive connected");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Could not connect Google Drive");
+    }
+  }
+
+  async function disconnectGoogleDrive() {
+    const token = googleDriveConnectionRef.current?.accessToken || "";
+    setGoogleDriveConnection(null);
+    await revokeGoogleDriveToken(token);
+    showToast("Google Drive disconnected");
+  }
+
+  function googleDriveAccessToken() {
+    const connection = googleDriveConnectionRef.current;
+    if (!connection || connection.expiresAt <= Date.now()) {
+      if (connection) setGoogleDriveConnection(null);
+      throw new Error("Connect Google Drive in Settings before running this workflow.");
+    }
+    return connection.accessToken;
   }
 
   function readFileAsset(file: File): Promise<FileAsset> {
@@ -3825,6 +3943,53 @@ export default function Workbench() {
           : `Loaded ${loaded.value.length} prompt characters and ${loaded.files.length} file${loaded.files.length === 1 ? "" : "s"}.`;
       }
 
+      if (node.type === "google-drive-save") {
+        const effectiveKey = String(inputFor("key", node.config.key || "workflow-result"));
+        const effectiveSubfolder = String(inputFor("subfolder", node.config.subfolder || ""));
+        await saveGoogleDriveRecord({
+          token: googleDriveAccessToken(),
+          folderPath: node.config.driveFolderPath || DEFAULT_GOOGLE_DRIVE_FOLDER,
+          subfolder: effectiveSubfolder,
+          key: effectiveKey,
+          fileExtension: node.config.fileExtension,
+          collision: node.config.collision,
+          saveFiles: node.config.saveFiles,
+          value: String(promptInput),
+          files: fileInput,
+        });
+        output("prompt", promptInput);
+        output("files", fileInput);
+        output("image", mediaAssets(fileInput, "image"));
+        output("video", mediaAssets(fileInput, "video"));
+        output("audio", mediaAssets(fileInput, "audio"));
+        debugFileSource = `Google Drive / ${node.config.driveFolderPath || DEFAULT_GOOGLE_DRIVE_FOLDER}${effectiveSubfolder ? `/${effectiveSubfolder}` : ""}`;
+        debugDetail = `Saved prompt data and ${fileInput.length} file${fileInput.length === 1 ? "" : "s"} to Google Drive.`;
+      }
+
+      if (node.type === "google-drive-load") {
+        const loaded = await loadGoogleDriveRecord({
+          token: googleDriveAccessToken(),
+          folderPath: node.config.driveFolderPath || DEFAULT_GOOGLE_DRIVE_FOLDER,
+          subfolder: String(inputFor("subfolder", node.config.subfolder || "")),
+          key: String(inputFor("key", node.config.key || "workflow-result")),
+          fileExtension: node.config.fileExtension,
+          loadMode: node.config.loadMode,
+          recursive: Boolean(inputFor("recursive", node.config.includeSubfolders || false)),
+        });
+        debugFileSource = loaded.source;
+        context.loadedData = loaded.value;
+        context.lastOutput = loaded.value;
+        output("prompt", loaded.value);
+        output("files", loaded.files);
+        output("image", mediaAssets(loaded.files, "image"));
+        output("video", mediaAssets(loaded.files, "video"));
+        output("audio", mediaAssets(loaded.files, "audio"));
+        output("document", loaded.files.filter(isDocumentAsset));
+        debugDetail = node.config.loadMode === "folder"
+          ? `Loaded all ${loaded.files.length} Google Drive file${loaded.files.length === 1 ? "" : "s"}.`
+          : `Loaded ${loaded.value.length} prompt characters and ${loaded.files.length} Google Drive file${loaded.files.length === 1 ? "" : "s"}.`;
+      }
+
       if (node.type === "set-state") {
         const connectedValue = inputFor<unknown>("value", undefined);
         const value = connectedValue === undefined ? parseLiteral(node.config.stateValue || "", node.config.valueType) : connectedValue;
@@ -4473,6 +4638,31 @@ export default function Workbench() {
             <div className="sidebar-heading library-heading">
               <button
                 type="button"
+                className={`sidebar-section-toggle ${presetsSectionOpen ? "" : "collapsed"}`}
+                onClick={() => setPresetsSectionOpen((open) => !open)}
+                aria-expanded={presetsSectionOpen}
+                aria-controls="preset-list-section"
+              >
+                <span>Presets</span><ChevronDown size={13} />
+              </button>
+              <button className="mini-icon" aria-label="Save selected nodes as preset" title="Save selected nodes as preset" onClick={saveSelectionAsPreset}><Plus size={16} /></button>
+            </div>
+            {presetsSectionOpen && <div className="preset-list" id="preset-list-section">
+              {presets.length ? presets.map((preset) => (
+                <div className="preset-list-item" key={preset.id}>
+                  <button className="preset-main-button" onClick={() => applyPreset(preset)} title={`Insert ${preset.name}`}>
+                    <span className="preset-list-icon"><Box size={15} /></span>
+                    <span><strong>{preset.name}</strong><small>{preset.nodes.length} node{preset.nodes.length === 1 ? "" : "s"}</small></span>
+                    <Plus size={13} className="add-icon" />
+                  </button>
+                  <button className="preset-delete" onClick={() => deletePreset(preset)} aria-label={`Delete ${preset.name} preset`} title="Delete preset"><Trash2 size={11} /></button>
+                </div>
+              )) : <div className="preset-list-empty"><span>No presets yet</span><small>Select nodes, then use + to save them.</small></div>}
+            </div>}
+            <div className="sidebar-divider" />
+            <div className="sidebar-heading library-heading">
+              <button
+                type="button"
                 className={`sidebar-section-toggle ${nodeLibrarySectionOpen ? "" : "collapsed"}`}
                 onClick={() => setNodeLibrarySectionOpen((open) => !open)}
                 aria-expanded={nodeLibrarySectionOpen}
@@ -4558,6 +4748,7 @@ export default function Workbench() {
                 <button className="icon-button" onClick={undoWorkflow} aria-label="Undo last workflow change" title="Undo (Ctrl+Z)"><Undo2 size={16} /></button>
                 <button className="icon-button" onClick={redoWorkflow} aria-label="Redo workflow change" title="Redo (Ctrl+Shift+Z)"><Redo2 size={16} /></button>
                 <button className={`assistant-toggle ${workflowAssistantOpen ? "active" : ""}`} onClick={() => setWorkflowAssistantOpen((open) => !open)} aria-expanded={workflowAssistantOpen} aria-controls="workflow-ai-assistant"><Sparkles size={15} /> AI assistant</button>
+                <button className="secondary-button" onClick={saveSelectionAsPreset} disabled={!selectedNodeIds.length && !selectedNodeId} title="Save selected nodes as a reusable preset"><Box size={15} /> Save preset</button>
                 <button className="secondary-button" onClick={saveWorkflow}><Save size={15} /> Save</button>
                 <button className="primary-button" onClick={openWorkflowChat}><Play size={15} fill="currentColor" /> Test workflow</button>
                 {!inspectorOpen && <button className="icon-button" onClick={() => setInspectorOpen(true)} aria-label="Open inspector" title="Open inspector"><PanelRightOpen size={17} /></button>}
@@ -4970,7 +5161,7 @@ export default function Workbench() {
                           <button className="mini-icon route-option-delete" disabled={options.length <= 1} aria-label={options.length <= 1 ? "At least one output is required" : `Remove ${option.label}`} title={options.length <= 1 ? "At least one output is required" : "Delete output"} onClick={() => removeRouteOption(selectedNode.id, option.id)}><Trash2 size={13} /></button>
                         </div>
                       ))}
-                      <small>{selectedNode.type === "ai-assigner" ? "Set when each output activates and what standalone prompt it should export. Multiple outputs can activate together; omitted outputs stay inactive." : "Connecting the last output automatically creates the next one."}</small>
+                      <small>{selectedNode.type === "ai-assigner" ? "Set when each output activates and what standalone prompt it should export. Multiple outputs can activate together; omitted outputs stay inactive." : selectedNode.type === "router-rule" ? "Add routes explicitly. The first match wins; the last route is the fallback when nothing matches." : "Add routes explicitly. The AI chooses one of the configured options."}</small>
                     </div>
                   )}
                   {selectedNode.type === "list-directory" && (
@@ -4987,6 +5178,29 @@ export default function Workbench() {
                       <label className="field-label">Subfolder path<input value={selectedNode.config.subfolder || ""} placeholder="Optional, relative to the directory below" onChange={(event) => updateNode({ config: { subfolder: event.target.value } })} /><small className="field-help">Leave blank to use the directory itself.</small></label>
                       <label className="field-label">Directory path<input value={selectedNode.config.directoryPath ?? selectedNode.config.directoryName ?? ""} placeholder={`${configuredDefaultDirectory()} (default)`} onChange={(event) => updateNode({ config: { directoryPath: event.target.value, directoryName: undefined } })} /><small className="field-help">Relative paths start at the Magic Conch program folder. Absolute paths are supported. No browser permission is required.</small></label>
                       {selectedNode.type === "save" ? (
+                        <>
+                          <label className="field-label">When a name already exists<div className="select-wrap"><select value={selectedNode.config.collision || "increment"} onChange={(event) => updateNode({ config: { collision: event.target.value as FlowNode["config"]["collision"] } })}><option value="increment">Add number (file-2)</option><option value="timestamp">Add timestamp</option><option value="overwrite">Overwrite</option></select><ChevronDown size={14} /></div></label>
+                          <label className="field-label">Save<div className="select-wrap"><select value={selectedNode.config.saveFiles || "both"} onChange={(event) => updateNode({ config: { saveFiles: event.target.value as FlowNode["config"]["saveFiles"] } })}><option value="both">Data and files</option><option value="data">Data only</option><option value="files">Files only</option></select><ChevronDown size={14} /></div></label>
+                        </>
+                      ) : (
+                        <>
+                          <label className="field-label">Load mode<div className="select-wrap"><select value={selectedNode.config.loadMode || "latest"} onChange={(event) => updateNode({ config: { loadMode: event.target.value as FlowNode["config"]["loadMode"] } })}><option value="latest">Newest saved record</option><option value="all">All matching saved records</option><option value="exact">Exact saved record name</option><option value="folder">All files in folder</option></select><ChevronDown size={14} /></div></label>
+                          {selectedNode.config.loadMode === "folder" && <label className="check-field"><input type="checkbox" checked={selectedNode.config.includeSubfolders || false} onChange={(event) => updateNode({ config: { includeSubfolders: event.target.checked } })} /><span>Include files in subfolders</span></label>}
+                        </>
+                      )}
+                    </>
+                  )}
+                  {(selectedNode.type === "google-drive-save" || selectedNode.type === "google-drive-load") && (
+                    <>
+                      <div className="inspector-note"><Cloud size={14} /><span><b>{googleDriveConnection ? "Google Drive connected" : "Google Drive is not connected"}</b><small>{googleDriveConnection ? "This browser session can access files created by Magic Conch." : "Connect in Settings before running this node."}</small></span></div>
+                      {!googleDriveConnection && (configuredGoogleDriveClientId || googleDriveClientId.trim()
+                        ? <button className="primary-button" type="button" onClick={connectGoogleDrive}><Cloud size={14} /> Sign in with Google</button>
+                        : <button className="secondary-button" type="button" onClick={() => { setSettingsTab("api"); setSettingsOpen(true); }}><Settings size={14} /> Configure Google login</button>)}
+                      {(selectedNode.type === "google-drive-save" || selectedNode.config.loadMode !== "folder") && <label className="field-label">File key<input value={selectedNode.config.key || ""} placeholder="record-name" onChange={(event) => updateNode({ config: { key: event.target.value } })} /><small className="field-help">Versioned records with the same key can coexist.</small></label>}
+                      {(selectedNode.type === "google-drive-save" || selectedNode.config.loadMode !== "folder") && <label className="field-label">File extension<input value={selectedNode.config.fileExtension || "json"} placeholder="json" onChange={(event) => updateNode({ config: { fileExtension: event.target.value } })} /><small className="field-help">Saved record content remains JSON.</small></label>}
+                      <label className="field-label">Drive folder path<input value={selectedNode.config.driveFolderPath || DEFAULT_GOOGLE_DRIVE_FOLDER} placeholder={DEFAULT_GOOGLE_DRIVE_FOLDER} onChange={(event) => updateNode({ config: { driveFolderPath: event.target.value } })} /><small className="field-help">Folder path inside My Drive. Missing folders are created automatically.</small></label>
+                      <label className="field-label">Subfolder path<input value={selectedNode.config.subfolder || ""} placeholder="Optional, relative to the Drive folder" onChange={(event) => updateNode({ config: { subfolder: event.target.value } })} /></label>
+                      {selectedNode.type === "google-drive-save" ? (
                         <>
                           <label className="field-label">When a name already exists<div className="select-wrap"><select value={selectedNode.config.collision || "increment"} onChange={(event) => updateNode({ config: { collision: event.target.value as FlowNode["config"]["collision"] } })}><option value="increment">Add number (file-2)</option><option value="timestamp">Add timestamp</option><option value="overwrite">Overwrite</option></select><ChevronDown size={14} /></div></label>
                           <label className="field-label">Save<div className="select-wrap"><select value={selectedNode.config.saveFiles || "both"} onChange={(event) => updateNode({ config: { saveFiles: event.target.value as FlowNode["config"]["saveFiles"] } })}><option value="both">Data and files</option><option value="data">Data only</option><option value="files">Files only</option></select><ChevronDown size={14} /></div></label>
@@ -5244,6 +5458,9 @@ export default function Workbench() {
                   </div>
                   <button className="secondary-button ollama-test" onClick={() => refreshAvailableModels("ollama")} disabled={modelsLoading.ollama}><RefreshCw size={14} className={modelsLoading.ollama ? "spin" : ""} /> Load installed Ollama models</button>
                   {!!availableModels.ollama?.length && <div className="model-tags">{availableModels.ollama.map((model) => <span key={model}>{model}</span>)}</div>}
+                  <div className="section-title"><Cloud size={17} /><div><strong>Google Drive</strong><small>Used only by Google Drive Save and Load nodes.</small></div></div>
+                  {!configuredGoogleDriveClientId && <label className="field-label">OAuth client ID <small>(local setup)</small><input value={googleDriveClientId} placeholder="123…apps.googleusercontent.com" onChange={(event) => { setGoogleDriveClientId(event.target.value); if (googleDriveConnection) setGoogleDriveConnection(null); }} /><small className="field-help">The app owner can instead set GOOGLE_DRIVE_CLIENT_ID. For local setup, create a Web application OAuth client, enable the Drive API, and add this app&apos;s origin to Authorized JavaScript origins.</small></label>}
+                  <div className="folder-row"><span className="folder-icon"><Cloud size={18} /></span><div><strong>{googleDriveConnection ? "Google Drive connected" : "Connect your Google account"}</strong><small>Permission is limited to Drive files and folders created or opened by this app. Access tokens stay in memory and expire automatically.</small></div>{googleDriveConnection ? <button className="secondary-button" onClick={disconnectGoogleDrive}>Disconnect</button> : <button className="primary-button" onClick={connectGoogleDrive} disabled={!(configuredGoogleDriveClientId || googleDriveClientId.trim())}><Cloud size={14} /> Sign in with Google</button>}</div>
                 </div>
               )}
               {settingsTab === "general" && (

@@ -29,6 +29,15 @@ test("runs configured Load nodes as pull sources when their outputs are needed",
   }), true);
 });
 
+test("runs configured Google Drive Load nodes as pull sources", () => {
+  assert.equal(isWorkflowNodeActive({
+    nodeType: "google-drive-load",
+    inputPorts: [{ id: "trigger" }, { id: "key" }],
+    incoming: [],
+    emittedPortKeys: new Set(),
+  }), true);
+});
+
 test("runs configured memory updates as pull sources", () => {
   assert.equal(isWorkflowNodeActive({
     nodeType: "update-memory",

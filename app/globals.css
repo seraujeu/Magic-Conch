@@ -63,6 +63,21 @@ button { color: inherit; }
 .workflow-item-actions { display: flex; gap: 1px; opacity: 0; }.workflow-list-item:hover .workflow-item-actions, .workflow-list-item.active .workflow-item-actions { opacity: 1; }.workflow-item-actions button { width: 20px; height: 22px; border: 0; background: transparent; color: #919994; border-radius: 5px; padding: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; }.workflow-item-actions button:hover { background: #e7eae3; color: #4f5953; }
 .workflow-list-item strong { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workflow-list-item small { font-size: 10px; color: #939a96; }
+.preset-list { flex: 0 1 auto; max-height: 190px; min-height: 0; padding: 0 9px 3px; display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
+.preset-list-item { display: grid; grid-template-columns: minmax(0,1fr) 22px; align-items: center; border-radius: 8px; }
+.preset-list-item:hover { background: #eceee8; }
+.preset-main-button { min-width: 0; border: 0; background: transparent; border-radius: 8px; padding: 5px 4px; display: grid; grid-template-columns: 28px minmax(0,1fr) 14px; align-items: center; gap: 7px; text-align: left; cursor: pointer; }
+.preset-main-button > span:nth-child(2) { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.preset-main-button strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: 10px; }
+.preset-main-button small { color: #939a96; font-size: 8px; }
+.preset-list-icon { width: 27px; height: 27px; border-radius: 7px; display: flex; align-items: center; justify-content: center; color: #7c6743; background: #f2eadb; }
+.preset-main-button:hover .add-icon { opacity: 1; }
+.preset-delete { width: 20px; height: 22px; border: 0; border-radius: 5px; padding: 0; background: transparent; color: #999f9b; display: flex; align-items: center; justify-content: center; cursor: pointer; opacity: 0; }
+.preset-list-item:hover .preset-delete, .preset-delete:focus-visible { opacity: 1; }
+.preset-delete:hover { color: #a64e48; background: #fff0ee; }
+.preset-list-empty { min-height: 54px; padding: 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; color: #858d88; text-align: center; }
+.preset-list-empty span { font-size: 9px; font-weight: 700; }
+.preset-list-empty small { color: #a0a6a2; font-size: 8px; }
 .workflow-context-menu { position: fixed; z-index: 100; width: 190px; padding: 5px; border: 1px solid #dfe2dc; border-radius: 10px; background: white; box-shadow: 0 14px 38px rgba(30,40,36,.18); }
 .workflow-context-menu button { width: 100%; height: 32px; padding: 0 9px; border: 0; border-radius: 7px; background: transparent; display: flex; align-items: center; gap: 9px; color: #4e5752; font-size: 11px; text-align: left; cursor: pointer; }
 .workflow-context-menu button:hover { background: #f0f2ec; color: var(--ink); }

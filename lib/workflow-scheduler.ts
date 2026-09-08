@@ -109,7 +109,7 @@ export function createWorkflowTaskLimiter(parallelism: WorkflowParallelism): Wor
   };
 }
 
-const PULL_SOURCE_NODE_TYPES = new Set(["load", "list-directory", "update-memory"]);
+const PULL_SOURCE_NODE_TYPES = new Set(["load", "google-drive-load", "list-directory", "update-memory"]);
 
 function portValueKey(nodeId: string, portId: string) {
   return `${nodeId}:${portId}`;
