@@ -11,7 +11,12 @@ const MAX_DEBUG_STRING_LENGTH = 20_000;
 const MAX_DEBUG_COLLECTION_ITEMS = 100;
 const MAX_DEBUG_DEPTH = 8;
 
-function isEmbeddedFile(value: Record<string, unknown>) {
+function isEmbeddedFile(value: Record<string, unknown>): value is {
+  name: string;
+  type: string;
+  size: number;
+  data: string;
+} {
   return typeof value.name === "string"
     && typeof value.type === "string"
     && typeof value.size === "number"

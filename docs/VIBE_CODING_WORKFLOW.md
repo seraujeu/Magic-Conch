@@ -80,6 +80,7 @@ If attachments matter, also connect the `files` ports from Start through Request
 | Need | Start with |
 | --- | --- |
 | Receive the chat message and attachments | **Start** |
+| Document context, decisions, or reminders | **Note** |
 | Ask the user a follow-up question | **Input** |
 | Call a configured model | **Request** |
 | Have AI assign content to named outputs | **AI Assigner** |
@@ -233,6 +234,7 @@ The IDs below are the stable strings used in JSON. Labels visible in the editor 
 | Node | JSON `type` | Main input ports | Main output ports |
 | --- | --- | --- | --- |
 | Start | `start` | `agent_name`, `start_message` | `prompt`, `files`, `image`, `video`, `audio`, `document` |
+| Note | `note` | none | none |
 | Message | `input` | `prompt`, `question`, `files`, media, `document` | `prompt`, `files`, media, `document` |
 | Request | `request` | `prompt`, `system_prompt`, `model`, `temperature`, `output_file_name`, files/media/document | `prompt`, `files`, media, `document` |
 | Use Workflow | `workflow` | `prompt`, `files`, media, `document` | `prompt`, `files`, media, `document` |
@@ -243,7 +245,7 @@ The IDs below are the stable strings used in JSON. Labels visible in the editor 
 | Load | `load` | `trigger`, `key`, `subfolder`, `recursive` | `prompt`, `files`, media, `document` |
 | End | `end` | `prompt`, `files`, `image`, `video`, `audio`, `document` | none |
 
-Other built-in type IDs are `chat-session`, `load-settings`, `update-memory`, `ai-assigner`, `string`, `integer`, `float`, `math`, `media-size`, `file-name`, `ocr`, `list-directory`, `set-state`, `loop`, `retry`, `wait`, `join`, `condition-ai`, `condition-rule`, `router-condition`, `router-ai`, and `router-rule`.
+Other built-in type IDs are `note`, `chat-session`, `load-settings`, `update-memory`, `ai-assigner`, `string`, `integer`, `float`, `math`, `media-size`, `file-name`, `ocr`, `list-directory`, `set-state`, `loop`, `retry`, `wait`, `join`, `condition-ai`, `condition-rule`, `router-condition`, `router-ai`, and `router-rule`.
 
 Dynamic nodes need IDs stored in configuration. For example, router output ports are the `id` values in `config.routeOptions`; Join and Math input ports come from `config.joinInputs` and `config.mathInputs`. The safest way to use a dynamic node is to configure it in the editor once, export JSON, and give that exported object to the coding assistant as the format template.
 
@@ -256,6 +258,9 @@ Dynamic nodes need IDs stored in configuration. For example, router output ports
   "start": {
     "agentName": "Action Planner",
     "startMessage": "What would you like to plan?"
+  },
+  "note": {
+    "noteContent": "Explain why this branch exists or leave implementation guidance here."
   },
   "request": {
     "provider": "openai",

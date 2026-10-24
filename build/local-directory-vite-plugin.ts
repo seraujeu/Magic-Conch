@@ -1,5 +1,5 @@
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { dirname, extname, isAbsolute, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, relative, resolve } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
@@ -50,6 +50,19 @@ export function isLoopbackHostname(hostname: string) {
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "[::1]" || normalized === "::1";
 }
 
+export function localDirectoryRequestAccessError(url: URL, origin: unknown, contentType: unknown) {
+  if (!isLoopbackHostname(url.hostname)) {
+    return { status: 404, error: "Local directory access is available only from this device." };
+  }
+  if (typeof origin !== "string" || origin !== url.origin) {
+    return { status: 403, error: "Local directory requests must come from this app's origin." };
+  }
+  if (typeof contentType !== "string" || contentType.split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+    return { status: 415, error: "Local directory requests must use application/json." };
+  }
+  return null;
+}
+
 function validateSubfolder(segments: unknown): string[] {
   if (segments == null) return [];
   if (!Array.isArray(segments) || segments.some((segment) => (
@@ -93,7 +106,10 @@ function recordFilename(key: string, extension: unknown) {
 
 function safeRelativeFilename(name: unknown) {
   if (typeof name !== "string") throw new Error("The file name is invalid.");
-  const normalized = name.replace(/\\/g, "/").replace(/^\/+/, "");
+  const normalized = name.replace(/\\/g, "/");
+  if (normalized.startsWith("/") || /^[a-zA-Z]:/.test(normalized)) {
+    throw new Error("The file path must be relative to its directory.");
+  }
   const segments = normalized.split("/");
   if (!segments.length) throw new Error("The file name is invalid.");
   const filename = safeFilename(segments.pop());
@@ -119,17 +135,18 @@ async function exists(path: string) {
 }
 
 async function collisionSafePath(folder: string, filename: string, collision: CollisionMode = "increment") {
-  const original = safeFilename(filename);
-  const direct = resolve(folder, original);
+  const direct = resolveRelativeFile(folder, filename).path;
+  const assetFolder = dirname(direct);
+  const original = basename(direct);
   if (collision === "overwrite" || !(await exists(direct))) return direct;
   const extension = extname(original);
   const stem = extension ? original.slice(0, -extension.length) : original;
   if (collision === "timestamp") {
-    return resolve(folder, `${stem}-${new Date().toISOString().replace(/[:.]/g, "-")}${extension}`);
+    return resolve(assetFolder, `${stem}-${new Date().toISOString().replace(/[:.]/g, "-")}${extension}`);
   }
   let index = 2;
-  while (await exists(resolve(folder, `${stem}-${index}${extension}`))) index += 1;
-  return resolve(folder, `${stem}-${index}${extension}`);
+  while (await exists(resolve(assetFolder, `${stem}-${index}${extension}`))) index += 1;
+  return resolve(assetFolder, `${stem}-${index}${extension}`);
 }
 
 function decodeAsset(asset: FileAsset) {
@@ -158,6 +175,7 @@ async function saveRecord(projectRoot: string, request: LocalDirectoryRequest) {
   if (request.saveFiles !== "data") {
     for (const asset of request.files || []) {
       const path = await collisionSafePath(folder, asset.name, collision);
+      await mkdir(dirname(path), { recursive: true });
       await writeFile(path, decodeAsset(asset));
       savedFiles.push(relative(folder, path).replace(/\\/g, "/"));
     }
@@ -300,14 +318,17 @@ export async function handleLocalDirectoryRequest(projectRoot: string, request: 
 export function localDirectory(): Plugin {
   let projectRoot = process.cwd();
   const middleware = (request: IncomingMessage, response: ServerResponse, next: () => void) => {
-    const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+    const protocol = (request.socket as { encrypted?: boolean }).encrypted ? "https:" : "http:";
+    const serverUrl = new URL(`${protocol}//${request.headers.host || "localhost"}`);
+    const url = new URL(request.url || "/", serverUrl);
     if (url.pathname !== LOCAL_DIRECTORY_ENDPOINT) return next();
-    if (!isLoopbackHostname(url.hostname)) {
-      sendJson(response, 404, { error: "Local directory access is available only from this device." });
-      return;
-    }
     if (request.method !== "POST") {
       sendJson(response, 405, { error: "Method not allowed." });
+      return;
+    }
+    const accessError = localDirectoryRequestAccessError(serverUrl, request.headers.origin, request.headers["content-type"]);
+    if (accessError) {
+      sendJson(response, accessError.status, { error: accessError.error });
       return;
     }
     void readJsonBody(request)

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -215,4 +215,57 @@ test("keeps All-files-in-folder snapshots isolated by Load node directory", asyn
   assert.equal(first.files[0].name, "nested/shared.txt");
   assert.equal(second.files[0].name, "nested/shared.txt");
   assert.notEqual(first.files[0].data, second.files[0].data);
+});
+
+test("saves recursive directory output and reloads its relative layout", async (t) => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "magic-conch-recursive-save-"));
+  t.after(() => rm(projectRoot, { recursive: true, force: true }));
+  await mkdir(join(projectRoot, "source", "nested"), { recursive: true });
+  await writeFile(join(projectRoot, "source", "nested", "input.txt"), "nested input");
+  await writeFile(join(projectRoot, "source", "top.txt"), "top input");
+  const listed = await handleLocalDirectoryRequest(projectRoot, {
+    operation: "list-files", directory: "source", recursive: true,
+  });
+  const saved = await handleLocalDirectoryRequest(projectRoot, {
+    operation: "save-record", directory: "destination", key: "copy", value: "copied", files: listed.files,
+  });
+  assert.deepEqual(saved.record.files, ["nested/input.txt", "top.txt"]);
+  assert.equal(await readFile(join(projectRoot, "destination", "nested", "input.txt"), "utf8"), "nested input");
+  const loaded = await handleLocalDirectoryRequest(projectRoot, {
+    operation: "load-record", directory: "destination", key: "copy", loadMode: "exact",
+  });
+  assert.equal(loaded.value, "copied");
+  assert.deepEqual(loaded.files, listed.files);
+});
+
+test("applies each collision mode inside a recursive asset's directory", async (t) => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "magic-conch-recursive-collision-"));
+  t.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const save = (collision, text) => handleLocalDirectoryRequest(projectRoot, {
+    operation: "save-record", saveFiles: "files", collision,
+    files: [{ name: "nested/input.txt", type: "text/plain", data: `data:text/plain,${text}`, size: text.length }],
+  });
+  await save("increment", "original");
+  const incremented = await save("increment", "second");
+  assert.deepEqual(incremented.record.files, ["nested/input-2.txt"]);
+  assert.equal(await readFile(join(projectRoot, "user-data", "nested", "input.txt"), "utf8"), "original");
+  assert.equal(await readFile(join(projectRoot, "user-data", "nested", "input-2.txt"), "utf8"), "second");
+  const timestamped = await save("timestamp", "third");
+  assert.match(timestamped.record.files[0], /^nested\/input-\d{4}-.*\.txt$/);
+  assert.equal(await readFile(join(projectRoot, "user-data", timestamped.record.files[0]), "utf8"), "third");
+  const overwritten = await save("overwrite", "replacement");
+  assert.deepEqual(overwritten.record.files, ["nested/input.txt"]);
+  assert.equal(await readFile(join(projectRoot, "user-data", "nested", "input.txt"), "utf8"), "replacement");
+});
+
+test("rejects traversal and absolute asset paths when saving recursive files", async (t) => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "magic-conch-recursive-unsafe-"));
+  t.after(() => rm(projectRoot, { recursive: true, force: true }));
+  for (const name of ["../outside.txt", "nested/../../outside.txt", "nested\\..\\outside.txt", "/outside.txt", "C:\\outside.txt", "C:outside.txt", "\\\\server\\share\\outside.txt"]) {
+    await assert.rejects(handleLocalDirectoryRequest(projectRoot, {
+      operation: "save-record", saveFiles: "files", collision: "overwrite",
+      files: [{ name, type: "text/plain", data: "data:text/plain,unsafe", size: 6 }],
+    }), /subfolder path is invalid|file path must be relative/);
+  }
+  await assert.rejects(readFile(join(projectRoot, "outside.txt")), { code: "ENOENT" });
 });

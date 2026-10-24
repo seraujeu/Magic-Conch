@@ -54,6 +54,7 @@ import {
   Send,
   Settings,
   Sparkles,
+  StickyNote,
   Trash2,
   Upload,
   Variable,
@@ -90,6 +91,7 @@ import {
 import { collectFileAssets, fileAssetsPromptSections } from "../lib/file-content";
 import { collectDebugFiles, sanitizeDebugData, sanitizeDebugValue } from "../lib/debug-data";
 import { artifactFallbackJson, readStoredArtifact, writeStoredArtifact } from "../lib/artifact-storage";
+import { recoverStoredArray } from "../lib/storage-recovery";
 import { fileNameFromAsset, firstFileAsset, getMediaDimensions } from "../lib/file-metadata";
 import { evaluateBooleanRule, parseAIBoolean } from "../lib/boolean-condition";
 import { rememberDirectoryPermission } from "../lib/directory-permission";
@@ -190,7 +192,7 @@ import {
 } from "../lib/ocr";
 import type { OcrEngine, OcrLayout, OcrPreprocess, OcrResult } from "../lib/ocr";
 
-type BuiltinNodeType = "start" | "chat-session" | "load-settings" | "update-memory" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "ocr" | "list-directory" | "save" | "load" | "google-drive-save" | "google-drive-load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
+type BuiltinNodeType = "start" | "note" | "chat-session" | "load-settings" | "update-memory" | "input" | "request" | "ai-assigner" | "workflow" | "string" | "integer" | "float" | "math" | "media-size" | "file-name" | "ocr" | "list-directory" | "save" | "load" | "google-drive-save" | "google-drive-load" | "set-state" | "transform" | "loop" | "retry" | "wait" | "code" | "parser" | "join" | "condition-ai" | "condition-rule" | "router-condition" | "router-ai" | "router-rule" | "end";
 type NodeType = string;
 type FileAsset = { name: string; type: string; data: string; size: number; bundleLoadNodeId?: string };
 type PortDataType = "prompt" | "files" | "document" | "text" | "number" | "boolean" | "string" | "integer" | "float" | "image" | "video" | "audio" | "any";
@@ -252,6 +254,7 @@ type FlowNode = {
     memoryOperation?: MemoryOperation;
     memoryContent?: string;
     memoryId?: string;
+    noteContent?: string;
     provider?: AIProvider;
     model?: string;
     systemPrompt?: string;
@@ -376,6 +379,7 @@ type PendingWorkflowInput = {
   nodeId: string;
   context: WorkflowContext;
   runState: WorkflowRunState;
+  workflow: Workflow;
 };
 type WorkflowRunState = {
   completedNodeIds: string[];
@@ -384,6 +388,17 @@ type WorkflowRunState = {
   endResults: { text: string; files: FileAsset[] }[];
 };
 type ChatSnapshot = { messages: Message[]; pendingInput: PendingWorkflowInput | null };
+
+function clonePendingWorkflowInput(pending: PendingWorkflowInput | null): PendingWorkflowInput | null {
+  if (!pending) return null;
+  const { executionLimiter, fileProcessingLimiter, ...contextData } = pending.context;
+  const snapshot = structuredClone({ ...pending, context: contextData });
+  return {
+    ...snapshot,
+    context: { ...snapshot.context, executionLimiter, fileProcessingLimiter },
+  };
+}
+
 type ChatSession = {
   id: string;
   title: string;
@@ -517,6 +532,7 @@ const NODE_META: Record<
   { label: string; subtitle: string; color: string; icon: typeof Play }
 > = {
   start: { label: "Start", subtitle: "Entry point", color: "#27a36a", icon: Play },
+  note: { label: "Note", subtitle: "Document the workflow", color: "#d19a2a", icon: StickyNote },
   "chat-session": { label: "Chat Session", subtitle: "Load messages and session details", color: "#5279bd", icon: History },
   "load-settings": { label: "Load User Settings", subtitle: "Load preference and memory", color: "#6873c8", icon: Settings },
   "update-memory": { label: "Update User Memory", subtitle: "Add, edit, or remove a memory", color: "#9a5ca8", icon: BrainCircuit },
@@ -554,6 +570,7 @@ const NODE_META: Record<
 
 const BUILTIN_NODE_GROUPS: { id: string; label: string; types: BuiltinNodeType[] }[] = [
   { id: "essentials", label: "Essentials", types: ["start", "chat-session", "input", "end"] },
+  { id: "annotations", label: "Annotations", types: ["note"] },
   { id: "personalization", label: "Personalization", types: ["load-settings", "update-memory"] },
   { id: "ai", label: "AI", types: ["request", "ai-assigner"] },
   { id: "values", label: "Values", types: ["string", "integer", "float", "math", "set-state"] },
@@ -604,6 +621,7 @@ function getNodeSchema(node: FlowNode, plugins: MagicConchPlugin[]): NodeSchema 
   const mediaOutputs: PortSpec[] = [{ id: "image", label: "image", type: "image" }, { id: "video", label: "video", type: "video" }, { id: "audio", label: "audio", type: "audio" }];
   const fileInputs: PortSpec[] = [{ id: "files", label: "files", type: "files" }, ...mediaInputs, documentIn];
   if (node.type === "start") return { inputs: [{ id: "agent_name", label: "agent name", type: "string" }, { id: "start_message", label: "start message", type: "string" }], outputs: [{ id: "prompt", label: "prompt", type: "prompt" }, { id: "files", label: "files", type: "files" }, ...mediaOutputs, documentOut] };
+  if (node.type === "note") return { inputs: [], outputs: [] };
   if (node.type === "chat-session") return {
     inputs: [],
     outputs: [
@@ -766,6 +784,7 @@ function portPoint(
 }
 
 function nodeCardHeight(node: FlowNode, plugins: MagicConchPlugin[]) {
+  if (node.type === "note") return 168;
   const schema = getNodeSchema(node, plugins);
   return 86 + Math.max(schema.inputs.length, schema.outputs.length) * 25 + (["ai-assigner", "router-ai", "router-rule"].includes(node.type) ? 27 : 0);
 }
@@ -873,7 +892,7 @@ async function materializeWorkflowLoadFiles(workflow: Workflow) {
   const remainingLoads = { ...workflow.bundledLoads };
   for (const nodeId of Object.keys(workflow.bundledLoads)) {
     const node = nodes.find((candidate) => candidate.id === nodeId);
-    const snapshot = bundledLoadResult({ ...workflow, nodes, files, bundledLoads: remainingLoads }, nodeId);
+    const snapshot = bundledLoadResult({ files, bundledLoads: remainingLoads }, nodeId);
     if (!node || !snapshot || (node.type !== "load" && node.type !== "list-directory")) continue;
     const directory = materializedLoadDirectory(workflow, node);
     const recordKey = node.config.key || "workflow-result";
@@ -1348,6 +1367,8 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
   });
   const [googleDriveClientId, setGoogleDriveClientId] = useState(configuredGoogleDriveClientId);
   const [googleDriveConnection, setGoogleDriveConnection] = useState<{ accessToken: string; expiresAt: number } | null>(null);
+  const [googleDriveSignInReady, setGoogleDriveSignInReady] = useState(false);
+  const [googleDriveConnecting, setGoogleDriveConnecting] = useState(false);
   const [availableModels, setAvailableModels] = useState<Partial<Record<AIProvider, string[]>>>({});
   const [modelsLoading, setModelsLoading] = useState<Partial<Record<AIProvider, boolean>>>({});
   const [plugins, setPlugins] = useState<MagicConchPlugin[]>([]);
@@ -1414,11 +1435,16 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
   const connectRef = useRef<{ nodeId: string; portId: string; dataType: PortDataType; pointerId: number } | null>(null);
   const activeWorkflowIdRef = useRef(activeWorkflowId);
   activeWorkflowIdRef.current = activeWorkflowId;
+  const workflowsRef = useRef(workflows);
+  workflowsRef.current = workflows;
+  const isRunningRef = useRef(isRunning);
+  isRunningRef.current = isRunning;
   const effectiveWorkflowParallelism = automaticWorkflowParallelism ? automaticParallelism : workflowParallelism;
   const workflowParallelismRef = useRef(effectiveWorkflowParallelism);
   workflowParallelismRef.current = effectiveWorkflowParallelism;
   const googleDriveConnectionRef = useRef(googleDriveConnection);
   googleDriveConnectionRef.current = googleDriveConnection;
+  const googleDriveConnectPromiseRef = useRef<Promise<void> | null>(null);
 
   const activeWorkflow = useMemo(
     () => workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0],
@@ -1439,7 +1465,11 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
     return () => { active = false; };
   }, []);
   useEffect(() => {
-    void loadGoogleIdentityServices().catch(() => { /* Connect reports a useful error if Google sign-in remains unavailable. */ });
+    let active = true;
+    void loadGoogleIdentityServices()
+      .then(() => { if (active) setGoogleDriveSignInReady(true); })
+      .catch(() => { /* Connect reports a useful error if Google sign-in remains unavailable. */ });
+    return () => { active = false; };
   }, []);
   const portLayoutKey = useMemo(
     () => activeWorkflow.nodes.map((node) => {
@@ -1583,9 +1613,12 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
           readStoredArtifact<MagicConchPlugin[]>("plugins").catch(() => null),
           readStoredChatSessions<Partial<ChatSession>[]>().catch(() => null),
         ]);
-        const savedFlows = indexedFlows ?? (savedFlowsJson ? JSON.parse(savedFlowsJson) as Workflow[] : null);
-        const savedPlugins = indexedPlugins ?? (savedPluginsJson ? JSON.parse(savedPluginsJson) as MagicConchPlugin[] : []);
-        const savedSessions = indexedSessions ?? (savedSessionsJson ? JSON.parse(savedSessionsJson) as Partial<ChatSession>[] : null);
+        const flowsRecovery = recoverStoredArray(indexedFlows, savedFlowsJson);
+        const pluginsRecovery = recoverStoredArray(indexedPlugins, savedPluginsJson);
+        const sessionsRecovery = recoverStoredArray(indexedSessions, savedSessionsJson);
+        const savedFlows = flowsRecovery.value;
+        const savedPlugins = pluginsRecovery.value || [];
+        const savedSessions = sessionsRecovery.value;
         const savedChatFolders = localStorage.getItem("magic-conch-chat-folders");
         const savedActiveSession = localStorage.getItem("magic-conch-active-session");
         const restoredPlugins = savedPlugins;
@@ -1661,20 +1694,20 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
             setMessages(chosen.messages);
             setActiveWorkflowId(chosen.workflowId);
           }
-          if (!indexedSessions && savedSessionsJson) {
+          if (sessionsRecovery.usedFallback) {
             await writeStoredChatSessions(sessions)
               .then(() => localStorage.removeItem("magic-conch-chat-sessions"))
               .catch(() => { /* The quota-safe fallback remains available. */ });
           }
         }
-        if (!indexedFlows && savedFlowsJson) {
+        if (flowsRecovery.usedFallback) {
           await writeStoredArtifact("workflows", savedFlows)
             .then(() => localStorage.removeItem("magic-conch-workflows"))
             .catch(() => { /* The lightweight localStorage fallback remains available. */ });
         } else if (indexedFlows) {
           localStorage.removeItem("magic-conch-workflows");
         }
-        if (!indexedPlugins && savedPluginsJson) {
+        if (pluginsRecovery.usedFallback) {
           await writeStoredArtifact("plugins", restoredPlugins)
             .then(() => localStorage.removeItem("magic-conch-plugins"))
             .catch(() => { /* The lightweight localStorage fallback remains available. */ });
@@ -1894,8 +1927,19 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
   function currentChatSnapshot(): ChatSnapshot {
     return {
       messages: structuredClone(messages),
-      pendingInput: pendingInput ? structuredClone(pendingInput) : null,
+      pendingInput: clonePendingWorkflowInput(pendingInput),
     };
+  }
+
+  function canChangeConversation() {
+    if (!isRunningRef.current) return true;
+    showToast("Wait for the current workflow to finish before changing chats or workflows");
+    return false;
+  }
+
+  function setWorkflowRunning(running: boolean) {
+    isRunningRef.current = running;
+    setIsRunning(running);
   }
 
   function rememberChat() {
@@ -1938,6 +1982,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
   }
 
   function createChatSession() {
+    if (!canChangeConversation()) return;
     const sessionNumber = Math.max(0, ...chatSessions.map((session) => session.sessionNumber || 0)) + 1;
     const sessionId = uid("session");
     const syntax = {
@@ -1972,6 +2017,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
   function selectChatSession(sessionId: string) {
     const session = chatSessions.find((item) => item.id === sessionId);
     if (!session || session.id === activeSessionId) return;
+    if (!canChangeConversation()) return;
     setActiveSessionId(session.id);
     setMessages(session.messages);
     setActiveWorkflowId(session.workflowId);
@@ -2062,6 +2108,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
   }
 
   function duplicateChatSession(sessionId: string) {
+    if (!canChangeConversation()) return;
     const source = chatSessions.find((session) => session.id === sessionId);
     if (!source) return;
     const duplicate: ChatSession = {
@@ -2084,6 +2131,8 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
   }
 
   function deleteChatSession(sessionId: string) {
+    if (!canChangeConversation()) return;
+    const deletingActiveSession = sessionId === activeSessionId;
     const remaining = chatSessions.filter((session) => session.id !== sessionId);
     if (!remaining.length) {
       const replacement: ChatSession = {
@@ -2106,8 +2155,13 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
         setActiveWorkflowId(next.workflowId);
       }
     }
-    setPendingInput(null);
-    setDebugEvents([]);
+    if (deletingActiveSession || !remaining.length) {
+      setPendingInput(null);
+      setDebugEvents([]);
+      setEditingMessage(null);
+      chatUndoRef.current = [];
+      chatRedoRef.current = [];
+    }
     showToast("Chat session deleted");
   }
 
@@ -2260,7 +2314,9 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
       x: Math.max(120, (460 - pan.x) / zoom) + count * 18,
       y: Math.max(100, (240 - pan.y) / zoom) + count * 18,
       config:
-        type === "load-settings"
+        type === "note"
+          ? { noteContent: "Write a note about this workflow…" }
+          : type === "load-settings"
           ? { settingsIncludePreference: true, settingsIncludeMemory: true }
           : type === "update-memory"
             ? { memoryOperation: "add", memoryContent: "", memoryId: "" }
@@ -2332,6 +2388,15 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
     setSelectedNodeId(id);
     setSelectedNodeIds([id]);
     setInspectorOpen(true);
+    if ((type === "google-drive-save" || type === "google-drive-load") && !googleDriveConnectionRef.current) {
+      if ((configuredGoogleDriveClientId || googleDriveClientId).trim()) {
+        void connectGoogleDrive();
+      } else {
+        setSettingsTab("api");
+        setSettingsOpen(true);
+        showToast("Configure Google login to connect this Drive node");
+      }
+    }
   }
 
   function deleteSelectedNode() {
@@ -2746,6 +2811,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
   }
 
   function newWorkflow() {
+    if (!canChangeConversation()) return;
     const id = uid("workflow");
     const workflow: Workflow = {
       id,
@@ -2768,6 +2834,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
     };
     setWorkflows((current) => [...current, workflow]);
     setActiveWorkflowId(id);
+    setPendingInput(null);
     setSelectedNodeId(null);
     setSelectedNodeIds([]);
     setPan({ x: 0, y: 28 });
@@ -2784,6 +2851,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
   }
 
   function duplicateWorkflow(workflowId: string) {
+    if (!canChangeConversation()) return;
     const source = workflows.find((workflow) => workflow.id === workflowId);
     if (!source) return;
     const nodeIds = new Map(source.nodes.map((node) => [node.id, uid(node.type)]));
@@ -2797,6 +2865,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
     };
     setWorkflows((current) => [...current, duplicate]);
     setActiveWorkflowId(duplicate.id);
+    setPendingInput(null);
     setSelectedNodeId(null);
     setSelectedNodeIds([]);
     showToast("Workflow duplicated");
@@ -2833,6 +2902,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
   }
 
   function deleteWorkflow(workflowId: string) {
+    if (!canChangeConversation()) return;
     if (workflows.length <= 1) {
       showToast("Keep at least one workflow");
       return;
@@ -2843,6 +2913,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
     setChatSessions((current) => current.map((session) => session.workflowId === workflowId ? { ...session, workflowId: replacement.id } : session));
     if (activeWorkflowId === workflowId) {
       setActiveWorkflowId(replacement.id);
+      setPendingInput(null);
       setSelectedNodeId(null);
       setSelectedNodeIds([]);
     }
@@ -2896,14 +2967,27 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
     }
   }
 
-  async function connectGoogleDrive() {
-    try {
-      const connection = await requestGoogleDriveToken(configuredGoogleDriveClientId || googleDriveClientId);
-      setGoogleDriveConnection(connection);
-      showToast("Google Drive connected");
-    } catch (error) {
-      showToast(error instanceof Error ? error.message : "Could not connect Google Drive");
+  function connectGoogleDrive() {
+    if (googleDriveConnectPromiseRef.current) return googleDriveConnectPromiseRef.current;
+    if (!googleDriveSignInReady) {
+      showToast("Google sign-in is still loading. Try again in a moment.");
+      return Promise.resolve();
     }
+    setGoogleDriveConnecting(true);
+    const connectionPromise = requestGoogleDriveToken(configuredGoogleDriveClientId || googleDriveClientId)
+      .then((connection) => {
+        setGoogleDriveConnection(connection);
+        showToast("Google Drive connected");
+      })
+      .catch((error) => {
+        showToast(error instanceof Error ? error.message : "Could not connect Google Drive");
+      })
+      .finally(() => {
+        googleDriveConnectPromiseRef.current = null;
+        setGoogleDriveConnecting(false);
+      });
+    googleDriveConnectPromiseRef.current = connectionPromise;
+    return connectionPromise;
   }
 
   async function disconnectGoogleDrive() {
@@ -3060,6 +3144,10 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
       if (activeWorkflowIdRef.current !== sourceWorkflow.id) {
         throw new Error(`Return to ${sourceWorkflow.name} and run the request again; the active workflow changed while the model was responding.`);
       }
+      const currentWorkflow = workflowsRef.current.find((workflow) => workflow.id === sourceWorkflow.id);
+      if (!currentWorkflow || JSON.stringify(workflowJsonManifest(currentWorkflow)) !== JSON.stringify(sourceManifest)) {
+        throw new Error("The workflow changed while the model was responding. Your changes were kept; run the request again to edit the latest version.");
+      }
       updateWorkflow((workflow) => ({
         ...edited,
         files: workflow.files,
@@ -3207,7 +3295,8 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
     }
   }
 
-  async function importWorkflowFile(file: File): Promise<boolean> {
+  async function importWorkflowFile(file: File): Promise<boolean | null> {
+    if (!canChangeConversation()) return null;
     try {
       let packagedWorkflows: Workflow[];
       let packagedPlugins: MagicConchPlugin[] = [];
@@ -3244,9 +3333,11 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
       }, availablePlugins));
       const imported: Workflow[] = [];
       for (const workflow of migrated) imported.push(await materializeWorkflowLoadFiles(workflow));
+      if (!canChangeConversation()) return null;
       if (packagedPlugins.length) setPlugins(availablePlugins);
       setWorkflows((current) => [...current, ...imported]);
       setActiveWorkflowId(imported[0].id);
+      setPendingInput(null);
       setSelectedNodeId(null);
       setSelectedNodeIds([]);
       return true;
@@ -3257,7 +3348,10 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
 
   async function importWorkflow(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
-    if (file) showToast(await importWorkflowFile(file) ? "Workflow imported" : "That file is not a valid workflow");
+    if (file) {
+      const imported = await importWorkflowFile(file);
+      if (imported !== null) showToast(imported ? "Workflow imported" : "That file is not a valid workflow");
+    }
     event.target.value = "";
   }
 
@@ -3270,7 +3364,9 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
 
     let importedCount = 0;
     for (const file of files) {
-      if (await importWorkflowFile(file)) importedCount += 1;
+      const imported = await importWorkflowFile(file);
+      if (imported === null) return;
+      if (imported) importedCount += 1;
     }
     showToast(importedCount
       ? `${importedCount} workflow${importedCount === 1 ? "" : "s"} imported`
@@ -3786,12 +3882,13 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
           .filter(Boolean)
           .join("\n\n");
         const provider = node.config.provider || "openai";
+        let response: string;
         let lastLiveUpdateAt = 0;
         if (provider === "ollama") {
           setLiveModelActivities((current) => ({ ...current, [node.id]: { nodeName: node.name, thinking: "", content: "" } }));
         }
         try {
-          context.lastOutput = await context.fileProcessingLimiter.run(
+          response = await context.fileProcessingLimiter.run(
             fileInput.reduce((total, file) => total + Math.max(0, file.size), 0),
             () => requestAI(
             {
@@ -3838,17 +3935,18 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
         const outputFileName = String(inputFor("output_file_name", node.config.outputFileName || ""));
         if (outputFileName) {
           const created = await readFileAsset(
-            new File([context.lastOutput], outputFileName, { type: "text/plain" }),
+            new File([response], outputFileName, { type: "text/plain" }),
           );
           fileInput.push(created);
         }
-        output("prompt", context.lastOutput);
+        context.lastOutput = response;
+        output("prompt", response);
         output("files", fileInput);
         output("image", mediaAssets(fileInput, "image"));
         output("video", mediaAssets(fileInput, "video"));
         output("audio", mediaAssets(fileInput, "audio"));
         output("document", fileInput.filter(isDocumentAsset));
-        debugDetail = `Generated ${context.lastOutput.length} prompt characters and passed ${fileInput.length} file${fileInput.length === 1 ? "" : "s"}.`;
+        debugDetail = `Generated ${response.length} prompt characters and passed ${fileInput.length} file${fileInput.length === 1 ? "" : "s"}.`;
       }
 
       if (node.type === "ai-assigner") {
@@ -4075,8 +4173,13 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
         const documentAsset = Array.isArray(parserDocumentInput) ? parserDocumentInput[0] : parserDocumentInput;
         let text = String(inputFor<unknown>("source", promptInput));
         if (documentAsset?.data) {
-          const encoded = documentAsset.data.split(",")[1] || "";
-          try { text = atob(encoded); } catch { text = documentAsset.name; }
+          const comma = documentAsset.data.indexOf(",");
+          if (comma < 0) throw new Error(`Document “${documentAsset.name}” has an invalid data URL.`);
+          const metadata = documentAsset.data.slice(0, comma);
+          const encoded = documentAsset.data.slice(comma + 1);
+          text = metadata.includes(";base64")
+            ? new TextDecoder("utf-8").decode(Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0)))
+            : decodeURIComponent(encoded);
         }
         const data = parseStructuredText(text, node.config.parserFormat || "auto");
         output("data", data);
@@ -4228,14 +4331,14 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
       return { emittedPortKeys: [...emittedPortKeys] };
   }
 
-  async function runWorkflow(context: WorkflowContext, savedState: WorkflowRunState): Promise<void> {
-    const start = activeWorkflow.nodes.find((node) => node.type === "start");
+  async function runWorkflow(context: WorkflowContext, savedState: WorkflowRunState, workflow = activeWorkflow): Promise<void> {
+    const start = workflow.nodes.find((node) => node.type === "start");
     if (!start) throw new Error("This workflow needs a Start node.");
     const reachable = new Set<string>([start.id]);
     const queue = [start.id];
     while (queue.length) {
       const sourceId = queue.shift()!;
-      activeWorkflow.edges.filter((edge) => edge.from === sourceId).forEach((edge) => {
+      workflow.edges.filter((edge) => edge.from === sourceId).forEach((edge) => {
         if (!reachable.has(edge.to)) { reachable.add(edge.to); queue.push(edge.to); }
       });
     }
@@ -4244,7 +4347,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
     let addedDependency = true;
     while (addedDependency) {
       addedDependency = false;
-      activeWorkflow.edges.forEach((edge) => {
+      workflow.edges.forEach((edge) => {
         if (reachable.has(edge.to) && !reachable.has(edge.from)) {
           reachable.add(edge.from);
           addedDependency = true;
@@ -4259,10 +4362,10 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
 
     while (true) {
       const settled = new Set([...completed, ...skipped]);
-      const pending = activeWorkflow.nodes.filter((node) => reachable.has(node.id) && !settled.has(node.id));
+      const pending = workflow.nodes.filter((node) => reachable.has(node.id) && !settled.has(node.id));
       if (!pending.length) break;
       const ready = pending.filter((node) => {
-        const predecessors = activeWorkflow.edges
+        const predecessors = workflow.edges
           .filter((edge) => edge.to === node.id && reachable.has(edge.from))
           .map((edge) => edge.from);
         return predecessors.every((id) => settled.has(id));
@@ -4270,7 +4373,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
       if (!ready.length) throw new Error("This workflow contains a cycle. Data-flow graphs must be acyclic.");
 
       const activeReady = ready.filter((node) => {
-        const incoming = activeWorkflow.edges.filter((edge) => edge.to === node.id && reachable.has(edge.from));
+        const incoming = workflow.edges.filter((edge) => edge.to === node.id && reachable.has(edge.from));
         return isWorkflowNodeActive({
           nodeType: node.type,
           inputPorts: getNodeSchema(node, plugins).inputs,
@@ -4284,7 +4387,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
       const executable = activeReady.filter((node) => node.type !== "input");
       const results = await mapWithConcurrencyLimit(executable, () => workflowParallelismRef.current, async (node) => ({
         node,
-        result: await executeScheduledGraphNode(node, context, emitted, activeWorkflow),
+        result: await executeScheduledGraphNode(node, context, emitted, workflow),
       }));
       results.forEach(({ node, result }) => {
         completed.add(node.id);
@@ -4294,7 +4397,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
 
       if (waitingNode) {
         const resolvedWaitingNode = expandWorkflowSyntaxInValue(waitingNode, context.syntax);
-        const questionEdge = activeWorkflow.edges.find((edge) => edge.to === waitingNode.id && edge.toPort === "question" && emitted.has(portValueKey(edge.from, edge.fromPort || "")));
+        const questionEdge = workflow.edges.find((edge) => edge.to === waitingNode.id && edge.toPort === "question" && emitted.has(portValueKey(edge.from, edge.fromPort || "")));
         const question = String(questionEdge ? context.values[portValueKey(questionEdge.from, questionEdge.fromPort || "")] : resolvedWaitingNode.config.prompt || "What additional information should I know?");
         const debugInputs = getNodeSchema(resolvedWaitingNode, plugins).inputs.map((port) => ({
           port: port.id,
@@ -4306,6 +4409,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
         setPendingInput({
           nodeId: waitingNode.id,
           context,
+          workflow,
           runState: {
             completedNodeIds: [...completed],
             skippedNodeIds: [...skipped],
@@ -4318,28 +4422,28 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
           role: "assistant",
           text: question,
           time: timeNow(),
-          meta: getStartSettings(activeWorkflow, context.syntax).agentName,
+          meta: getStartSettings(workflow, context.syntax).agentName,
         }]);
-        setIsRunning(false);
+        setWorkflowRunning(false);
         return;
       }
     }
 
-    const hasReachableEnd = activeWorkflow.nodes.some((node) => node.type === "end" && reachable.has(node.id));
+    const hasReachableEnd = workflow.nodes.some((node) => node.type === "end" && reachable.has(node.id));
     setMessages((current) => [
       ...current,
       ...(endResults.length ? endResults.map((result) => ({
-        id: uid("message"), role: "assistant" as const, text: result.text, time: timeNow(), meta: getStartSettings(activeWorkflow, context.syntax).agentName, files: result.files,
+        id: uid("message"), role: "assistant" as const, text: result.text, time: timeNow(), meta: getStartSettings(workflow, context.syntax).agentName, files: result.files,
       })) : [{
         id: uid("message"), role: "assistant" as const,
         text: hasReachableEnd
           ? "Workflow stopped before reaching its End node. Check for an inactive route or upstream trigger."
           : "Workflow finished without a reachable End node.",
-        time: timeNow(), meta: getStartSettings(activeWorkflow, context.syntax).agentName,
+        time: timeNow(), meta: getStartSettings(workflow, context.syntax).agentName,
       }]),
     ]);
     setPendingInput(null);
-    setIsRunning(false);
+    setWorkflowRunning(false);
   }
 
   async function runNewWorkflowMessage(text: string, messageFiles: FileAsset[], priorMessages = messages) {
@@ -4401,7 +4505,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
         meta: "Action needed",
       },
     ]);
-    setIsRunning(false);
+    setWorkflowRunning(false);
   }
 
   async function resendMessage(message: Message) {
@@ -4418,7 +4522,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
       message.id,
       replacement,
     ) as Message[]);
-    setIsRunning(true);
+    setWorkflowRunning(true);
     try {
       const messageIndex = messages.findIndex((candidate) => candidate.id === message.id);
       await runNewWorkflowMessage(message.text, files, messageIndex < 0 ? messages : messages.slice(0, messageIndex));
@@ -4442,18 +4546,19 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
 
   async function sendMessage() {
     const text = messageInput.trim() || (attachedFiles.length ? "Process the attached files." : "");
-    if (!text || isRunning) return;
+    if (!text || isRunningRef.current) return;
     rememberChat();
     setMessageInput("");
     setMessages((current) => [
       ...current,
       { id: uid("message"), role: "user", text, time: timeNow(), files: attachedFiles },
     ]);
-    setIsRunning(true);
+    setWorkflowRunning(true);
 
     try {
       if (pendingInput) {
-        const messageFiles = [...pendingInput.context.files, ...attachedFiles];
+        const pausedInput = clonePendingWorkflowInput(pendingInput)!;
+        const messageFiles = [...pausedInput.context.files, ...attachedFiles];
         setDebugEvents((current) => {
           const lastWaiting = [...current].reverse().find((event) => event.status === "waiting");
           return current.map((event) => event.id === lastWaiting?.id ? {
@@ -4467,32 +4572,32 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
           } : event);
         });
         const context = {
-          ...pendingInput.context,
+          ...pausedInput.context,
           additionalInput: text,
           files: messageFiles,
         };
-        context.values[portValueKey(pendingInput.nodeId, "prompt")] = text;
-        context.values[portValueKey(pendingInput.nodeId, "files")] = context.files;
-        context.values[portValueKey(pendingInput.nodeId, "image")] = mediaAssets(context.files, "image");
-        context.values[portValueKey(pendingInput.nodeId, "video")] = mediaAssets(context.files, "video");
-        context.values[portValueKey(pendingInput.nodeId, "audio")] = mediaAssets(context.files, "audio");
-        context.values[portValueKey(pendingInput.nodeId, "document")] = context.files.filter(isDocumentAsset);
+        context.values[portValueKey(pausedInput.nodeId, "prompt")] = text;
+        context.values[portValueKey(pausedInput.nodeId, "files")] = context.files;
+        context.values[portValueKey(pausedInput.nodeId, "image")] = mediaAssets(context.files, "image");
+        context.values[portValueKey(pausedInput.nodeId, "video")] = mediaAssets(context.files, "video");
+        context.values[portValueKey(pausedInput.nodeId, "audio")] = mediaAssets(context.files, "audio");
+        context.values[portValueKey(pausedInput.nodeId, "document")] = context.files.filter(isDocumentAsset);
         setAttachedFiles([]);
         const runState: WorkflowRunState = {
-          ...pendingInput.runState,
-          completedNodeIds: [...pendingInput.runState.completedNodeIds, pendingInput.nodeId],
+          ...pausedInput.runState,
+          completedNodeIds: [...pausedInput.runState.completedNodeIds, pausedInput.nodeId],
           emittedPortKeys: [
-            ...pendingInput.runState.emittedPortKeys,
-            portValueKey(pendingInput.nodeId, "prompt"),
-            portValueKey(pendingInput.nodeId, "files"),
-            portValueKey(pendingInput.nodeId, "image"),
-            portValueKey(pendingInput.nodeId, "video"),
-            portValueKey(pendingInput.nodeId, "audio"),
-            portValueKey(pendingInput.nodeId, "document"),
+            ...pausedInput.runState.emittedPortKeys,
+            portValueKey(pausedInput.nodeId, "prompt"),
+            portValueKey(pausedInput.nodeId, "files"),
+            portValueKey(pausedInput.nodeId, "image"),
+            portValueKey(pausedInput.nodeId, "video"),
+            portValueKey(pausedInput.nodeId, "audio"),
+            portValueKey(pausedInput.nodeId, "document"),
           ],
         };
         setPendingInput(null);
-        await runWorkflow(context, runState);
+        await runWorkflow(context, runState, pausedInput.workflow);
       } else {
         const files = attachedFiles;
         setAttachedFiles([]);
@@ -4504,6 +4609,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
   }
 
   function switchWorkflow(id: string) {
+    if (!canChangeConversation()) return;
     const workflow = workflows.find((item) => item.id === id);
     setActiveWorkflowId(id);
     if (workflow && !messages.some((message) => message.role === "user")) {
@@ -4819,7 +4925,11 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
                           aria-label={`Disconnect ${edge.dataType || "any"} connection`}
                           onClick={() => removeEdge(edge.id)}
                           onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === "Delete") removeEdge(edge.id);
+                            if (event.key === "Enter" || event.key === "Delete") {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              removeEdge(edge.id);
+                            }
                           }}
                         />
                       </g>
@@ -4842,7 +4952,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
                   return (
                     <article
                       key={node.id}
-                      className={`flow-node ${selectedNodeIds.includes(node.id) ? "selected" : ""}`}
+                      className={`flow-node ${node.type === "note" ? "note-node" : ""} ${selectedNodeIds.includes(node.id) ? "selected" : ""}`}
                       style={{ left: node.x, top: node.y, height: nodeCardHeight(node, plugins), "--node-color": meta.color } as React.CSSProperties}
                       onPointerDown={(event) => beginNodeDrag(event, node)}
                     >
@@ -4854,6 +4964,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
                           <small>{node.type === "request" || node.type === "ai-assigner" || node.type === "router-ai" || node.type === "condition-ai" ? `${node.config.provider || "openai"} · ${node.config.model || "model"}` : node.type === "workflow" ? workflows.find((workflow) => workflow.id === node.config.calledWorkflowId)?.name || "Select a workflow" : meta.subtitle}</small>
                         </span>
                       </div>
+                      {node.type === "note" && <div className={`note-node-content ${node.config.noteContent?.trim() ? "" : "empty"}`}>{node.config.noteContent?.trim() || "Write a note in the Inspector."}</div>}
                       <div className="node-ports">
                         <div className="port-column input-column">
                           {schema.inputs.map((port) => {
@@ -4895,6 +5006,7 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
                     <span><strong>{selectedMeta?.label}</strong><small>{selectedNode.id}</small></span>
                   </div>
                   <label className="field-label">Name<input value={selectedNode.name} onChange={(event) => updateNode({ name: event.target.value })} /></label>
+                  {selectedNode.type === "note" && <label className="field-label">Note<textarea rows={10} value={selectedNode.config.noteContent || ""} placeholder="Write context, decisions, reminders, or instructions…" onChange={(event) => updateNode({ config: { noteContent: event.target.value } })} /><small className="field-help">Notes are saved and exported with the workflow. They have no ports and do not run, so they cannot change workflow results.</small></label>}
                   {selectedNode.type === "string" && <label className="field-label">String value<textarea rows={4} value={selectedNode.config.stringValue || ""} placeholder="Enter text…" onChange={(event) => updateNode({ config: { stringValue: event.target.value } })} /><small className="field-help">Connect the string output to any compatible data or attribute input.</small></label>}
                   {selectedNode.type === "integer" && <label className="field-label">Integer value<input type="number" step="1" value={selectedNode.config.integerValue ?? 0} onChange={(event) => updateNode({ config: { integerValue: Math.trunc(Number(event.target.value) || 0) } })} /><small className="field-help">Decimals are truncated to a whole number.</small></label>}
                   {selectedNode.type === "float" && <label className="field-label">Float value<input type="number" step="any" value={selectedNode.config.floatValue ?? 0} onChange={(event) => updateNode({ config: { floatValue: Number(event.target.value) || 0 } })} /></label>}
@@ -5192,9 +5304,9 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
                   )}
                   {(selectedNode.type === "google-drive-save" || selectedNode.type === "google-drive-load") && (
                     <>
-                      <div className="inspector-note"><Cloud size={14} /><span><b>{googleDriveConnection ? "Google Drive connected" : "Google Drive is not connected"}</b><small>{googleDriveConnection ? "This browser session can access files created by Magic Conch." : "Connect in Settings before running this node."}</small></span></div>
+                      <div className="inspector-note"><Cloud size={14} /><span><b>{googleDriveConnection ? "Google Drive connected" : googleDriveConnecting ? "Waiting for Google sign-in" : "Google Drive is not connected"}</b><small>{googleDriveConnection ? "This browser session can access files created by Magic Conch." : googleDriveConnecting ? "Finish signing in with Google in the popup window." : "Sign in here before running this node."}</small></span></div>
                       {!googleDriveConnection && (configuredGoogleDriveClientId || googleDriveClientId.trim()
-                        ? <button className="primary-button" type="button" onClick={connectGoogleDrive}><Cloud size={14} /> Sign in with Google</button>
+                        ? <button className="primary-button" type="button" onClick={connectGoogleDrive} disabled={googleDriveConnecting || !googleDriveSignInReady}>{googleDriveConnecting || !googleDriveSignInReady ? <LoaderCircle size={14} className="spin" /> : <Cloud size={14} />} {googleDriveConnecting ? "Google sign-in open" : googleDriveSignInReady ? "Sign in with Google" : "Loading Google sign-in"}</button>
                         : <button className="secondary-button" type="button" onClick={() => { setSettingsTab("api"); setSettingsOpen(true); }}><Settings size={14} /> Configure Google login</button>)}
                       {(selectedNode.type === "google-drive-save" || selectedNode.config.loadMode !== "folder") && <label className="field-label">File key<input value={selectedNode.config.key || ""} placeholder="record-name" onChange={(event) => updateNode({ config: { key: event.target.value } })} /><small className="field-help">Versioned records with the same key can coexist.</small></label>}
                       {(selectedNode.type === "google-drive-save" || selectedNode.config.loadMode !== "folder") && <label className="field-label">File extension<input value={selectedNode.config.fileExtension || "json"} placeholder="json" onChange={(event) => updateNode({ config: { fileExtension: event.target.value } })} /><small className="field-help">Saved record content remains JSON.</small></label>}
@@ -5460,7 +5572,18 @@ export default function Workbench({ configuredGoogleDriveClientId = "" }: { conf
                   {!!availableModels.ollama?.length && <div className="model-tags">{availableModels.ollama.map((model) => <span key={model}>{model}</span>)}</div>}
                   <div className="section-title"><Cloud size={17} /><div><strong>Google Drive</strong><small>Used only by Google Drive Save and Load nodes.</small></div></div>
                   {!configuredGoogleDriveClientId && <label className="field-label">OAuth client ID <small>(local setup)</small><input value={googleDriveClientId} placeholder="123…apps.googleusercontent.com" onChange={(event) => { setGoogleDriveClientId(event.target.value); if (googleDriveConnection) setGoogleDriveConnection(null); }} /><small className="field-help">The app owner can instead set GOOGLE_DRIVE_CLIENT_ID. For local setup, create a Web application OAuth client, enable the Drive API, and add this app&apos;s origin to Authorized JavaScript origins.</small></label>}
-                  <div className="folder-row"><span className="folder-icon"><Cloud size={18} /></span><div><strong>{googleDriveConnection ? "Google Drive connected" : "Connect your Google account"}</strong><small>Permission is limited to Drive files and folders created or opened by this app. Access tokens stay in memory and expire automatically.</small></div>{googleDriveConnection ? <button className="secondary-button" onClick={disconnectGoogleDrive}>Disconnect</button> : <button className="primary-button" onClick={connectGoogleDrive} disabled={!(configuredGoogleDriveClientId || googleDriveClientId.trim())}><Cloud size={14} /> Sign in with Google</button>}</div>
+                  {!configuredGoogleDriveClientId && <details className="oauth-setup-guide" open>
+                    <summary>How to get an OAuth client ID</summary>
+                    <ol>
+                      <li>Open <a href="https://console.cloud.google.com/auth/clients" target="_blank" rel="noreferrer">Google Cloud OAuth clients</a>, then create or select a project.</li>
+                      <li>Configure the OAuth consent screen (Google Auth Platform branding and audience). Add your Google account as a test user if the app is in testing.</li>
+                      <li>Enable the <a href="https://console.cloud.google.com/apis/library/drive.googleapis.com" target="_blank" rel="noreferrer">Google Drive API</a> for that project.</li>
+                      <li>Create a client and choose <b>Web application</b> as the application type.</li>
+                      <li>Under <b>Authorized JavaScript origins</b>, add <code>http://localhost</code> and <code>http://localhost:4173</code>. No redirect URI is required for this popup flow.</li>
+                      <li>Copy the generated <b>Client ID</b> ending in <code>.apps.googleusercontent.com</code> and paste it above. Do not paste the client secret or an API key.</li>
+                    </ol>
+                  </details>}
+                  <div className="folder-row"><span className="folder-icon"><Cloud size={18} /></span><div><strong>{googleDriveConnection ? "Google Drive connected" : googleDriveConnecting ? "Waiting for Google sign-in" : "Connect your Google account"}</strong><small>{googleDriveConnecting ? "Finish signing in with Google in the popup window." : "Permission is limited to Drive files and folders created or opened by this app. Access tokens stay in memory and expire automatically."}</small></div>{googleDriveConnection ? <button className="secondary-button" onClick={disconnectGoogleDrive}>Disconnect</button> : <button className="primary-button" onClick={connectGoogleDrive} disabled={googleDriveConnecting || !googleDriveSignInReady || !(configuredGoogleDriveClientId || googleDriveClientId.trim())}>{googleDriveConnecting || !googleDriveSignInReady ? <LoaderCircle size={14} className="spin" /> : <Cloud size={14} />} {googleDriveConnecting ? "Google sign-in open" : googleDriveSignInReady ? "Sign in with Google" : "Loading Google sign-in"}</button>}</div>
                 </div>
               )}
               {settingsTab === "general" && (

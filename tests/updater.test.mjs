@@ -15,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { acquireUpdateLock, registerRunningApp } from "../scripts/operation-lock.mjs";
 import { parseArguments } from "../scripts/update-from-github.mjs";
@@ -281,4 +281,88 @@ test("migrates a ZIP installation without replacing ignored personal data", asyn
   const subsequentUpdate = fixture.runZipUpdater(["--skip-tests"]);
   assert.equal(subsequentUpdate.status, 0, `${subsequentUpdate.stdout}\n${subsequentUpdate.stderr}`);
   assert.equal((await readFile(join(fixture.zipActive, "version.txt"), "utf8")).trim(), "3");
+});
+
+test("rolls ZIP updates back across original-backup and new-file failure boundaries", async (t) => {
+  const fixture = await createUpdaterFixture(t);
+  const originalVersion = await readFile(join(fixture.zipActive, "version.txt"), "utf8");
+  await writeFile(join(fixture.seed, "new-source.txt"), "new program file\n", "utf8");
+  git(fixture.seed, ["add", "new-source.txt"]);
+  await commitVersion(fixture.seed, 2);
+  const runtime = join(fixture.zipActive, ".runtime");
+  await mkdir(runtime, { recursive: true });
+  const preload = join(runtime, "inject-update-fault.mjs");
+  await writeFile(preload, [
+    'import fs from "node:fs";',
+    'import { syncBuiltinESMExports } from "node:module";',
+    'import { resolve } from "node:path";',
+    'const rename = fs.renameSync;',
+    'const copy = fs.copyFileSync;',
+    'const target = resolve(process.env.UPDATE_FAULT_PATH);',
+    'let triggered = false;',
+    'const fail = () => { triggered = true; throw new Error("Injected updater fault"); };',
+    'fs.renameSync = (source, destination) => {',
+    '  if (!triggered && resolve(source) === target) {',
+    '    if (process.env.UPDATE_FAULT_POINT === "before-backup") fail();',
+    '    if (process.env.UPDATE_FAULT_POINT === "after-backup") { rename(source, destination); fail(); }',
+    '  }',
+    '  return rename(source, destination);',
+    '};',
+    'fs.copyFileSync = (source, destination) => {',
+    '  copy(source, destination);',
+    '  if (!triggered && resolve(destination) === target && process.env.UPDATE_FAULT_POINT === "after-install") fail();',
+    '};',
+    'syncBuiltinESMExports();',
+    '',
+  ].join("\n"), "utf8");
+
+  for (const [name, path, point] of [
+    ["journal saved before original rename", "version.txt", "before-backup"],
+    ["original backed up before installation", "version.txt", "after-backup"],
+    ["replacement installed before completion journal", "version.txt", "after-install"],
+    ["new file installed before completion journal", "new-source.txt", "after-install"],
+  ]) {
+    await t.test(name, async () => {
+      const failed = fixture.runZipUpdater(["--skip-tests"], {
+        NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+        UPDATE_FAULT_PATH: join(fixture.zipActive, path),
+        UPDATE_FAULT_POINT: point,
+      });
+      assert.equal(failed.status, 1, `${failed.stdout}\n${failed.stderr}`);
+      assert.match(failed.stderr, /Injected updater fault/);
+      assert.match(failed.stdout, /rolled back safely/);
+      assert.equal(await readFile(join(fixture.zipActive, "version.txt"), "utf8"), originalVersion);
+      assert.equal(await readFile(join(fixture.zipActive, "node_modules", "old.txt"), "utf8"), "old ZIP dependencies\n");
+      await assert.rejects(readFile(join(fixture.zipActive, "new-source.txt")), { code: "ENOENT" });
+      await assert.rejects(readFile(join(runtime, "update-transaction.json")), { code: "ENOENT" });
+    });
+  }
+});
+
+test("preserves originals when recovering legacy pending intents or a repeated rollback", async (t) => {
+  const fixture = await createUpdaterFixture(t);
+  const originalVersion = await readFile(join(fixture.zipActive, "version.txt"), "utf8");
+  const runtime = join(fixture.zipActive, ".runtime");
+  await mkdir(runtime, { recursive: true });
+  const candidateRevision = git(fixture.seed, ["rev-parse", "HEAD"]).stdout.trim();
+  for (const version of [1, 2]) {
+    const state = {
+      version,
+      mode: "bootstrap",
+      token: randomUUID(),
+      phase: "deploying",
+      candidateRevision,
+      appliedPaths: version === 2 ? ["version.txt"] : [],
+      movedUntrackedPaths: [],
+      pendingPath: version === 1 ? "version.txt" : null,
+      pendingUntrackedPath: null,
+      ...(version === 2 ? { originalPaths: ["version.txt"] } : {}),
+    };
+    await writeFile(join(runtime, "update-transaction.json"), `${JSON.stringify(state)}\n`, "utf8");
+    const recovered = fixture.runZipUpdater(["--check"]);
+    assert.equal(recovered.status, 0, `${recovered.stdout}\n${recovered.stderr}`);
+    assert.match(recovered.stdout, /rolled back safely/);
+    assert.equal(await readFile(join(fixture.zipActive, "version.txt"), "utf8"), originalVersion);
+    if (version === 1) assert.match(recovered.stderr, /Legacy recovery preserved version.txt/);
+  }
 });

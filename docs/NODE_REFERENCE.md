@@ -21,6 +21,16 @@ Ports use `port_id:type`. For example, `prompt:prompt` means the JSON port ID is
 
 ## Essentials
 
+### Note (`note`)
+
+**Purpose:** Adds human-readable context, decisions, reminders, or instructions directly to the workflow canvas.
+
+**Inputs:** none.
+
+**Outputs:** none.
+
+**Rules and settings:** `noteContent` contains the note body. Notes are annotations only: they are saved, imported, exported, and editable by the user or workflow assistant, but they do not execute or affect workflow results.
+
 ### Start (`start`)
 
 **Purpose:** Defines the single entry point, opening identity, and data included when a chat run begins.
@@ -293,7 +303,7 @@ Ports use `port_id:type`. For example, `prompt:prompt` means the JSON port ID is
 
 **Rules and settings:**
 
-- The app owner configures a Google Web OAuth client ID. End users connect through **Sign in with Google** in Settings before running the node.
+- The app owner configures a Google Web OAuth client ID. Adding the node opens the Google sign-in popup when Drive is not connected; users can also choose **Sign in with Google** in the node inspector or Settings.
 - The node requests the narrow `drive.file` scope and can access files and folders created or opened by Magic Conch, not the user's whole Drive.
 - `driveFolderPath` defaults to `Magic Conch`; missing folders and the optional connected/configured `subfolder` are created automatically.
 - `key`, `fileExtension`, `saveFiles`, and `collision` behave like the local Save node.

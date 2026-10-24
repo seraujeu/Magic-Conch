@@ -394,7 +394,7 @@ function bootstrapBackupPath(backupRoot, category, repositoryPath) {
 function validateBootstrapTransaction(state) {
   const path = updateTransactionPath(projectRoot);
   if (
-    state?.version !== 1 ||
+    ![1, 2].includes(state?.version) ||
     state.mode !== "bootstrap" ||
     state.phase !== bootstrapPhase ||
     !/^[0-9a-f]{40,64}$/i.test(state.candidateRevision || "") ||
@@ -402,6 +402,7 @@ function validateBootstrapTransaction(state) {
     !Array.isArray(state.movedUntrackedPaths) ||
     !state.appliedPaths.every((entry) => typeof entry === "string") ||
     !state.movedUntrackedPaths.every((entry) => typeof entry === "string") ||
+    (state.version === 2 && (!Array.isArray(state.originalPaths) || !state.originalPaths.every((entry) => typeof entry === "string"))) ||
     (state.pendingPath !== null && typeof state.pendingPath !== "string") ||
     (state.pendingUntrackedPath !== null && typeof state.pendingUntrackedPath !== "string")
   ) {
@@ -411,6 +412,7 @@ function validateBootstrapTransaction(state) {
   for (const entry of [
     ...state.appliedPaths,
     ...state.movedUntrackedPaths,
+    ...(state.version === 2 ? state.originalPaths : []),
     state.pendingPath,
     state.pendingUntrackedPath,
   ].filter(Boolean)) normalizeRepositoryPath(entry);
@@ -434,10 +436,12 @@ function applyBootstrapPath(state, repositoryPath, install) {
   const { backupRoot } = bootstrapPaths(state.token);
   const activePath = activeInstallationPath(normalized);
   const backupPath = bootstrapBackupPath(backupRoot, "replaced", normalized);
+  const hadOriginal = pathExists(activePath);
+  if (hadOriginal) state.originalPaths.push(normalized);
   state.pendingPath = normalized;
   saveTransaction(state);
 
-  if (pathExists(activePath)) {
+  if (hadOriginal) {
     mkdirSync(dirname(backupPath), { recursive: true });
     renameSync(activePath, backupPath);
   }
@@ -487,10 +491,20 @@ function rollbackBootstrapTransaction() {
   for (const repositoryPath of uniqueReverse([...state.appliedPaths, state.pendingPath])) {
     const activePath = activeInstallationPath(repositoryPath);
     const backupPath = bootstrapBackupPath(backupRoot, "replaced", repositoryPath);
-    if (pathExists(activePath)) rmSync(activePath, { recursive: true, force: true });
     if (pathExists(backupPath)) {
+      if (pathExists(activePath)) rmSync(activePath, { recursive: true, force: true });
       mkdirSync(dirname(activePath), { recursive: true });
       renameSync(backupPath, activePath);
+    } else if (state.version === 2 && !state.originalPaths.includes(repositoryPath)) {
+      // Only remove an installed path when the journal proves no original
+      // existed. A pending intent can be saved before the original is moved.
+      if (pathExists(activePath)) rmSync(activePath, { recursive: true, force: true });
+    } else if (!pathExists(activePath)) {
+      throw new Error(`Recovery cannot find the original ${repositoryPath} or its backup; retained the recovery record.`);
+    } else if (state.version === 1) {
+      // Older journals did not record original-path existence. Preserve an
+      // ambiguous live path rather than risk deleting the original installation.
+      console.warn(`Legacy recovery preserved ${repositoryPath} because no replacement backup exists.`);
     }
   }
 
@@ -560,12 +574,13 @@ function deployBootstrapClone(git, prepared) {
     .filter(Boolean)
     .map(normalizeRepositoryPath);
   const state = {
-    version: 1,
+    version: 2,
     mode: "bootstrap",
     token: prepared.token,
     phase: bootstrapPhase,
     candidateRevision: prepared.candidateRevision,
     appliedPaths: [],
+    originalPaths: [],
     movedUntrackedPaths: [],
     pendingPath: null,
     pendingUntrackedPath: null,

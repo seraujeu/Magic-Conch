@@ -28,6 +28,22 @@ test("server-renders the Magic Conch workflow editor", async () => {
   assert.doesNotMatch(html, /type-flow|edge-flow/);
 });
 
+test("provides portless workflow notes for users and the workflow assistant", async () => {
+  const [workbench, css, nodeReference] = await Promise.all([
+    readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+    readFile(new URL("../docs/NODE_REFERENCE.md", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(workbench, /note: \{ label: "Note", subtitle: "Document the workflow"/);
+  assert.match(workbench, /if \(node\.type === "note"\) return \{ inputs: \[\], outputs: \[\] \}/);
+  assert.match(workbench, /type === "note"[\s\S]*?noteContent: "Write a note about this workflow…"/);
+  assert.match(workbench, />Note<textarea rows=\{10\} value=\{selectedNode\.config\.noteContent/);
+  assert.match(workbench, /className=\{`note-node-content/);
+  assert.match(css, /\.note-node-content \{/);
+  assert.match(nodeReference, /### Note \(`note`\)[\s\S]*?do not execute or affect workflow results/);
+});
+
 test("uses typed data edges as concurrent workflow dependencies", async () => {
   const [workbench, css] = await Promise.all([
     readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
@@ -70,7 +86,7 @@ test("uses Start node settings for the chat agent and opening message", async ()
   assert.match(workbench, /function getStartSettings/);
   assert.match(workbench, />Agent name<input/);
   assert.match(workbench, />Start message<textarea/);
-  assert.match(workbench, /meta: getStartSettings\(activeWorkflow, context\.syntax\)\.agentName/);
+  assert.match(workbench, /meta: getStartSettings\(workflow, context\.syntax\)\.agentName/);
 });
 
 test("lets Start nodes select detailed chat, file, and session inputs", async () => {
@@ -225,6 +241,39 @@ test("stores large workflow and plug-in artifacts outside localStorage", async (
   assert.doesNotMatch(workbench, /localStorage\.setItem\("magic-conch-workflows", JSON\.stringify\(workflows\)\)/);
 });
 
+test("opens Google sign-in when a Drive node is added", async () => {
+  const [workbench, googleDrive, css] = await Promise.all([
+    readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/google-drive.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(workbench, /type === "google-drive-save" \|\| type === "google-drive-load"/);
+  assert.match(workbench, /void connectGoogleDrive\(\)/);
+  assert.match(workbench, /setSettingsOpen\(true\)/);
+  assert.match(workbench, /googleDriveConnectPromiseRef/);
+  assert.match(workbench, /googleDriveSignInReady/);
+  assert.match(workbench, /Finish signing in with Google in the popup window/);
+  assert.doesNotMatch(googleDrive, /await loadGoogleIdentityServices\(\)/);
+  assert.doesNotMatch(css, /\.modal-backdrop[^}]*backdrop-filter/);
+});
+
+
+test("explains how to create the Google Drive OAuth client ID", async () => {
+  const [workbench, css] = await Promise.all([
+    readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(workbench, />How to get an OAuth client ID</);
+  assert.match(workbench, /Google Cloud OAuth clients/);
+  assert.match(workbench, /Google Drive API/);
+  assert.match(workbench, /Authorized JavaScript origins/);
+  assert.match(workbench, /http:\/\/localhost:4173/);
+  assert.match(workbench, /\.apps\.googleusercontent\.com/);
+  assert.match(workbench, /client secret or an API key/);
+  assert.match(css, /\.oauth-setup-guide \{/);
+});
 test("lets users limit parallel workflow execution", async () => {
   const workbench = await readFile(new URL("../app/workbench.tsx", import.meta.url), "utf8");
   assert.match(workbench, /magic-conch-workflow-parallelism/);

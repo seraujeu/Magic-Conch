@@ -11,8 +11,10 @@
     "start": "vinext start",
     "launch": "node scripts/launch.mjs",
     "update": "node scripts/update-from-github.mjs",
-    "test": "npm run build && node --test tests/*.test.mjs",
+    "test": "npm run typecheck && npm run build && node --test tests/*.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "typecheck": "tsc --noEmit --incremental false",
+    "types:generate": "npm run build && wrangler types worker-runtime.d.ts --config dist/server/wrangler.json --include-env false",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {

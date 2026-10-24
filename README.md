@@ -26,7 +26,9 @@ client in Google Cloud, add the app URL (by default `http://localhost:4173`) as
 an Authorized JavaScript origin, and set `GOOGLE_DRIVE_CLIENT_ID` before launching
 the app. End users can then choose **Sign in with Google** under Settings → API;
 they do not need to enter a client ID. For local development without that
-environment variable, the same settings panel exposes a client-ID fallback.
+environment variable, the same settings panel exposes a client-ID fallback. Adding
+a Google Drive Save or Google Drive Load node opens the Google sign-in popup when
+the app is not connected yet; the node inspector also provides a sign-in button.
 Magic Conch requests the limited `drive.file` scope, so it can
 access only Drive files and folders that the app created or that the user opened
 with the app. The short-lived access token is kept in memory and is never saved.
@@ -156,7 +158,13 @@ npm install
 npm run dev
 npm test
 npm run lint
+npm run typecheck
 ```
+
+`npm test` includes the TypeScript check, production build, and regression tests.
+Cloudflare runtime declarations are checked in as `worker-runtime.d.ts`; after
+updating Wrangler or the worker configuration, regenerate them with
+`npm run types:generate`.
 
 The application uses vinext, React, Vite, and Cloudflare's local development
 runtime. `.openai/hosting.json` retains the optional Sites binding contract;

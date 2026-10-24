@@ -207,10 +207,13 @@ function hydratePortableManifest(entries: PortableArchiveEntry[], manifestEntry:
     const reference = String(file.path || file.name || "");
     if (!reference) throw new Error(`Bundled file ${index + 1} has no path.`);
     const normalized = normalizeArchivePath(reference);
-    const candidates = [normalized, `${manifestFolder}${normalized}`];
+    const candidates = [`${manifestFolder}${normalized}`];
     if (!normalized.toLocaleLowerCase().startsWith("files/")) {
-      candidates.push(`files/${normalized}`, `${manifestFolder}files/${normalized}`);
+      candidates.push(`${manifestFolder}files/${normalized}`);
     }
+    // Exported files/ paths and bare names belong to this manifest. Only an
+    // explicit path outside files/ may refer to a shared archive-root asset.
+    if (manifestFolder && file.path && !normalized.toLocaleLowerCase().startsWith("files/")) candidates.push(normalized);
     const entry = candidates.map((candidate) => byPath.get(candidate.toLocaleLowerCase())).find(Boolean);
     if (!entry) throw new Error(`The bundled file “${reference}” is missing.`);
     consumed.add(entry.path.toLocaleLowerCase());

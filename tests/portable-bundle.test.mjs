@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { strToU8, unzipSync, zipSync } from "fflate";
 import { createPortableBundle, createPortableBundles, readPortableBundle, readPortableBundleParts } from "../lib/portable-bundle.ts";
+import { bundledLoadResult } from "../lib/workflow-load-bundle.ts";
 
 test("round-trips a manifest and its own files through a zip", () => {
   const manifest = {
@@ -92,4 +93,60 @@ test("stores files from separate Load directories in separate archive directorie
     ["load-1", "nested/shared.txt"],
     ["load-2", "nested/shared.txt"],
   ]);
+});
+
+test("binds identically named Load files to their own dependency manifest", () => {
+  const manifest = (id, text) => ({
+    id,
+    bundledLoads: { "load-1": { value: text } },
+    files: [{ name: "nested/shared.txt", type: "text/plain", size: text.length, data: `data:text/plain,${text}`, bundleLoadNodeId: "load-1" }],
+  });
+  const archive = createPortableBundles([
+    { manifestPath: "workflow.json", manifest: manifest("root", "ROOT") },
+    { manifestPath: "dependencies/workflows/child/workflow.json", manifest: manifest("child", "CHILD") },
+  ]);
+  const parts = readPortableBundleParts(archive, "workflow.json");
+  for (const [index, text] of ["ROOT", "CHILD"].entries()) {
+    assert.equal(parts[index].manifest.files.length, 1);
+    const snapshot = bundledLoadResult(parts[index].manifest, "load-1");
+    assert.equal(snapshot.value, text);
+    assert.equal(snapshot.files[0].name, "nested/shared.txt");
+    assert.equal(snapshot.files[0].data, `data:text/plain;base64,${Buffer.from(text).toString("base64")}`);
+  }
+});
+
+test("prefers each manifest's files directory for references without a files prefix", () => {
+  const archive = zipSync({
+    "plugin.json": strToU8(JSON.stringify({ id: "root", files: [{ name: "shared.js", path: "shared.js" }] })),
+    "files/shared.js": strToU8("root script"),
+    "dependencies/plugin.json": strToU8(JSON.stringify({ id: "child", files: [{ name: "shared.js", path: "shared.js" }] })),
+    "dependencies/files/shared.js": strToU8("child script"),
+  });
+  const parts = readPortableBundleParts(archive, "plugin.json");
+  assert.deepEqual(parts.map((part) => part.manifest.files.length), [1, 1]);
+  assert.deepEqual(parts.map((part) => part.manifest.files[0].data), [
+    `data:text/javascript;base64,${Buffer.from("root script").toString("base64")}`,
+    `data:text/javascript;base64,${Buffer.from("child script").toString("base64")}`,
+  ]);
+});
+
+test("retains support for explicit archive-root asset references", () => {
+  const archive = zipSync({
+    "dependencies/plugin.json": strToU8(JSON.stringify({ id: "child", files: [{ name: "shared.txt", path: "shared/assets/input.txt" }] })),
+    "shared/assets/input.txt": strToU8("shared input"),
+  });
+  const restored = readPortableBundle(archive, "plugin.json");
+  assert.equal(restored.files.length, 1);
+  assert.equal(restored.files[0].data, `data:text/plain;base64,${Buffer.from("shared input").toString("base64")}`);
+});
+
+test("rejects missing dependency assets instead of borrowing matching root files", () => {
+  for (const reference of [{ name: "shared.txt", path: "files/shared.txt" }, { name: "shared.txt" }]) {
+    const archive = zipSync({
+      "workflow.json": strToU8(JSON.stringify({ id: "root", files: [{ name: "shared.txt", path: "files/shared.txt" }] })),
+      "files/shared.txt": strToU8("root input"),
+      "dependencies/workflow.json": strToU8(JSON.stringify({ id: "child", files: [reference] })),
+    });
+    assert.throws(() => readPortableBundleParts(archive, "workflow.json"), /bundled file .* is missing/);
+  }
 });

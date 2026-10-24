@@ -271,6 +271,15 @@ export async function loadGoogleDriveRecord(options: {
 
 type GoogleTokenResponse = { access_token?: string; expires_in?: number; error?: string; error_description?: string };
 type GoogleTokenClient = { requestAccessToken: (options?: { prompt?: string }) => void };
+type GoogleOAuthError = { message?: string; type?: string };
+
+export function googleOAuthErrorMessage(error: GoogleOAuthError) {
+  if (error.type === "popup_failed_to_open") {
+    return "Chrome blocked the Google sign-in window. Allow pop-ups and redirects for this site, then try again.";
+  }
+  if (error.type === "popup_closed") return "The Google sign-in window was closed before access was granted.";
+  return error.message || error.type || "Google sign-in could not be opened.";
+}
 
 export async function loadGoogleIdentityServices() {
   const googleWindow = window as typeof window & { google?: { accounts?: { oauth2?: unknown } } };
@@ -291,15 +300,14 @@ export async function loadGoogleIdentityServices() {
   });
 }
 
-export async function requestGoogleDriveToken(clientId: string) {
-  if (!clientId.trim()) throw new Error("Enter a Google OAuth client ID in Settings first.");
-  await loadGoogleIdentityServices();
+export function requestGoogleDriveToken(clientId: string) {
+  if (!clientId.trim()) return Promise.reject(new Error("Enter a Google OAuth client ID in Settings first."));
   return new Promise<{ accessToken: string; expiresAt: number }>((resolve, reject) => {
     const googleWindow = window as typeof window & {
       google?: { accounts?: { oauth2?: { initTokenClient: (config: Record<string, unknown>) => GoogleTokenClient } } };
     };
     const oauth2 = googleWindow.google?.accounts?.oauth2;
-    if (!oauth2) return reject(new Error("Google sign-in is unavailable."));
+    if (!oauth2) return reject(new Error("Google sign-in is still loading. Try again in a moment."));
     const client = oauth2.initTokenClient({
       client_id: clientId.trim(),
       scope: GOOGLE_DRIVE_SCOPE,
@@ -307,7 +315,7 @@ export async function requestGoogleDriveToken(clientId: string) {
         if (!response.access_token) return reject(new Error(response.error_description || response.error || "Google Drive access was not granted."));
         resolve({ accessToken: response.access_token, expiresAt: Date.now() + Math.max(30, Number(response.expires_in || 3600) - 30) * 1000 });
       },
-      error_callback: (error: { message?: string; type?: string }) => reject(new Error(error.message || error.type || "Google sign-in was closed.")),
+      error_callback: (error: GoogleOAuthError) => reject(new Error(googleOAuthErrorMessage(error))),
     });
     client.requestAccessToken({ prompt: "consent" });
   });
